@@ -229,6 +229,10 @@ struct property {
 };
 
 struct mqtt_packet {
+    struct mqtt_packet *next;
+    struct mqtt_packet *next_client;
+    struct client *owner;
+
     mqtt_control_packet_type type;
     ssize_t remaining_length;
     unsigned flags;
@@ -244,10 +248,26 @@ struct mqtt_packet {
 
     unsigned property_count;
     struct property (*properties)[];
-    uint8_t *client_id;
 
+    uint16_t packet_identifier;
     uint32_t payload_len;
     void *payload;
+};
+
+struct topic {
+    uint8_t *topic;
+    uint8_t options;
+};
+
+struct client {
+    struct client *next;
+    struct mqtt_packet *active_packets;
+
+    int fd;
+    const uint8_t *client_id;
+
+    struct topic *topics;
+    unsigned num_topics;
 };
 
 

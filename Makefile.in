@@ -58,7 +58,7 @@ $(objdir)/.d:
 	@mkdir -p $(objdir)/.d 2>/dev/null
 
 $(objdir)/$(PACKAGE).8: $(objdir)/$(PACKAGE)
-	-$(HELP2MAN) -N -s 8 -S 'ZeroDay Linux' --help-option=-h --version-option=-v -o $@ $<
+	-$(HELP2MAN) -N -s 8 -S 'ZeroDay Linux' --help-option=-h --version-option=-V -o $@ $<
 
 $(objdir)/$(PACKAGE): $(package_OBJS)
 	$(CC) $< $(LDFLAGS) -o $@

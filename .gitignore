@@ -1,0 +1,8 @@
+fail-mqttd
+*.o
+*.8
+config.h*
+config.log
+Makefile
+config.status
+.d
