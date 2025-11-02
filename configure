@@ -144,8 +144,9 @@ CC=${CC:-${TOOL}cc}
 CXX=${CXX:-${TOOL}c++}
 AR=${AR:-${TOOL}ar}
 RANLIB=${RANLIB:-${TOOL}ranlib}
-YACC=${YACC:-yacc}
-LEX=${LEX:-lex}
+# Not used, if used, put "yacc" and "lex" after -
+YACC=${YACC:-}
+LEX=${LEX:-}
 
 # Predefined values, which should not be easily changed
 
@@ -281,7 +282,7 @@ echo "objdir = ${OBJDIR}; srcdir = ${SRCDIR};"
 
 # List of system headers we need to check for
 
-H_FILES="assert.h ctype.h err.h errno.h fcntl.h limits.h regex.h signal.h stdbool.h stdio.h stdlib.h string.h strings.h sys/select.h sys/socket.h sys/stat.h sys/time.h sys/types.h sys/un.h sys/wait.h syslog.h time.h unistd.h"
+H_FILES="stdlib.h netinet/in.h sys/socket.h fcntl.h unistd.h err.h stdio.h string.h stdbool.h errno.h sys/select.h stdatomic.h signal.h"
 
 # List of system functions to check for function:arg0,arg1
 

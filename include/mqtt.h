@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <uchar.h>
 
+#define MAX_PACKET_LENGTH   (0x1000000UL)
+
 struct mqtt_fixed_header {
     unsigned flags:4;
     unsigned type:4;
@@ -60,10 +62,12 @@ typedef enum {
 
 #define MQTT_CONNECT_FLAG_CLEAN_START   (1<<1)
 #define MQTT_CONNECT_FLAG_WILL_FLAG     (1<<2)
-#define MQTT_CONNECT_FLAG_WILL_QOS      (1<<3)
-#define MQTT_CONNECT_FLAG_WILL_RETAIN   (1<<4)
-#define MQTT_CONNECT_FLAG_PASSWORD      (1<<5)
-#define MQTT_CONNECT_FLAG_USERNAME      (1<<6)
+#define MQTT_CONNECT_FLAG_WILL_QOS      ((1<<3)|(1<<4))
+#define MQTT_CONNECT_FLAG_WILL_RETAIN   (1<<5)
+#define MQTT_CONNECT_FLAG_PASSWORD      (1<<6)
+#define MQTT_CONNECT_FLAG_USERNAME      (1<<7)
+
+#define GET_QOS(x) (((x) & MQTT_CONNECT_FLAG_WILL_QOS) >> 3U)
 
 typedef enum {
     MQTT_TYPE_BYTE = 1,
@@ -82,13 +86,13 @@ typedef enum {
     MQTT_PAYLOAD_FORMAT_INDICATOR = 1,
     MQTT_MESSAGE_EXPIRY_INTERVAL = 2,
     MQTT_CONTENT_TYPE = 3,
-    MQTT_RESPONSE_TYPE = 8,
-    MQTT_CORRLEATION_DATA = 9,
+    MQTT_RESPONSE_TOPIC = 8,
+    MQTT_CORRELATION_DATA = 9,
     MQTT_SUBSCRIPTION_IDENTIFIER = 11,
     MQTT_SESSION_EXPIRY_INTERVAL = 17,
     MQTT_ASSIGNED_CLIENT_IDENTIFIER = 18,
     MQTT_SERVER_KEEP_ALIVE = 19,
-    MQTT_AUTHENTICATION_METHD = 21,
+    MQTT_AUTHENTICATION_METHOD = 21,
     MQTT_AUTHENTICATION_DATA = 22,
     MQTT_REQUEST_PROBLEM_INFORMATION = 23,
     MQTT_WILL_DELAY_INTERVAL = 24,
@@ -110,61 +114,13 @@ typedef enum {
     MQTT_MAX_PROPERTY_IDENT = 43,
 } mqtt_property_ident;
 
-const mqtt_types mqtt_property_to_type[] = {
-    [MQTT_PAYLOAD_FORMAT_INDICATOR]          = MQTT_TYPE_BYTE,
-    [MQTT_MESSAGE_EXPIRY_INTERVAL]           = MQTT_TYPE_4BYTE,
-    [MQTT_CONTENT_TYPE]                      = MQTT_TYPE_UTF8_STRING,
-    [MQTT_RESPONSE_TYPE]                     = MQTT_TYPE_UTF8_STRING,
-    [MQTT_CORRLEATION_DATA]                  = MQTT_TYPE_BINARY,
-    [MQTT_SUBSCRIPTION_IDENTIFIER]           = MQTT_TYPE_VARBYTE,
-    [MQTT_SESSION_EXPIRY_INTERVAL]           = MQTT_TYPE_4BYTE,
-    [MQTT_ASSIGNED_CLIENT_IDENTIFIER]        = MQTT_TYPE_UTF8_STRING,
-    [MQTT_SERVER_KEEP_ALIVE]                 = MQTT_TYPE_2BYTE,
-    [MQTT_AUTHENTICATION_METHD]              = MQTT_TYPE_UTF8_STRING,
-    [MQTT_AUTHENTICATION_DATA]               = MQTT_TYPE_BINARY,
-    [MQTT_REQUEST_PROBLEM_INFORMATION]       = MQTT_TYPE_BYTE,
-    [MQTT_WILL_DELAY_INTERVAL]               = MQTT_TYPE_4BYTE,
-    [MQTT_REQUEST_RESPONSE_INFORMATION]      = MQTT_TYPE_BYTE,
-    [MQTT_RESPONSE_INFORMATION]              = MQTT_TYPE_UTF8_STRING,
-    [MQTT_SERVER_REFERENCE]                  = MQTT_TYPE_UTF8_STRING,
-    [MQTT_REASON_STRING]                     = MQTT_TYPE_UTF8_STRING,
-    [MQTT_RECEIVE_MAXIMUM]                   = MQTT_TYPE_2BYTE,
-    [MQTT_TOPIC_ALIAS_MAXIMUM]               = MQTT_TYPE_2BYTE,
-    [MQTT_TOPIC_ALIAS]                       = MQTT_TYPE_2BYTE,
-    [MQTT_MAXIMUM_QOS]                       = MQTT_TYPE_BYTE,
-    [MQTT_RETAIN_AVAILABLE]                  = MQTT_TYPE_BYTE,
-    [MQTT_USER_PROPERTY]                     = MQTT_TYPE_UTF8_STRING_PAIR,
-    [MQTT_MAXIMUM_PACKET_SIZE]               = MQTT_TYPE_4BYTE,
-    [MQTT_WILDCARD_SUBSCRIPTION_AVAILABLE]   = MQTT_TYPE_BYTE,
-    [MQTT_SUBSCRIPTION_IDENTIFIER_AVAILABLE] = MQTT_TYPE_BYTE,
-    [MQTT_SHARED_SUBSCRIPTION_AVAILABLE]     = MQTT_TYPE_BYTE,
-};
-
 typedef enum {
     MQTT_PAYLOAD_NONE = 0,
     MQTT_PAYLOAD_REQUIRED = 1,
     MQTT_PAYLOAD_OPTIONAL = 2,
 } mqtt_payload_required;
 
-const mqtt_payload_required mqtt_packet_to_payload[] = {
-    [MQTT_CP_CONNECT]     = MQTT_PAYLOAD_REQUIRED,
-    [MQTT_CP_CONNACK]     = MQTT_PAYLOAD_NONE,
-    [MQTT_CP_PUBLISH]     = MQTT_PAYLOAD_OPTIONAL,
-    [MQTT_CP_PUBACK]      = MQTT_PAYLOAD_NONE,
-    [MQTT_CP_PUBREC]      = MQTT_PAYLOAD_NONE,
-    [MQTT_CP_PUBREL]      = MQTT_PAYLOAD_NONE,
-    [MQTT_CP_PUBCOMP]     = MQTT_PAYLOAD_NONE,
-    [MQTT_CP_SUBSCRIBE]   = MQTT_PAYLOAD_REQUIRED,
-    [MQTT_CP_SUBACK]      = MQTT_PAYLOAD_REQUIRED,
-    [MQTT_CP_UNSUBSCRIBE] = MQTT_PAYLOAD_REQUIRED,
-    [MQTT_CP_UNSUBACK]    = MQTT_PAYLOAD_REQUIRED,
-    [MQTT_CP_PINGREQ]     = MQTT_PAYLOAD_NONE,
-    [MQTT_CP_PINGRESP]    = MQTT_PAYLOAD_NONE,
-    [MQTT_CP_DISCONNECT]  = MQTT_PAYLOAD_NONE,
-    [MQTT_CP_AUTH]        = MQTT_PAYLOAD_NONE,
-};
-
-enum {
+typedef enum {
     MQTT_SUCCESS = 0,
     MQTT_NORMAL_DISCONNECTION = 0,
     MQTT_GRANTED_QOS_0 = 0,
@@ -214,6 +170,7 @@ enum {
 
 struct property {
     mqtt_types type;
+    uint8_t identifier;
     union {
         uint8_t byte;
         uint16_t byte2;
@@ -252,10 +209,22 @@ struct mqtt_packet {
     uint16_t packet_identifier;
     uint32_t payload_len;
     void *payload;
+
+    _Atomic unsigned refcnt;
+    _Atomic int lock;
 };
 
-struct topic {
-    uint8_t *topic;
+struct client;
+
+typedef enum {
+    NEW = 0,
+    ACTIVE = 1,
+    CLOSING = 2,
+    CLOSED = 3,
+} client_state;
+
+struct topic_subs {
+    const uint8_t *topic;
     uint8_t options;
 };
 
@@ -263,12 +232,27 @@ struct client {
     struct client *next;
     struct mqtt_packet *active_packets;
 
-    int fd;
-    const uint8_t *client_id;
+    client_state state;
 
-    struct topic *topics;
+    int fd;
+    unsigned qos;
+    const uint8_t *client_id;
+    const uint8_t *username;
+    const uint8_t *password;
+    uint16_t password_len;
+
+    struct topic_subs *topics;
     unsigned num_topics;
 };
 
+struct topic {
+    struct topic *next;
+    const uint8_t *name;
+    struct client (*subscribers)[];
+};
+
+
+extern const mqtt_payload_required mqtt_packet_to_payload[MQTT_CP_MAX];
+extern const mqtt_types mqtt_property_to_type[MQTT_MAX_PROPERTY_IDENT];
 
 #endif
