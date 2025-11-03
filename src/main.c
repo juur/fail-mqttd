@@ -19,9 +19,17 @@ static int mother_fd = -1;
 static struct mqtt_packet *global_packet_list = NULL;
 static struct client *global_clients = NULL;
 static struct topic *global_topics = NULL;
+static struct message *global_messages = NULL;
 static bool running = true;
 
 typedef int (*control_func_t)(struct client *, struct mqtt_packet *, const void *);
+
+/*
+ * forward declarations
+ */
+
+static int unsubscribe_from_topic(struct subscription *sub);
+static int dequeue_message(struct message *msg);
 
 /*
  * command line stuff
@@ -68,11 +76,307 @@ static int _read_error(const char *msg, ssize_t rc, ssize_t expected, bool die, 
 [[maybe_unused]] static void dump_topics(void)
 {
     printf("global_topics:\n");
-    for (struct topic *tmp; tmp; tmp = tmp->next)
+    for (struct topic *tmp = global_topics; tmp; tmp = tmp->next)
     {
         printf("  topic: <%s>\n", (char *)tmp->name);
     }
 }
+
+/*
+ * allocators / deallocators
+ */
+
+[[gnu::nonnull]] static void free_topic_subs(struct topic_sub_request *request)
+{
+    if (request->topics) {
+        for (unsigned cnt = 0; cnt < request->num_topics; cnt++)
+        {
+            if (request->topics[cnt]) {
+                free((void *)request->topics[cnt]);
+                request->topics[cnt] = NULL;
+            }
+        }
+        free(request->topics);
+        request->topics = NULL;
+    }
+
+    if (request->options) {
+        free(request->options);
+        request->options = NULL;
+    }
+    free(request);
+}
+
+[[gnu::nonnull]] static void free_topic(struct topic *topic)
+{
+    printf("free_topic: <%s>\n",
+            (topic->name == NULL) ? "" : (char *)topic->name
+            );
+    if (global_topics == topic) {
+        global_topics = topic->next;
+    } else for (struct topic *tmp = global_topics; tmp; tmp = tmp->next)
+    {
+        if (tmp->next == topic) {
+            tmp->next = topic->next;
+            break;
+        }
+    }
+    topic->next = NULL;
+
+    if (topic->name)
+        free((void *)topic->name);
+
+    if (topic->subscribers) {
+        /* TODO ??? */
+        free(topic->subscribers);
+    }
+
+    if (topic->pending_queue) {
+        /* TODO persist */
+        struct message *msg;
+        while ((msg = topic->pending_queue)) {
+            if (dequeue_message(msg) == -1) {
+                err(EXIT_FAILURE, "free_topic: dequeue_message");
+                topic->pending_queue = msg->next_queue;
+            }
+            msg->state = MSG_DEAD;
+        }
+    }
+
+    free(topic);
+}
+
+[[gnu::nonnull]] static void free_properties(struct property (*props)[], unsigned count)
+{
+    for (unsigned i = 0; i < count; i++)
+    {
+        switch ((*props)[i].type)
+        {
+            case MQTT_TYPE_UTF8_STRING:
+                if ((*props)[i].utf8_string)
+                    free((*props)[i].utf8_string);
+                break;
+
+            case MQTT_TYPE_BINARY:
+                if ((*props)[i].binary.data)
+                    free((*props)[i].binary.data);
+                break;
+
+            default:
+                break;
+        }
+    }
+    free(props);
+}
+
+
+[[gnu::nonnull]] static void free_packet(struct mqtt_packet *pck)
+{
+    struct mqtt_packet *tmp;
+
+    if (pck->lock) {
+        warn("free_packet: attempt to free packet with lock");
+        return;
+    }
+
+    if (pck->refcnt) {
+        warn("free_packet: attempt to free packet with refcnt");
+        return;
+    }
+
+    if (pck->owner) {
+        if (pck->owner->active_packets == pck) {
+            pck->owner->active_packets = pck->next_client;
+        } else for (tmp = pck->owner->active_packets; tmp; tmp = tmp->next_client)
+        {
+            if (tmp->next_client == pck) {
+                tmp->next_client = pck->next_client;
+                break;
+            }
+        }
+        pck->next_client = NULL;
+        pck->owner = NULL;
+    }
+
+    if (pck == global_packet_list) {
+        global_packet_list = pck->next;
+    } else for (tmp = global_packet_list; tmp; tmp = tmp->next)
+    {
+        if (tmp->next == pck) {
+            tmp->next = pck->next;
+            break;
+        }
+    }
+    pck->next = NULL;
+
+    if (pck->payload) {
+        free(pck->payload);
+        pck->payload = NULL;
+    }
+
+    if (pck->properties) {
+        free_properties(pck->properties, pck->property_count);
+
+        pck->property_count = 0;
+        pck->properties = NULL;
+    }
+
+    free(pck);
+}
+
+[[gnu::nonnull]] static void free_message(struct message *msg)
+{
+    if (msg->topic) {
+        warn("free_message: attempt to free with topic <%s> set", msg->topic->name);
+        return;
+    }
+
+    if (global_messages == msg) {
+        global_messages = msg->next;
+    } else for (struct message *tmp = global_messages; tmp; tmp = tmp->next) {
+        if (tmp->next == msg) {
+            tmp->next = msg->next;
+            break;
+        }
+    }
+    msg->next = NULL;
+
+    if (msg->payload) {
+        free((void *)msg->payload);
+        msg->payload = NULL;
+    }
+
+    free(msg);
+}
+
+[[gnu::nonnull]] static void free_client(struct client *client)
+{
+    struct client *tmp;
+
+    if (client->state == CS_CLOSED)
+        err(EXIT_FAILURE, "free_client: double free");
+
+    client->state = CS_CLOSED;
+
+    if (global_clients == client) {
+        global_clients = client->next;
+    } else for (tmp = global_clients; tmp; tmp = tmp->next) {
+        if (tmp->next == client) {
+            tmp->next = client->next;
+            break;
+        }
+    }
+    client->next = NULL;
+
+    for (struct mqtt_packet *p = client->active_packets, *next; p; p = next)
+    {
+        next = p->next_client;
+        free_packet(p);
+    }
+
+    client->active_packets = NULL;
+
+    if (client->fd != -1) {
+        shutdown(client->fd, SHUT_RDWR);
+        close(client->fd);
+        client->fd = -1;
+    }
+
+    if (client->client_id) {
+        free ((void *)client->client_id);
+        client->client_id = NULL;
+    }
+
+    if (client->username) {
+        free ((void *)client->username);
+        client->username = NULL;
+    }
+
+    if (client->password) {
+        free ((void *)client->password);
+        client->password = NULL;
+    }
+
+    if (client->subscriptions) {
+        for (unsigned idx = 0; idx < client->num_subscriptions; idx++)
+            unsubscribe_from_topic(&(*client->subscriptions)[idx]);
+        free(client->subscriptions);
+        client->subscriptions = NULL;
+        client->num_subscriptions = 0;
+    }
+
+    free(client);
+}
+
+[[gnu::malloc]] static struct topic *alloc_topic(const uint8_t *name)
+{
+    struct topic *ret;
+
+    errno = 0;
+
+    if ((ret = calloc(1, sizeof(struct topic))) == NULL)
+        return NULL;
+
+    ret->name = name;
+
+    return ret;
+}
+
+[[gnu::malloc]] static struct mqtt_packet *alloc_packet(struct client *owner)
+{
+    struct mqtt_packet *ret;
+
+    errno = 0;
+
+    if ((ret = calloc(1, sizeof(struct mqtt_packet))) == NULL)
+        return NULL;
+
+    if (owner) {
+        ret->owner = owner;
+        ret->next_client = owner->active_packets;
+        owner->active_packets = ret;
+    }
+
+    ret->next = global_packet_list;
+    global_packet_list = ret;
+
+    return ret;
+}
+
+[[gnu::malloc]] static struct message *alloc_message(void)
+{
+    struct message *msg;
+
+    errno = 0;
+
+    if ((msg = calloc(1, sizeof(struct message))) == NULL)
+        return NULL;
+
+    msg->state = MSG_NEW;
+    msg->next = global_messages;
+    global_messages = msg;
+
+    return msg;
+}
+
+[[gnu::malloc]] static struct client *alloc_client(void)
+{
+    struct client *client;
+
+    errno = 0;
+
+    if ((client = calloc(1, sizeof(struct client))) == NULL)
+        return NULL;
+
+    client->state = CS_NEW;
+    client->fd = -1;
+
+    client->next = global_clients;
+    global_clients = client;
+
+    return client;
+}
+
 
 /*
  * packet parsing helpers
@@ -192,29 +496,6 @@ fail:
     return NULL;
 }
 
-[[gnu::nonnull]] static void free_properties(struct property (*props)[], unsigned count)
-{
-    for (unsigned i = 0; i < count; i++)
-    {
-        switch ((*props)[i].type)
-        {
-            case MQTT_TYPE_UTF8_STRING:
-                if ((*props)[i].utf8_string)
-                    free((*props)[i].utf8_string);
-                break;
-
-            case MQTT_TYPE_BINARY:
-                if ((*props)[i].binary.data)
-                    free((*props)[i].binary.data);
-                break;
-
-            default:
-                break;
-        }
-    }
-    free(props);
-}
-
 /* a type of -1U is used for situations where the properties are NOT the standard ones
  * in a packet, e.g. "will_properties" */
 [[gnu::nonnull]] static int parse_properties(
@@ -231,7 +512,7 @@ fail:
     void *tmp;
 
     errno = 0;
-    
+
     properties_length = read_var_byte(ptr, bytes_left);
 
     if (properties_length == 0 && errno)
@@ -253,7 +534,7 @@ fail:
         if ((tmp = realloc(props, sizeof(struct property) * (num_props + 1))) == NULL)
             goto fail;
         props = tmp;
-        
+
         memset(&(*props)[num_props], 0, sizeof(struct property));
 
         ident = **ptr;
@@ -327,211 +608,14 @@ fail:
 }
 
 /*
- * allocators / deallocators
- */
-
-[[gnu::nonnull]] static void free_topic(struct topic *topic)
-{
-    if (global_topics == topic) {
-        global_topics = topic->next;
-    } else for (struct topic *tmp; tmp; tmp = tmp->next)
-    {
-        if (tmp->next == topic) {
-            tmp->next = topic->next;
-            break;
-        }
-    }
-    topic->next = NULL;
-
-    if (topic->name)
-        free((void *)topic->name);
-
-    if (topic->subscribers) {
-        /* TODO ??? */
-        free(topic->subscribers);
-    }
-
-    free(topic);
-}
-
-[[gnu::nonnull]] static void free_packet(struct mqtt_packet *pck)
-{
-    struct mqtt_packet *tmp;
-    printf("free_packet: %p\n", (void *)pck);
-
-    if (pck->lock) {
-        warn("free_packet: attempt to free packet with lock");
-        return;
-    }
-
-    if (pck->refcnt) {
-        warn("free_packet: attempt to free packet with refcnt");
-        return;
-    }
-
-    if (pck->owner) {
-        if (pck->owner->active_packets == pck) {
-            pck->owner->active_packets = pck->next_client;
-        } else for (tmp = pck->owner->active_packets; tmp; tmp = tmp->next_client)
-        {
-            if (tmp->next_client == pck) {
-                tmp->next_client = pck->next_client;
-                break;
-            }
-        }
-        pck->next_client = NULL;
-        pck->owner = NULL;
-    }
-
-    if (pck == global_packet_list) {
-        global_packet_list = pck->next;
-    } else for (tmp = global_packet_list; tmp; tmp = tmp->next)
-    {
-        if (tmp->next == pck) {
-            tmp->next = pck->next;
-            break;
-        }
-    }
-    pck->next = NULL;
-
-    if (pck->payload) {
-        free(pck->payload);
-        pck->payload = NULL;
-    }
-
-    if (pck->properties) {
-        free_properties(pck->properties, pck->property_count);
-
-        pck->property_count = 0;
-        pck->properties = NULL;
-    }
-
-    free(pck);
-}
-
-[[gnu::nonnull]] static void free_client(struct client *client)
-{
-    struct client *tmp;
-    printf("free_client: %p\n", (void *)client);
-
-    if (client->state == CLOSED)
-        err(EXIT_FAILURE, "free_client: double free");
-
-    client->state = CLOSED;
-
-    if (global_clients == client) {
-        global_clients = client->next;
-    } else for (tmp = global_clients; tmp; tmp = tmp->next) {
-        if (tmp->next == client) {
-            tmp->next = client->next;
-            break;
-        }
-    }
-    client->next = NULL;
-
-    for (struct mqtt_packet *p = client->active_packets, *next; p; p = next)
-    {
-        next = p->next_client;
-        free_packet(p);
-    }
-
-    client->active_packets = NULL;
-
-    if (client->fd != -1) {
-        shutdown(client->fd, SHUT_RDWR);
-        close(client->fd);
-        client->fd = -1;
-    }
-
-    if (client->client_id) {
-        free ((void *)client->client_id);
-        client->client_id = NULL;
-    }
-
-    if (client->username) {
-        free ((void *)client->username);
-        client->username = NULL;
-    }
-
-    if (client->password) {
-        free ((void *)client->password);
-        client->password = NULL;
-    }
-
-    if (client->topics) {
-        for (unsigned cnt = 0; cnt < client->num_topics; cnt++)
-        {
-            if (client->topics[cnt].topic) {
-                free((void *)client->topics[cnt].topic);
-                client->topics[cnt].topic = NULL;
-            }
-        }
-        free(client->topics);
-        client->topics = NULL;
-        client->num_topics = 0;
-    }
-
-    free(client);
-}
-
-[[gnu::malloc]] static struct topic *alloc_topic(const uint8_t *name)
-{
-    struct topic *ret;
-
-    errno = 0;
-
-    if ((ret = calloc(1, sizeof(struct topic))) == NULL)
-        return NULL;
-
-    ret->name = name;
-
-    return ret;
-}
-
-[[gnu::malloc]] static struct mqtt_packet *alloc_packet(struct client *owner)
-{
-    struct mqtt_packet *ret;
-
-    if ((ret = calloc(1, sizeof(struct mqtt_packet))) == NULL)
-        return NULL;
-
-    if (owner) {
-        ret->owner = owner;
-        ret->next_client = owner->active_packets;
-        owner->active_packets = ret;
-    }
-
-    ret->next = global_packet_list;
-    global_packet_list = ret;
-
-    printf("alloc_packet: %p\n", (void *)ret);
-    return ret;
-}
-
-[[gnu::malloc]] static struct client *alloc_client(void)
-{
-    struct client *client;
-
-    if ((client = calloc(1, sizeof(struct client))) == NULL)
-        return NULL;
-
-    client->state = NEW;
-    client->fd = -1;
-
-    client->next = global_clients;
-    global_clients = client;
-
-    printf("alloc_client: %p\n", (void *)client);
-    return client;
-}
-
-/*
- * signal handlers 
+ * signal handlers
  */
 
 static void sh_sigint(int signum, siginfo_t * /*info*/, void * /*stuff*/)
 {
     printf("sh_sigint: received signal %u\n", signum);
+    if (running == false)
+        exit(EXIT_FAILURE);
     running = false;
 }
 
@@ -546,6 +630,13 @@ static void close_socket(void)
         shutdown(mother_fd, SHUT_RDWR);
         close(mother_fd);
     }
+}
+
+static void free_messages(void)
+{
+    printf("free_messages\n");
+    while (global_messages)
+        free_message(global_messages);
 }
 
 static void free_clients(void)
@@ -575,6 +666,8 @@ static void free_topics(void)
 
 static struct topic *find_topic(const uint8_t *name)
 {
+    errno = 0;
+
     for (struct topic *tmp = global_topics; tmp; tmp = tmp->next)
     {
         if (!strcmp((const void *)name, (const void *)tmp->name))
@@ -588,6 +681,8 @@ static struct topic *register_topic(const uint8_t *name)
 {
     struct topic *ret;
 
+    errno = 0;
+
     if ((ret = alloc_topic(name)) == NULL)
         return NULL;
 
@@ -597,20 +692,169 @@ static struct topic *register_topic(const uint8_t *name)
     return ret;
 }
 
-static int register_message(const uint8_t *topic_name, int format, uint16_t len, const void *payload, unsigned qos)
+static int enqueue_message(struct topic *topic, struct message *msg)
 {
-    printf("register_message: topic=<%s> format=%u len=%u qos=%u payload=%p\n", 
-            topic_name, format, len, qos, payload);
+    errno = 0;
 
-    struct topic *topic;
-
-    if ((topic = find_topic(topic_name)) == NULL)
-        if ((topic = register_topic(topic_name)) == NULL)
-            return -1;
-
-
+    msg->topic = topic;
+    msg->next_queue = topic->pending_queue;
+    topic->pending_queue = msg;
 
     return 0;
+}
+
+static int dequeue_message(struct message *msg)
+{
+    errno = 0;
+
+    if (msg->topic == NULL) {
+        warnx("dequeue_message: attempt to dequeue_message with topic <%s> set\n", msg->topic->name);
+        errno = EINVAL;
+        return -1; /* or 0? TODO */
+    }
+
+    if (msg == msg->topic->pending_queue) {
+        msg->topic->pending_queue = msg->next_queue;
+        goto done;
+    } else for (struct message *tmp = msg->topic->pending_queue; tmp; tmp = tmp->next_queue) {
+        if (tmp->next_queue == msg) {
+            tmp->next_queue = msg->next_queue;
+            goto done;
+        }
+    }
+
+    errno = ESRCH;
+    return -1;
+
+done:
+    msg->next_queue = NULL;
+    msg->topic = NULL;
+    return 0;
+}
+
+static int register_message(const uint8_t *topic_name, int format, uint16_t len, const void *payload, unsigned qos)
+{
+    struct topic *topic;
+    errno = 0;
+
+    printf("register_message: topic=<%s> format=%u len=%u qos=%u payload=%p\n",
+            topic_name, format, len, qos, payload);
+
+    if ((topic = find_topic(topic_name)) == NULL) {
+        const uint8_t *tmp_name;
+
+        if ((tmp_name = (void *)strdup((const char *)topic_name)) == NULL)
+            goto fail;
+
+        if ((topic = register_topic(tmp_name)) == NULL) {
+            warn("register_message: register_topic <%s>", tmp_name);
+            goto fail;
+        }
+    }
+
+    struct message *msg;
+
+    if ((msg = alloc_message()) == NULL)
+        goto fail;
+
+    msg->format = format;
+    msg->payload = payload;
+
+    if (enqueue_message(topic, msg) == -1) {
+        warn("register_message: enqueue_message");
+        free_message(msg);
+        goto fail;
+    }
+
+    msg->state = MSG_ACTIVE;
+
+    /* TODO register the message for delivery and commit */
+
+    return 0;
+
+fail:
+    return -1;
+}
+
+static int add_subscription_to_topic(struct topic *topic, struct client *client, uint8_t option)
+{
+    struct subscription (*tmp_subs)[];
+
+    errno = 0;
+
+    if ((tmp_subs = (void *)realloc(topic->subscribers,
+                    sizeof(struct subscription) * (topic->num_subscribers + 1))) == NULL)
+        return -1;
+
+    topic->subscribers = tmp_subs;
+
+    (*topic->subscribers)[topic->num_subscribers].option = option;
+    (*topic->subscribers)[topic->num_subscribers].client = client;
+    (*topic->subscribers)[topic->num_subscribers].topic = topic;
+
+    topic->num_subscribers++;
+    return 0;
+}
+
+static int unsubscribe_from_topic(struct subscription *sub)
+{
+    errno = 0;
+
+    /* remove from topic TODO */
+    /* remove from client TODO */
+
+    sub->topic = NULL;
+    sub->client = NULL;
+    sub->option = 0;
+
+    /* squash topic sub list? */
+    /* squash client sub list? */
+
+    return 0;
+}
+
+static int subscribe_to_topics(struct client *client, struct topic_sub_request *request)
+{
+    struct subscription (*tmp_subs)[] = NULL;
+    struct topic *tmp_topic = NULL;
+
+    errno = 0;
+
+    if ((tmp_subs = (void *)realloc(client->subscriptions,
+                    sizeof(struct subscription) * (client->num_subscriptions + request->num_topics))) == NULL)
+        goto fail;
+
+    client->subscriptions = tmp_subs;
+
+    for (unsigned idx = 0; idx < request->num_topics; idx++)
+    {
+        memset(&(*client->subscriptions)[client->num_subscriptions + idx], 0, sizeof(struct subscription));
+
+        if ((tmp_topic = find_topic(request->topics[idx])) == NULL) {
+            /* TODO somehow ensure reply does a fail for this one? */
+            continue;
+        }
+
+        if (add_subscription_to_topic(tmp_topic, client, request->options[idx]) == -1) {
+            warn("subscribe_to_topics: add_subscription_to_topic <%s>", tmp_topic->name);
+            continue;
+        }
+
+        (*client->subscriptions)[client->num_subscriptions + idx].client = client;
+        (*client->subscriptions)[client->num_subscriptions + idx].topic = tmp_topic;
+        (*client->subscriptions)[client->num_subscriptions + idx].option = request->options[idx];
+
+        free((void *)request->topics[idx]);
+        request->options[idx] = 0;
+        request->topics[idx] = NULL;
+    }
+
+    client->num_subscriptions = client->num_subscriptions + request->num_topics;
+    return 0;
+
+fail:
+
+    return -1;
 }
 
 /*
@@ -620,6 +864,8 @@ static int register_message(const uint8_t *topic_name, int format, uint16_t len,
 [[gnu::nonnull]] static int send_cp_pingresp(const struct client *client)
 {
     ssize_t length = 0;
+
+    errno = 0;
 
     length += sizeof(struct mqtt_fixed_header);
     length += 1; /* remaining length 1 byte */
@@ -646,6 +892,8 @@ static int register_message(const uint8_t *topic_name, int format, uint16_t len,
 [[gnu::nonnull]] static int send_cp_connack(struct client *client)
 {
     ssize_t length = 0;
+
+    errno = 0;
 
     length += sizeof(struct mqtt_fixed_header);
     length += 1; /* remaining length 1byte */
@@ -686,19 +934,20 @@ static int register_message(const uint8_t *topic_name, int format, uint16_t len,
  *  Reason Codes[]
  */
 
-[[gnu::nonnull]] static int send_cp_suback(struct client *client, uint16_t packet_id)
+[[gnu::nonnull]] static int send_cp_suback(struct client *client, uint16_t packet_id, struct topic_sub_request *request)
 {
-    printf("send_cp_suback: client=%p packet_id=%u\n", (void *)client, packet_id);
     uint16_t tmp;
-
     ssize_t length = 0;
+
+    errno = 0;
+
     length += sizeof(struct mqtt_fixed_header); /* [0] MQTT Control Packet type */
     length += 1; /* [1]   Remaining Length 1byte */
 
     length += sizeof(packet_id); /* [2-3] Packet Identifier */
     length += 1; /* [4]   properties length (0) */
     length += 0; /*       properties TODO */
-    length += 1 * client->num_topics; /* [5+] */
+    length += 1 * request->num_topics; /* [5+] */
 
     uint8_t *packet;
 
@@ -713,8 +962,8 @@ static int register_message(const uint8_t *topic_name, int format, uint16_t len,
 
     packet[4] = 0; /* properties length */
 
-    for (unsigned i = 0; i < client->num_topics; i++)
-        packet[5 + i] = 0; /* TODO which QoS? */
+    for (unsigned i = 0; i < request->num_topics; i++)
+        packet[5 + i] = 0; /* TODO which QoS? what if sub failed? */
 
     ssize_t wr_len;
 
@@ -741,15 +990,14 @@ static int register_message(const uint8_t *topic_name, int format, uint16_t len,
  * control packet processing functions
  */
 
-[[gnu::nonnull]] static int handle_cp_publish(struct client *client, struct mqtt_packet *packet, const void *remain)
+[[gnu::nonnull]] static int handle_cp_publish(struct client * /*client*/, struct mqtt_packet *packet, const void *remain)
 {
-    printf("handle_cp_publish: client=%p packet=%p\n", (void *)client, (void *)packet);
-
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-
     uint8_t *topic_name;
     uint16_t packet_identifier;
+
+    errno = 0;
 
     if ((topic_name = read_utf8(&ptr, &bytes_left)) == NULL)
         goto fail;
@@ -787,25 +1035,36 @@ static int register_message(const uint8_t *topic_name, int format, uint16_t len,
     memcpy(packet->payload, ptr, bytes_left);
 
     printf("\n");
-    printf("handle_cp_publish: creating a message\n");
-    if (register_message(topic_name, payload_format, packet->payload_len, packet->payload, qos) == -1)
+    
+    if (register_message(topic_name, payload_format, packet->payload_len, packet->payload, qos) == -1) {
+        warn("handle_cp_publish: register_message");
+        free(topic_name);
         return -1;
+    }
+
+    free(topic_name);
+
+    packet->payload = NULL;
+    packet->payload_len = 0;
+
     return 0;
 
 fail:
+    if (topic_name) {
+        free(topic_name);
+    }
     printf("\n");
     return -1;
 }
 
 [[gnu::nonnull]] static int handle_cp_subscribe(struct client *client, struct mqtt_packet *packet, const void *remain)
 {
-    printf("handle_cp_subscribe: client=%p packet=%p\n", (void *)client, (void *)packet);
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    struct topic_subs *topics = NULL;
-    uint8_t *topic = NULL;
-    unsigned num_topics = 0;
+    struct topic_sub_request *request = NULL;
     void *tmp;
+
+    errno = 0;
 
     if (bytes_left < 3) {
         errno = ENOSPC;
@@ -822,42 +1081,53 @@ fail:
 
     /* check if bytes_left == 0 means malformed i.e. >= 1 topic required TODO */
 
+    if ((request = malloc(sizeof(struct topic_sub_request))) == NULL)
+        goto fail;
+
+    request->topics = NULL;
+    request->num_topics = 0;
+    request->options = 0;
+
     while (bytes_left)
     {
         if (bytes_left < 3)
             goto fail;
 
-        if ((tmp = realloc(topics, sizeof(struct topic_subs) * (num_topics + 1))) == NULL)
+        if ((tmp = realloc(request->topics, sizeof(uint8_t *) * (request->num_topics + 1))) == NULL)
             goto fail;
-        topics = tmp;
+        request->topics = tmp;
 
-        if ((topic = read_utf8(&ptr, &bytes_left)) == NULL)
+        if ((tmp = realloc(request->options, sizeof(uint8_t) * (request->num_topics + 1))) == NULL)
+            goto fail;
+        request->options = tmp;
+
+        if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
 
         if (bytes_left < 1)
             goto fail;
 
-        topics[num_topics].topic = topic;
-        topics[num_topics].options = *ptr++;
+        request->options[request->num_topics] = *ptr++;
         bytes_left--;
 
         //printf("handle_cp_subscribe: topic[%u] <%s> subscription_options=%u\n", num_topics - 1, topics[num_topics - 1].topic, topics[num_topics - 1].options);
-        num_topics++;
+        request->num_topics++;
     }
 
-    client->topics = topics;
-    client->num_topics = num_topics;
     atomic_fetch_add_explicit(&packet->refcnt, 1, memory_order_relaxed);
 
-    return send_cp_suback(client, packet->packet_identifier);
+    if (subscribe_to_topics(client, request) == -1) {
+        warn("handle_cp_subscribe: subscribe_to_topics");
+        goto fail;
+    }
+
+    int rc = send_cp_suback(client, packet->packet_identifier, request);
+    free_topic_subs(request);
+    return rc;
 
 fail:
-    if (topics) {
-        for (unsigned i = 0; i < num_topics; i++)
-            if (topics[i].topic)
-                free((void *)topics[i].topic);
-        free(topics);
-    }
+    if (request)
+        free_topic_subs(request);
     return -1;
 }
 
@@ -865,6 +1135,8 @@ fail:
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
+
+    errno = 0;
 
     if (bytes_left < 2) {
         errno = ENOSPC;
@@ -878,12 +1150,12 @@ fail:
         goto fail;
 
     printf("handle_cp_disconnect: disconnect reason was %u\n", disconnect_reason);
-    client->state = CLOSING;
+    client->state = CS_CLOSING;
     return 0;
 
 fail:
-    printf("handle_cp_disconnect: packet malformed\n");
-    client->state = CLOSING;
+    warnx("handle_cp_disconnect: packet malformed");
+    client->state = CS_CLOSING;
     return -1;
 }
 
@@ -1016,16 +1288,20 @@ fail:
 
     client->qos = GET_QOS(packet->connect_hdr.flags);
 
-    printf("QoS [%u] ", client->qos);
-
-    printf("\n");
-
+    printf("QoS [%u]\n", client->qos);
+    
     send_cp_connack(client);
 
     if (packet->connect_hdr.flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
-        printf("handle_cp_connect: creating a message\n");
-        if (register_message(will_topic, payload_format, will_payload_len, will_payload, client->qos) == -1)
+        //printf("handle_cp_connect: creating a message\n");
+        if (register_message(will_topic, payload_format, will_payload_len, will_payload, client->qos) == -1) {
+            warn("handle_cp_connect: register_message");
+            free(will_topic);
             return -1;
+        }
+        free(will_topic);
+        packet->payload = NULL;
+        packet->payload_len = 0;
     }
 
     return 0;
@@ -1059,7 +1335,7 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
 
     if ((rd_len = read(client->fd, &hdr, sizeof(hdr))) != sizeof(hdr)) {
         if (rd_len == 0) {
-            client->state = CLOSING;
+            client->state = CS_CLOSING;
             return 0;
         }
         read_error(NULL, rd_len, sizeof(hdr), false);
@@ -1141,15 +1417,42 @@ fail:
 
 static void tick(void)
 {
-    for (struct client *clnt = global_clients, *next; clnt; clnt = next) 
+    for (struct client *clnt = global_clients, *next; clnt; clnt = next)
     {
         next = clnt->next;
 
-        if (clnt->state == CLOSED || clnt->state == NEW)
+        if (clnt->state == CS_CLOSED || clnt->state == CS_NEW)
             continue;
 
-        if (clnt->state == CLOSING)
+        if (clnt->state == CS_CLOSING)
             free_client(clnt);
+    }
+
+    for (struct topic *topic = global_topics; topic; topic = topic->next)
+    {
+        if (topic->pending_queue == NULL)
+            continue;
+
+        if (topic->num_subscribers == 0)
+            continue;
+
+        struct message *msg;
+
+        msg = topic->pending_queue;
+        if (dequeue_message(msg) == -1) {
+            warn("tick: dequeue_message failed");
+        } else
+            msg->state = MSG_DEAD;
+    }
+
+    for (struct message *msg = global_messages, *next; msg; msg = next)
+    {
+        next = msg->next;
+
+        if (msg->state != MSG_DEAD)
+            continue;
+
+        free_message(msg);
     }
 }
 
@@ -1193,7 +1496,7 @@ static int main_loop(int mother_fd)
             printf("main_loop: no connections, going to sleep\n");
             rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, NULL);
         } else {
-            rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv); 
+            rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv);
         }
 
         if (rc == 0) {
@@ -1224,7 +1527,7 @@ static int main_loop(int mother_fd)
             }
 
             new_client->fd = child_fd;
-            new_client->state = ACTIVE;
+            new_client->state = CS_ACTIVE;
         }
 
         if (FD_ISSET(mother_fd, &fds_exc))
@@ -1232,14 +1535,15 @@ static int main_loop(int mother_fd)
 
         for (struct client *clnt = global_clients; clnt; clnt = clnt->next)
         {
-            if (clnt->state != ACTIVE)
+            if (clnt->state != CS_ACTIVE)
                 continue;
 
             if (FD_ISSET(clnt->fd, &fds_in)) {
-                printf("main_loop: read event on %p[%d]\n", (void *)clnt, clnt->fd);
+                //printf("main_loop: read event on %p[%d]\n", (void *)clnt, clnt->fd);
                 if (parse_incoming(clnt) == -1) {
                     /* TODO do something? */ ;
                 }
+                printf("\n");
             }
 
             if (FD_ISSET(clnt->fd, &fds_out)) {
@@ -1299,8 +1603,9 @@ int main(int argc, char *argv[])
 
     if ((mother_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
         err(EXIT_FAILURE, "socket");
-    
+
     atexit(close_socket);
+    atexit(free_messages);
     atexit(free_packets);
     atexit(free_clients);
     atexit(free_topics);

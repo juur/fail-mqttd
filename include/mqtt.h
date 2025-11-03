@@ -193,7 +193,7 @@ struct mqtt_packet {
     mqtt_control_packet_type type;
     ssize_t remaining_length;
     unsigned flags;
-    
+
     union {
         struct {
             unsigned flags;
@@ -215,17 +215,43 @@ struct mqtt_packet {
 };
 
 struct client;
+struct subscription;
 
 typedef enum {
-    NEW = 0,
-    ACTIVE = 1,
-    CLOSING = 2,
-    CLOSED = 3,
+    CS_NEW = 0,
+    CS_ACTIVE = 1,
+    CS_CLOSING = 2,
+    CS_CLOSED = 3,
 } client_state;
 
-struct topic_subs {
-    const uint8_t *topic;
-    uint8_t options;
+typedef enum {
+    MSG_NEW = 0,
+    MSG_ACTIVE = 1,
+    MSG_DEAD = 2,
+} message_state;
+
+struct message {
+    struct message *next;
+    struct message *next_queue;
+
+    struct topic *topic;
+
+    uint8_t format;
+    const void *payload;
+    unsigned qos;
+    message_state state;
+};
+
+struct topic_sub_request {
+    unsigned num_topics;
+    const uint8_t **topics;
+    uint8_t *options;
+};
+
+struct subscription {
+    struct client *client;
+    struct topic *topic;
+    uint8_t option;
 };
 
 struct client {
@@ -241,14 +267,17 @@ struct client {
     const uint8_t *password;
     uint16_t password_len;
 
-    struct topic_subs *topics;
-    unsigned num_topics;
+    struct subscription (*subscriptions)[];
+    unsigned num_subscriptions;
 };
 
 struct topic {
     struct topic *next;
     const uint8_t *name;
-    struct client (*subscribers)[];
+    struct subscription (*subscribers)[];
+    unsigned num_subscribers;
+
+    struct message *pending_queue;
 };
 
 
