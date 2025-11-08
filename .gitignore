@@ -6,3 +6,5 @@ config.log
 Makefile
 config.status
 .d
+vgcore.*
+.clangd

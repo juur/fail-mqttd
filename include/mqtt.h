@@ -4,6 +4,7 @@
 #include <sys/types.h>
 #include <stdint.h>
 #include <uchar.h>
+#include <arpa/inet.h>
 
 #define MAX_PACKET_LENGTH   (0x1000000UL)
 
@@ -70,6 +71,7 @@ typedef enum {
 #define GET_QOS(x) (((x) & MQTT_CONNECT_FLAG_WILL_QOS) >> 3U)
 
 typedef enum {
+    MQTT_TYPE_UNDEFINED = 0,
     MQTT_TYPE_BYTE = 1,
     MQTT_TYPE_4BYTE = 2,
     MQTT_TYPE_UTF8_STRING = 3,
@@ -203,22 +205,16 @@ struct mqtt_packet {
         } connect_hdr;
     };
 
-    unsigned property_count;
     struct property (*properties)[];
-
-    uint16_t packet_identifier;
-    
-    uint32_t payload_len;
+    struct property (*will_props)[];
     void *payload;
     struct message *message;
-
+    uint16_t packet_identifier;
+    uint32_t payload_len;
+    unsigned property_count;
     unsigned num_will_props;
-    struct property (*will_props)[];
-
     uint8_t reason_code;
-
-    _Atomic unsigned refcnt;
-    _Atomic int lock;
+    alignas(16) _Atomic unsigned refcnt;
 };
 
 struct client;
@@ -240,24 +236,20 @@ typedef enum {
 struct message {
     struct message *next;
     struct message *next_queue;
-
     struct topic *topic;
-
-    uint8_t format;
     const void *payload;
+    uint8_t format;
     size_t payload_len;
     unsigned qos;
     message_state state;
-
-    _Atomic int lock;
-    _Atomic unsigned refcnt;
+    alignas(16) _Atomic unsigned refcnt;
 };
 
 struct topic_sub_request {
-    unsigned num_topics;
     const uint8_t **topics;
     uint8_t *options;
     uint8_t *response_codes;
+    unsigned num_topics;
 };
 
 struct subscription {
@@ -269,28 +261,30 @@ struct subscription {
 struct client {
     struct client *next;
     struct mqtt_packet *active_packets;
+    pthread_rwlock_t subscriptions_lock;
 
-    client_state state;
-
-    int fd;
-    unsigned qos;
     const uint8_t *client_id;
     const uint8_t *username;
     const uint8_t *password;
+    struct subscription (*subscriptions)[];
+    client_state state;
+    int fd;
+    unsigned qos;
+    unsigned num_subscriptions;
+    /* host byte order */
+    in_addr_t remote_addr;
+    in_port_t remote_port;
     uint16_t password_len;
     uint16_t last_packet_id;
-
-    struct subscription (*subscriptions)[];
-    unsigned num_subscriptions;
+    char hostname[INET_ADDRSTRLEN];
 };
 
 struct topic {
     struct topic *next;
     const uint8_t *name;
     struct subscription (*subscribers)[];
-    unsigned num_subscribers;
-
     struct message *pending_queue;
+    unsigned num_subscribers;
 };
 
 
