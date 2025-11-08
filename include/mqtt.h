@@ -207,8 +207,15 @@ struct mqtt_packet {
     struct property (*properties)[];
 
     uint16_t packet_identifier;
+    
     uint32_t payload_len;
     void *payload;
+    struct message *message;
+
+    unsigned num_will_props;
+    struct property (*will_props)[];
+
+    uint8_t reason_code;
 
     _Atomic unsigned refcnt;
     _Atomic int lock;
@@ -238,14 +245,19 @@ struct message {
 
     uint8_t format;
     const void *payload;
+    size_t payload_len;
     unsigned qos;
     message_state state;
+
+    _Atomic int lock;
+    _Atomic unsigned refcnt;
 };
 
 struct topic_sub_request {
     unsigned num_topics;
     const uint8_t **topics;
     uint8_t *options;
+    uint8_t *response_codes;
 };
 
 struct subscription {
@@ -266,6 +278,7 @@ struct client {
     const uint8_t *username;
     const uint8_t *password;
     uint16_t password_len;
+    uint16_t last_packet_id;
 
     struct subscription (*subscriptions)[];
     unsigned num_subscriptions;
