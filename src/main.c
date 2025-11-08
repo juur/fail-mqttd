@@ -834,8 +834,8 @@ fail:
 
     errno = 0;
 
-    if ((tmp_subs = (void *)realloc(topic->subscribers,
-                    sizeof(struct subscription) * (topic->num_subscribers + 1))) == NULL)
+    size_t sub_size = sizeof(struct subscription) * (topic->num_subscribers + 1);
+    if ((tmp_subs = (void *)realloc(topic->subscribers, sub_size)) == NULL)
         return -1;
 
     topic->subscribers = tmp_subs;
@@ -873,6 +873,7 @@ fail:
     errno = 0;
 
     size_t sub_size = sizeof(struct subscription) * (client->num_subscriptions + request->num_topics);
+
     if ((tmp_subs = (void *)realloc(client->subscriptions, sub_size)) == NULL) {
         for (unsigned idx = 0; idx < request->num_topics; idx++)
             request->response_codes[idx] = MQTT_UNSPECIFIED_ERROR;
@@ -1350,7 +1351,7 @@ fail:
         if ((tmp = realloc(request->response_codes, u8_size)) == NULL)
             goto fail;
         request->response_codes = tmp;
-        
+
         if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL) {
             reason_code = MQTT_MALFORMED_PACKET;
             goto fail;
@@ -1576,9 +1577,11 @@ fail:
                     will_payload, client->qos) == -1) {
             warn("handle_cp_connect: register_message");
             free(will_topic);
+            will_topic = NULL;
             goto fail;
         }
         free(will_topic);
+        will_topic = NULL;
         packet->payload = NULL;
         packet->payload_len = 0;
     }
@@ -1588,6 +1591,8 @@ fail:
 
 fail:
     send_cp_connack(client, response_code);
+    if (will_topic)
+        free(will_topic);
     if (will_props)
         free_properties(will_props, num_will_props);
     if (will_payload)
