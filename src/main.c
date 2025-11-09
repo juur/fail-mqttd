@@ -832,6 +832,8 @@ fail:
                     warn("parse_properties: unsupported property identifier %u\n", prop->identifier);
             }
 
+        skip = 0;
+
         switch (prop->type)
         {
             case MQTT_TYPE_BYTE:
@@ -861,21 +863,21 @@ fail:
                 prop->varbyte = read_var_byte(ptr, bytes_left);
                 if (prop->varbyte == 0 && errno)
                     goto fail;
-                skip = 0;
                 break;
 
             case MQTT_TYPE_UTF8_STRING:
                 prop->utf8_string = read_utf8(ptr, bytes_left);
                 if (prop->utf8_string == NULL)
                     goto fail;
-                skip = 0;
                 break;
 
             case MQTT_TYPE_BINARY:
                 if (*bytes_left < 2)
                     goto fail;
+
                 memcpy(&prop->binary.len, *ptr, 2);
                 prop->binary.len = ntohs(prop->binary.len);
+
                 if (prop->binary.len) {
                     if (prop->binary.len > *bytes_left)
                         goto fail;
@@ -888,7 +890,6 @@ fail:
                     *bytes_left -= prop->binary.len;
 
                 }
-                skip = 0;
                 break;
 
             case MQTT_TYPE_UTF8_STRING_PAIR:
@@ -900,7 +901,6 @@ fail:
                 if (prop->utf8_pair[1] == NULL)
                     goto fail;
 
-                skip = 0;
                 break;
 
             case MQTT_TYPE_MAX: /* Avoid GCC warnings */
@@ -1535,11 +1535,13 @@ fail:
     *ptr = length - sizeof(struct mqtt_fixed_header) - 1; /* Remaining Length */
     ptr++;
 
-    *ptr = 0;            /* Connect Ack Flags */
+    *ptr = 0;           /* Connect Ack Flags */
     ptr++;
 
-    *ptr =reason_code; /* Connect Reason Code */
+    *ptr = reason_code; /* Connect Reason Code */
     ptr++;
+
+    /* properties length is set to 0 in calloc() */
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
@@ -1903,9 +1905,11 @@ fail:
     uint8_t *topic_name = NULL;
     uint16_t packet_identifier = 0;
     mqtt_reason_codes reason_code = MQTT_UNSPECIFIED_ERROR;
+    unsigned qos = 0;
+    [[maybe_unused]] bool flag_retain;
+    [[maybe_unused]] bool flag_dup;
 
     errno = 0;
-    packet_identifier = 0;
 
     if ((topic_name = read_utf8(&ptr, &bytes_left)) == NULL) {
         reason_code = MQTT_MALFORMED_PACKET;
@@ -1919,13 +1923,10 @@ fail:
 
     dbg_printf("handle_cp_publish: topic=<%s> ", topic_name);
 
-    unsigned qos;
-    [[maybe_unused]] bool flag_retain;
-    [[maybe_unused]] bool flag_dup;
+    qos = GET_QOS(packet->flags); // & (1<<1|1<<2)) >> 1;
+    flag_retain = (packet->flags & MQTT_FLAG_PUBLISH_RETAIN) == 1;
+    flag_dup = (packet->flags & MQTT_FLAG_PUBLISH_DUP) == MQTT_FLAG_PUBLISH_DUP;
 
-    qos = (packet->flags & (1<<1|1<<2)) >> 1;
-    flag_retain = (packet->flags & 1) == 1;
-    flag_dup = (packet->flags & (1<<3)) == (1<<3);
     dbg_printf("qos=%u ", qos);
 
     if (qos > 2) {
@@ -2576,10 +2577,16 @@ static void tick_msg(struct message *msg)
             continue;
         }
 
+        if (client_state->client == NULL) {
+            warnx("tick_msg: client_state->client is NULL");
+            continue;
+        }
+
         dbg_printf("tick: sending message\n");
 
         if ((packet = alloc_packet(client_state->client)) == NULL) {
-            warn("tick: unable to alloc_packet for msg on topic <%s>", msg->topic->name);
+            warn("tick: unable to alloc_packet for msg on topic <%s>",
+                    msg->topic->name);
             continue; /* FIXME */
         }
 
@@ -2604,13 +2611,14 @@ static void tick_msg(struct message *msg)
         }
 
         packet->reason_code = MQTT_SUCCESS;
+
         /* TODO make this async START ?? */
         client_state->last_sent = time(0);
         if (send_cp_publish(packet) == -1) {
             client_state->last_sent = 0;
             warn("tick: unable to send_cp_publish");
+            free_packet(packet); /* Anything else? */
             continue;
-            /* FIXME alloc_packet leak */
         }
 
         if (msg->qos == 0) /* Fake? */
