@@ -61,6 +61,7 @@ typedef enum {
 #define MQTT_FLAG_PUBLISH_QOS (1<<2|1<<1)
 #define MQTT_FLAG_PUBLISH_RETAIN (1<<0)
 
+#define MQTT_CONNECT_FLAG_RESERVED      (1<<0)
 #define MQTT_CONNECT_FLAG_CLEAN_START   (1<<1)
 #define MQTT_CONNECT_FLAG_WILL_FLAG     (1<<2)
 #define MQTT_CONNECT_FLAG_WILL_QOS      ((1<<3)|(1<<4))
@@ -196,15 +197,6 @@ struct mqtt_packet {
     ssize_t remaining_length;
     unsigned flags;
 
-    union {
-        struct {
-            unsigned flags;
-            unsigned length;
-            unsigned keep_alive;
-            unsigned version;
-        } connect_hdr;
-    };
-
     struct property (*properties)[];
     struct property (*will_props)[];
     void *payload;
@@ -225,6 +217,7 @@ typedef enum {
     CS_ACTIVE = 1,
     CS_CLOSING = 2,
     CS_CLOSED = 3,
+    CS_DISCONNECTED = 4,
 } client_state;
 
 typedef enum {
@@ -233,15 +226,25 @@ typedef enum {
     MSG_DEAD = 2,
 } message_state;
 
+struct client_message_state {
+    struct client *client;
+    time_t last_sent;
+    uint16_t packet_identifier;
+    time_t acknowledged_at;
+};
+
 struct message {
     struct message *next;
     struct message *next_queue;
+    struct client *sender;
     struct topic *topic;
     const void *payload;
     uint8_t format;
     size_t payload_len;
     unsigned qos;
     message_state state;
+    unsigned num_client_states;
+    struct client_message_state (*client_states)[];
     alignas(16) _Atomic unsigned refcnt;
 };
 
@@ -277,6 +280,11 @@ struct client {
     uint16_t password_len;
     uint16_t last_packet_id;
     char hostname[INET_ADDRSTRLEN];
+    uint8_t connect_flags;
+    uint8_t protocol_version;
+    uint16_t keep_alive;
+    time_t last_connected;
+    time_t last_keep_alive;
 };
 
 struct topic {
@@ -284,6 +292,8 @@ struct topic {
     const uint8_t *name;
     struct subscription (*subscribers)[];
     struct message *pending_queue;
+    pthread_rwlock_t subscribers_lock;
+    pthread_rwlock_t pending_queue_lock;
     unsigned num_subscribers;
 };
 
