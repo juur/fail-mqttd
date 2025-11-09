@@ -19,6 +19,24 @@ const mqtt_payload_required mqtt_packet_to_payload[MQTT_CP_MAX] = {
     [MQTT_CP_AUTH]        = MQTT_PAYLOAD_NONE,
 };
 
+const uint8_t mqtt_packet_permitted_flags[MQTT_CP_MAX] = {
+    [MQTT_CP_CONNECT]     = ~0x0,
+    [MQTT_CP_CONNACK]     = ~0x0,
+    [MQTT_CP_PUBLISH]     = ~0xf,
+    [MQTT_CP_PUBACK]      = ~0x0,
+    [MQTT_CP_PUBREC]      = ~0x0,
+    [MQTT_CP_PUBREL]      = ~0x2,
+    [MQTT_CP_PUBCOMP]     = ~0x0,
+    [MQTT_CP_SUBSCRIBE]   = ~0x2,
+    [MQTT_CP_SUBACK]      = ~0x0,
+    [MQTT_CP_UNSUBSCRIBE] = ~0x2,
+    [MQTT_CP_UNSUBACK]    = ~0x0,
+    [MQTT_CP_PINGREQ]     = ~0x0,
+    [MQTT_CP_PINGRESP]    = ~0x0,
+    [MQTT_CP_DISCONNECT]  = ~0x0,
+    [MQTT_CP_AUTH]        = ~0x0,
+};
+
 const char *const mqtt_packet_type_strings[MQTT_CP_MAX] = {
     [MQTT_CP_CONNECT]     = "CONNECT",
     [MQTT_CP_CONNACK]     = "CONNACK",

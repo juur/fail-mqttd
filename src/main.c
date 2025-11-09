@@ -269,6 +269,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     }
 
     if (pck->owner) {
+        pthread_rwlock_wrlock(&pck->owner->active_packets_lock);
         if (pck->owner->active_packets == pck) {
             pck->owner->active_packets = pck->next_client;
         } else for (tmp = pck->owner->active_packets; tmp; tmp = tmp->next_client)
@@ -280,6 +281,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
         }
         pck->next_client = NULL;
         pck->owner = NULL;
+        pthread_rwlock_unlock(&pck->owner->active_packets_lock);
     }
 
     pthread_rwlock_wrlock(&global_packets_lock);
@@ -349,6 +351,12 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
         msg->payload = NULL;
     }
 
+    /* TODO do this properly */
+    if (msg->client_states)
+        free(msg->client_states);
+
+    pthread_rwlock_destroy(&msg->client_states_lock);
+
     num_messages--;
     free(msg);
 }
@@ -357,13 +365,11 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 {
     struct client *tmp;
 
-    if (client->state == CS_CLOSED)
-        err(EXIT_FAILURE, "free_client: double free");
-
     client->state = CS_CLOSED;
 
     if (needs_lock)
         pthread_rwlock_wrlock(&global_clients_lock);
+
     if (global_client_list == client) {
         global_client_list = client->next;
     } else for (tmp = global_client_list; tmp; tmp = tmp->next) {
@@ -374,13 +380,17 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     }
     if (needs_lock)
         pthread_rwlock_unlock(&global_clients_lock);
+
     client->next = NULL;
 
+    pthread_rwlock_wrlock(&client->active_packets_lock);
     for (struct mqtt_packet *p = client->active_packets, *next; p; p = next)
     {
         next = p->next_client;
         free_packet(p);
     }
+    client->active_packets = NULL;
+    pthread_rwlock_unlock(&client->active_packets_lock);
 
     pthread_rwlock_wrlock(&global_packets_lock);
     for (struct mqtt_packet *p = global_packet_list; p; p = p->next)
@@ -390,7 +400,6 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     }
     pthread_rwlock_unlock(&global_packets_lock);
 
-    client->active_packets = NULL;
 
     if (client->fd != -1)
         close_socket(&client->fd);
@@ -423,6 +432,16 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
         client->num_subscriptions = 0;
     }
     pthread_rwlock_unlock(&client->subscriptions_lock);
+
+    /* TODO do this properly */
+    pthread_rwlock_wrlock(&client->packet_ids_to_states_lock);
+    if (client->packet_ids_to_states)
+        free (client->packet_ids_to_states);
+    pthread_rwlock_unlock(&client->packet_ids_to_states_lock);
+
+    pthread_rwlock_destroy(&client->subscriptions_lock);
+    pthread_rwlock_destroy(&client->active_packets_lock);
+    pthread_rwlock_destroy(&client->packet_ids_to_states_lock);
 
     num_clients--;
     free(client);
@@ -467,8 +486,10 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 
     if (owner) {
         ret->owner = owner;
+        pthread_rwlock_wrlock(&owner->active_packets_lock);
         ret->next_client = owner->active_packets;
         owner->active_packets = ret;
+        pthread_rwlock_unlock(&owner->active_packets_lock);
     }
 
     pthread_rwlock_wrlock(&global_packets_lock);
@@ -522,6 +543,10 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     client->fd = -1;
     if (pthread_rwlock_init(&client->subscriptions_lock, NULL) == -1)
         goto fail;
+    if (pthread_rwlock_init(&client->active_packets_lock, NULL) == -1)
+        goto fail;
+    if (pthread_rwlock_init(&client->packet_ids_to_states_lock, NULL) == -1)
+        goto fail;
 
     pthread_rwlock_wrlock(&global_clients_lock);
     client->next = global_client_list;
@@ -551,9 +576,6 @@ fail:
     ptr = name;
 
     if (!*ptr)
-        return -1;
-
-    if (!strcmp((const char *)ptr, "/"))
         return -1;
 
     while (*ptr)
@@ -818,6 +840,7 @@ fail:
                 prop->byte = **ptr;
                 skip = 1;
                 break;
+
             case MQTT_TYPE_2BYTE:
                 if (*bytes_left < 2)
                     goto fail;
@@ -825,6 +848,7 @@ fail:
                 prop->byte2 = ntohs(prop->byte2);
                 skip = 2;
                 break;
+
             case MQTT_TYPE_4BYTE:
                 if (*bytes_left < 4)
                     goto fail;
@@ -832,20 +856,57 @@ fail:
                 prop->byte4 = ntohl(prop->byte4);
                 skip = 4;
                 break;
+
             case MQTT_TYPE_VARBYTE:
                 prop->varbyte = read_var_byte(ptr, bytes_left);
                 if (prop->varbyte == 0 && errno)
                     goto fail;
                 skip = 0;
                 break;
+
             case MQTT_TYPE_UTF8_STRING:
                 prop->utf8_string = read_utf8(ptr, bytes_left);
                 if (prop->utf8_string == NULL)
                     goto fail;
                 skip = 0;
                 break;
-            default:
-                warn("parse_properties: unsupported type %u\n", mqtt_property_to_type[prop->type]);
+
+            case MQTT_TYPE_BINARY:
+                if (*bytes_left < 2)
+                    goto fail;
+                memcpy(&prop->binary.len, *ptr, 2);
+                prop->binary.len = ntohs(prop->binary.len);
+                if (prop->binary.len) {
+                    if (prop->binary.len > *bytes_left)
+                        goto fail;
+
+                    if ((prop->binary.data = malloc(prop->binary.len)) == NULL)
+                        goto fail;
+
+                    memcpy(prop->binary.data, *ptr, prop->binary.len);
+                    *ptr += prop->binary.len;
+                    *bytes_left -= prop->binary.len;
+
+                }
+                skip = 0;
+                break;
+
+            case MQTT_TYPE_UTF8_STRING_PAIR:
+                prop->utf8_pair[0] = read_utf8(ptr, bytes_left);
+                if (prop->utf8_pair[0] == NULL)
+                    goto fail;
+
+                prop->utf8_pair[1] = read_utf8(ptr, bytes_left);
+                if (prop->utf8_pair[1] == NULL)
+                    goto fail;
+
+                skip = 0;
+                break;
+
+            case MQTT_TYPE_MAX: /* Avoid GCC warnings */
+            case MQTT_TYPE_UNDEFINED:
+                errno = EINVAL;
+                warn("parse_properties: illegal use of property type 0");
                 goto fail;
         }
 
@@ -865,6 +926,35 @@ fail:
 fail:
     if (props)
         free_properties(props, num_props);
+
+    return -1;
+}
+
+static int add_to_packet_ids(struct client_message_state *cs, struct message *msg)
+{
+    struct packet_id_to_state (*tmp)[];
+    pthread_rwlock_wrlock(&cs->client->packet_ids_to_states_lock);
+    unsigned tmp_size = cs->client->num_packet_id_to_state + 1;
+
+    if ((tmp = realloc(cs->client->packet_ids_to_states,
+                    sizeof(struct packet_id_to_state) * tmp_size)) == NULL) {
+        pthread_rwlock_unlock(&cs->client->packet_ids_to_states_lock);
+        goto fail;
+    }
+
+    (*tmp)[tmp_size - 1].packet_identifier = cs->packet_identifier;
+    (*tmp)[tmp_size - 1].message = msg;
+    (*tmp)[tmp_size - 1].state = cs;
+
+    cs->client->packet_ids_to_states = tmp;
+    cs->client->num_packet_id_to_state = tmp_size;
+    pthread_rwlock_unlock(&cs->client->packet_ids_to_states_lock);
+
+    return 0;
+
+fail:
+    if (tmp)
+        free(tmp);
 
     return -1;
 }
@@ -1029,7 +1119,7 @@ done:
     return 0;
 }
 
-[[gnu::nonnull,gnu::access(read_only,4,3)]] static int register_message(const uint8_t *topic_name,
+[[gnu::nonnull,gnu::access(read_only,4,3)]] static struct message *register_message(const uint8_t *topic_name,
         int format, uint16_t len, const void *payload, unsigned qos, struct client *sender)
 {
     struct topic *topic;
@@ -1077,12 +1167,12 @@ done:
 
     /* TODO register the message for delivery and commit */
 
-    return 0;
+    return msg;
 
 fail:
     if (tmp_name)
         free((void *)tmp_name);
-    return -1;
+    return NULL;
 }
 
 [[gnu::nonnull]] static int add_subscription_to_topic(struct topic *topic,
@@ -1309,7 +1399,7 @@ fail:
     length += 2; /* [2-3] UTF-8 length */
     length += (topic_len = strlen((char *)pkt->message->topic->name)); /* [4..] */
 
-    if (msg->qos)
+    if ((pkt->flags & MQTT_FLAG_PUBLISH_QOS_MASK))
         length += 2; /* packet identifier */
 
     length += 1; /* properties length */
@@ -1320,7 +1410,7 @@ fail:
         return -1;
 
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_PUBLISH;
-    ((struct mqtt_fixed_header *)ptr)->flags |= (msg->qos) << 2;
+    ((struct mqtt_fixed_header *)ptr)->flags = pkt->flags;
     ptr++;
 
     *ptr = length - sizeof(struct mqtt_fixed_header) - 1; /* Remaining Length */
@@ -1333,7 +1423,7 @@ fail:
     memcpy(ptr, msg->topic->name, topic_len);
     ptr += topic_len;
 
-    if (msg->qos) {
+    if (pkt->flags & MQTT_FLAG_PUBLISH_QOS_MASK) {
         tmp = htons(pkt->packet_identifier); /* TODO proper packet identifier */
         memcpy(ptr, &tmp, 2);
         ptr += 2;
@@ -1464,6 +1554,92 @@ fail:
     return 0;
 }
 
+static int send_cp_pubrec(struct client *client, uint16_t packet_id, mqtt_reason_codes reason_code)
+{
+    ssize_t length, wr_len;
+    uint8_t *packet, *ptr;
+    uint16_t tmp;
+
+    errno = 0;
+
+    if (reason_code == MQTT_MALFORMED_PACKET || reason_code == MQTT_PROTOCOL_ERROR) {
+        /* Is this an illegal state? Should it always be DISCONNECT */
+        client->state = CS_CLOSING;
+        return 0;
+    }
+
+    length = sizeof(struct mqtt_fixed_header);
+    length += 1; /* Remaining Length */
+
+    length += 3; /* Packet Identifier + Reason Code */
+
+    length += 1; /* Properties Length */
+
+    if ((ptr = packet = calloc(1, length)) == NULL)
+        return -1;
+
+    ((struct mqtt_fixed_header *)packet)->type = MQTT_CP_PUBREC;
+    ptr++;
+
+    *ptr = length - sizeof(struct mqtt_fixed_header) - 1;
+    ptr++;
+
+    tmp = htons(packet_id);
+    memcpy(ptr, &tmp, 2);
+    ptr += 2;
+
+    *ptr = reason_code;
+    ptr++;
+
+    if ((wr_len = write(client->fd, packet, length)) != length) {
+        free(packet);
+        return log_io_error(NULL, wr_len, length, false);
+    }
+
+    free(packet);
+
+    return 0;
+}
+
+static int send_cp_pubcomp(struct client *client, uint16_t packet_id, mqtt_reason_codes reason_code)
+{
+    ssize_t length, wr_len;
+    uint8_t *packet, *ptr;
+    uint16_t tmp;
+
+    errno = 0;
+
+    length = sizeof(struct mqtt_fixed_header);
+    length +=1; /* Remaining Length */
+
+    length +=3;
+
+    if ((ptr = packet = calloc(1, length)) == NULL)
+        return -1;
+
+    ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_PUBCOMP;
+    ptr++;
+
+    *ptr = length - sizeof(struct mqtt_fixed_header) - 1;
+    ptr++;
+
+    tmp = htons(packet_id);
+    memcpy(ptr, &tmp, 2);
+    ptr += 2;
+
+    *ptr = reason_code;
+    ptr++;
+
+    if ((wr_len = write(client->fd, packet, length)) != length) {
+        free(packet);
+        return log_io_error(NULL, wr_len, length, false);
+    }
+
+    free(packet);
+
+    return 0;
+}
+
 static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason_codes reason_code)
 {
     ssize_t length, wr_len;
@@ -1487,7 +1663,7 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
 
-    ((struct mqtt_fixed_header *)packet)->type = MQTT_CP_PUBACK;
+    ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_PUBACK;
     ptr++;
 
     *ptr = length - sizeof(struct mqtt_fixed_header) - 1;
@@ -1568,6 +1744,7 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
 
     free(packet);
 
+    pthread_rwlock_wrlock(&client->active_packets_lock);
     for (struct mqtt_packet *tmp = client->active_packets; tmp; tmp = tmp->next_client)
     {
         if (tmp->packet_identifier == packet_id && atomic_load_explicit(&tmp->refcnt, memory_order_relaxed) > 0) {
@@ -1576,6 +1753,7 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
         }
 
     }
+    pthread_rwlock_unlock(&client->active_packets_lock);
 
     return 0;
 }
@@ -1583,6 +1761,139 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
 /*
  * control packet processing functions
  */
+
+[[gnu::nonnull]] static int handle_cp_pubrel(struct client *client,
+        struct mqtt_packet *packet, const void *remain)
+{
+    const uint8_t *ptr = remain;
+    size_t bytes_left = packet->remaining_length;
+    mqtt_reason_codes reason_code = MQTT_UNSPECIFIED_ERROR;
+    [[maybe_unused]] mqtt_reason_codes pubrel_reason_code = 0;
+    uint16_t tmp;
+
+    dbg_printf("handle_cp_pubrel: bytes_left=%lu\n", bytes_left);
+
+    errno = 0;
+
+    if (packet->flags != 0x2) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+
+    if (bytes_left < 2) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+
+    memcpy(&tmp, ptr, 2);
+    packet->packet_identifier = ntohs(tmp);
+    ptr += 2;
+    bytes_left -= 2;
+
+    if (packet->packet_identifier == 0) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
+
+    if (bytes_left == 0) {
+        pubrel_reason_code = MQTT_SUCCESS;
+        goto skip_props;
+    }
+
+    pubrel_reason_code = *ptr;
+    ptr++;
+    bytes_left--;
+
+    if (parse_properties(&ptr, &bytes_left, &packet->properties, &packet->property_count, MQTT_CP_PUBREL) == -1) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+skip_props:
+
+    return send_cp_pubcomp(client, packet->packet_identifier, MQTT_SUCCESS);
+
+fail:
+    if (reason_code == MQTT_MALFORMED_PACKET || reason_code == MQTT_PROTOCOL_ERROR) {
+        errno = EINVAL;
+        client->state = CS_CLOSING;
+    }
+
+    return -1;
+}
+
+[[gnu::nonnull]] static int handle_cp_pubrec(struct client *client,
+        struct mqtt_packet *packet, const void *remain)
+{
+    const uint8_t *ptr = remain;
+    size_t bytes_left = packet->remaining_length;
+    mqtt_reason_codes reason_code = MQTT_UNSPECIFIED_ERROR;
+    [[maybe_unused]] mqtt_reason_codes pubrec_reason_code = 0;
+    uint16_t packet_identifier;
+
+    errno = 0;
+
+    if (bytes_left < 2) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+
+    memcpy(&packet_identifier, ptr, 2);
+    bytes_left -= 2;
+    ptr += 2;
+    packet_identifier = ntohs(packet_identifier);
+
+    if (packet_identifier == 0) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
+
+    /* The Reason Code and Property Length can be omitted if the Reason Code
+     * is 0x00 (Success) and there are no Properties. */
+    if (bytes_left == 0) {
+        goto skip_props;
+    }
+
+    pubrec_reason_code = *ptr;
+    ptr++;
+
+    if (parse_properties(&ptr, &bytes_left, &packet->properties,
+                &packet->property_count, MQTT_CP_PUBREC) == -1) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+skip_props:
+    pubrec_reason_code = MQTT_SUCCESS;
+
+    bool found = false;
+    pthread_rwlock_wrlock(&client->packet_ids_to_states_lock);
+    for (unsigned idx = 0; idx < client->num_packet_id_to_state; idx++)
+    {
+        if ((*client->packet_ids_to_states)[idx].packet_identifier == packet_identifier) {
+            struct packet_id_to_state *ptos = &(*client->packet_ids_to_states)[idx];
+            ptos->state->acknowledged_at = time(0);
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&client->packet_ids_to_states_lock);
+
+    if (found == false) {
+        reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
+        warn("handle_cp_pubrec: cannot find packet_identifier %u for client %s\n",
+                packet_identifier, (char *)client->client_id);
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    if (reason_code == MQTT_MALFORMED_PACKET || reason_code == MQTT_PROTOCOL_ERROR) {
+        errno = EINVAL;
+        client->state = CS_CLOSING;
+        client->disconnect_reason = reason_code;
+    }
+
+    return -1;
+}
 
 [[gnu::nonnull]] static int handle_cp_publish(struct client *client,
         struct mqtt_packet *packet, const void *remain)
@@ -1628,6 +1939,10 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
         packet_identifier = ntohs(packet_identifier);
         ptr += 2;
         bytes_left -= 2;
+        if (packet_identifier == 0) {
+            reason_code = MQTT_PROTOCOL_ERROR;
+            goto fail;
+        }
         dbg_printf("packet_ident=%u ", packet_identifier);
     }
 
@@ -1649,10 +1964,13 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
 
     dbg_printf("\n");
 
-    if (register_message(topic_name, payload_format, packet->payload_len, packet->payload, qos, client) == -1) {
+    struct message *msg;
+    if ((msg = register_message(topic_name, payload_format, packet->payload_len,
+                packet->payload, qos, client)) == NULL) {
         warn("handle_cp_publish: register_message");
         goto fail;
     }
+    msg->sender_packet_identifier = packet_identifier;
 
     free(topic_name);
 
@@ -1662,6 +1980,7 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
     if (qos == 1) {
         send_cp_puback(client, packet_identifier, MQTT_SUCCESS);
     } else if (qos == 2) {
+        send_cp_pubrec(client, packet_identifier, MQTT_SUCCESS);
     }
 
     return 0;
@@ -1672,15 +1991,20 @@ fail:
     if (topic_name) {
         free(topic_name);
     }
+
     if (packet->payload) {
         free(packet->payload);
         packet->payload_len = 0;
     }
 
-    send_cp_puback(client, packet_identifier, reason_code);
-
-    if (reason_code == MQTT_MALFORMED_PACKET || reason_code == MQTT_PROTOCOL_ERROR)
+    if (qos == 0 || reason_code == MQTT_MALFORMED_PACKET ||
+            reason_code == MQTT_PROTOCOL_ERROR) {
         client->state = CS_CLOSING;
+        client->disconnect_reason = reason_code;
+    } else if (qos == 1)
+        send_cp_puback(client, packet_identifier, reason_code);
+    else if (qos == 2)
+        send_cp_pubrec(client, packet_identifier, reason_code);
 
     return -1;
 }
@@ -1696,6 +2020,11 @@ fail:
 
     errno = 0;
 
+    if (packet->flags != 0x2) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+
     if (bytes_left < 3) {
         reason_code = MQTT_MALFORMED_PACKET;
         errno = ENOSPC;
@@ -1707,13 +2036,22 @@ fail:
     ptr += 2;
     bytes_left -= 2;
 
+    if (packet->packet_identifier == 0) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
+
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
                 &packet->property_count, MQTT_CP_SUBSCRIBE) == -1) {
         reason_code = MQTT_MALFORMED_PACKET;
         goto fail;
     }
 
-    /* check if bytes_left == 0 means malformed i.e. >= 1 topic required TODO */
+    /* Check for 0 topic filters */
+    if (bytes_left < 3) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
 
     if ((request = calloc(1, sizeof(struct topic_sub_request))) == NULL)
         goto fail;
@@ -1725,7 +2063,8 @@ fail:
             goto fail;
         }
 
-        if ((tmp = realloc(request->topics, sizeof(uint8_t *) * (request->num_topics + 1))) == NULL)
+        if ((tmp = realloc(request->topics,
+                        sizeof(uint8_t *) * (request->num_topics + 1))) == NULL)
             goto fail;
         request->topics = tmp;
 
@@ -1739,7 +2078,8 @@ fail:
             goto fail;
         request->response_codes = tmp;
 
-        if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL) {
+        if ((request->topics[request->num_topics] = read_utf8(&ptr,
+                        &bytes_left)) == NULL) {
             reason_code = MQTT_MALFORMED_PACKET;
             goto fail;
         }
@@ -1754,10 +2094,38 @@ fail:
         else
             request->response_codes[request->num_topics] = MQTT_SUCCESS;
 
+        /* Validate subscribe options byte */
+
+        /* bits 7 & 6 are reserved */
+        if ((*ptr & 0xc0)) {
+            reason_code = MQTT_MALFORMED_PACKET;
+            goto fail;
+        }
+
+        /* QoS can't be 3 */
+        if ((*ptr & 0x3) == 0x3) {
+            reason_code = MQTT_MALFORMED_PACKET;
+            goto fail;
+        }
+
+        /* retain handling can't be 3 */
+        if ((*ptr & 0x30) == 0x30) {
+            reason_code = MQTT_MALFORMED_PACKET;
+            goto fail;
+        }
+
+        if (!strncmp("$share/", (char *)request->topics[request->num_topics], 7)) {
+            if ((*ptr & 0x2)) {
+                reason_code = MQTT_MALFORMED_PACKET;
+                goto fail;
+            }
+        }
+
+        /* TODO do something with the RETAIN flag */
+
         request->options[request->num_topics] = *ptr++;
         bytes_left--;
 
-        //dbg_printf("handle_cp_subscribe: topic[%u] <%s> subscription_options=%u\n", num_topics - 1, topics[num_topics - 1].topic, topics[num_topics - 1].options);
         request->num_topics++;
     }
 
@@ -1790,7 +2158,10 @@ fail:
 
     errno = 0;
 
-    if (bytes_left >= 1) {
+    if (bytes_left == 0)
+        goto skip;
+
+    if (bytes_left > 0) {
         disconnect_reason = *ptr++;
         bytes_left--;
         dbg_printf("handle_cp_disconnect: disconnect reason was %u\n", disconnect_reason);
@@ -1801,8 +2172,10 @@ fail:
                     &packet->property_count, MQTT_CP_DISCONNECT) == -1)
             goto fail;
 
-    } else
+    } else {
+skip:
         dbg_printf("handle_cp_disconnect: no reason\n");
+    }
 
     client->state = CS_CLOSING;
     return 0;
@@ -1832,6 +2205,7 @@ fail:
     size_t bytes_left = packet->remaining_length;
     mqtt_reason_codes response_code = MQTT_UNSPECIFIED_ERROR;
     uint8_t *will_topic = NULL;
+    uint8_t will_qos = 0;
     void *will_payload = NULL;
     uint16_t will_payload_len;
     uint8_t payload_format = 0;
@@ -1978,24 +2352,25 @@ fail:
         goto fail;
     }
 
-    client->qos = GET_QOS(connect_flags);
+    will_qos = GET_WILL_QOS(connect_flags);
 
-    if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) == 0 && client->qos != 0) {
+    if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) == 0 && will_qos != 0) {
         response_code = MQTT_PROTOCOL_ERROR;
         goto fail;
     }
 
-    if (client->qos > 2) {
+    if (will_qos > 2) {
         response_code = MQTT_MALFORMED_PACKET;
         goto fail;
     }
 
-    dbg_printf("QoS [%u]\n", client->qos);
+    dbg_printf("QoS [%u]\n", will_qos);
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
         //dbg_printf("handle_cp_connect: creating a message\n");
-        if (register_message(will_topic, payload_format, will_payload_len,
-                    will_payload, client->qos, client) == -1) {
+        struct message *msg;
+        if ((msg = register_message(will_topic, payload_format, will_payload_len,
+                    will_payload, will_qos, client)) == NULL) {
             warn("handle_cp_connect: register_message");
             free(will_topic);
             will_topic = NULL;
@@ -2015,7 +2390,12 @@ fail:
     return 0;
 
 fail:
-    send_cp_connack(client, response_code);
+    if (response_code == MQTT_MALFORMED_PACKET || response_code == MQTT_PROTOCOL_ERROR) {
+        client->state = CS_CLOSING;
+        client->disconnect_reason = response_code;
+    } else
+        send_cp_connack(client, response_code);
+
     if (will_topic)
         free(will_topic);
     if (will_props)
@@ -2035,6 +2415,8 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
     [MQTT_CP_PINGREQ]    = handle_cp_pingreq,
     [MQTT_CP_PUBLISH]    = handle_cp_publish,
     [MQTT_CP_SUBSCRIBE]  = handle_cp_subscribe,
+    [MQTT_CP_PUBREC]     = handle_cp_pubrec,
+    [MQTT_CP_PUBREL]     = handle_cp_pubrel,
 };
 
 /*
@@ -2068,18 +2450,18 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
 
     dbg_printf("parse_incoming: type=%u flags=%u\n", hdr.type, hdr.flags);
 
-    if (hdr.type >= MQTT_CP_MAX) {
-        warnx("invalid hdr.type");
+    if (hdr.type >= MQTT_CP_MAX || hdr.type == 0) {
+        warnx("parse_incoming: invalid header type");
         goto fail;
     }
 
     if (control_functions[hdr.type] == NULL) {
-        warnx("unsupported packet %d", hdr.type);
+        warnx("parse_incoming: unsupported packet %d", hdr.type);
         goto fail;
     }
 
     if ((new_packet = alloc_packet(client)) == NULL) {
-        warn("alloc_packet");
+        warn("parse_incoming: alloc_packet");
         goto fail;
     }
 
@@ -2092,7 +2474,7 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
             goto fail;
         }
         if (multi > 128*128*128) {
-            warn("invalid variable byte int");
+            warnx("parse_incoming: invalid variable byte int");
             goto fail;
         }
         value += (tmp & 127) * multi;
@@ -2113,6 +2495,11 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
     if ((rd_len = read(client->fd, packet, new_packet->remaining_length)) !=
             new_packet->remaining_length) {
         log_io_error(NULL, rd_len, new_packet->remaining_length, false);
+        goto fail;
+    }
+
+    /* per table 2-2 */
+    if (new_packet->flags & mqtt_packet_permitted_flags[new_packet->type]) {
         goto fail;
     }
 
@@ -2138,32 +2525,122 @@ fail:
 
 #define MAX_MESSAGES_PER_TICK 100
 
-static void tick(void)
+/* Clients */
+
+static void client_tick(void)
 {
-    struct mqtt_packet *packet;
-
-    /* Clients */
-
     pthread_rwlock_wrlock(&global_clients_lock);
     for (struct client *clnt = global_client_list, *next; clnt; clnt = next)
     {
         next = clnt->next;
 
-        if (clnt->state == CS_CLOSED || clnt->state == CS_NEW)
-            continue;
+        switch (clnt->state)
+        {
+            case CS_ACTIVE:
+            case CS_NEW:
+                continue;
 
-        if (clnt->state == CS_DISCONNECTED) {
-            /* TODO timeout check ? */
+            case CS_DISCONNECTED:
+                continue;
+
+            case CS_CLOSING:
+                if (clnt->disconnect_reason)
+                    send_cp_disconnect(clnt, clnt->disconnect_reason);
+                clnt->state = CS_CLOSED;
+                break;
+
+            case CS_CLOSED:
+                free_client(clnt, false);
+                break;
+        }
+    }
+    pthread_rwlock_unlock(&global_clients_lock);
+}
+
+
+static void tick_msg(struct message *msg)
+{
+    struct client_message_state *client_state;
+    unsigned num_sent = 0;
+    struct mqtt_packet *packet;
+
+    if (msg->client_states == NULL)
+        return;
+
+    pthread_rwlock_wrlock(&msg->client_states_lock);
+    for (unsigned idx = 0; idx < msg->num_client_states; idx++) {
+        client_state = &(*msg->client_states)[idx];
+
+        if (client_state->acknowledged_at) {
+            num_sent++;
             continue;
         }
 
-        if (clnt->state == CS_CLOSING)
-            free_client(clnt, false);
+        dbg_printf("tick: sending message\n");
+
+        if ((packet = alloc_packet(client_state->client)) == NULL) {
+            warn("tick: unable to alloc_packet for msg on topic <%s>", msg->topic->name);
+            continue; /* FIXME */
+        }
+
+        packet->message = msg;
+        packet->type = MQTT_CP_PUBLISH;
+        packet->flags |= MQTT_FLAG_PUBLISH_QOS(msg->qos);
+
+        if (msg->qos) {
+            if (client_state->packet_identifier == 0) {
+                client_state->packet_identifier = ++packet->owner->last_packet_id;
+            }
+            packet->packet_identifier = client_state->packet_identifier;
+
+            /* acknowledged_at is 0, so this must be a retry? */
+            if (client_state->last_sent) {
+                packet->flags |= MQTT_FLAG_PUBLISH_DUP;
+            }
+            if (add_to_packet_ids(client_state, msg) == -1) {
+                warn("tick: unable to add_to_packet_ids");
+                /* FIXME alloc_packet leak */
+            }
+        }
+
+        packet->reason_code = MQTT_SUCCESS;
+        /* TODO make this async START ?? */
+        client_state->last_sent = time(0);
+        if (send_cp_publish(packet) == -1) {
+            client_state->last_sent = 0;
+            warn("tick: unable to send_cp_publish");
+            continue;
+            /* FIXME alloc_packet leak */
+        }
+
+        if (msg->qos == 0) /* Fake? */
+            client_state->acknowledged_at = time(0);
+
+        free_packet(packet);
+        /* TODO async END */
     }
-    pthread_rwlock_unlock(&global_clients_lock);
 
-    /* Topics */
+    /* We have now sent everything */
+    if (num_sent == msg->num_client_states) {
+        /* TODO replace with list of subscribers to message, removal thereof,
+         * then dequeue when none left */
+        if (dequeue_message(msg) == -1) {
+            warn("tick: dequeue_message failed");
+        } else {
+            msg->state = MSG_DEAD;
+        }
 
+        msg->num_client_states = 0;
+        free(msg->client_states);
+        msg->client_states = NULL;
+    }
+    pthread_rwlock_unlock(&msg->client_states_lock);
+}
+
+/* Topics */
+
+static void topic_tick(void)
+{
     unsigned max_messages = MAX_MESSAGES_PER_TICK;
 
     pthread_rwlock_wrlock(&global_topics_lock);
@@ -2180,57 +2657,17 @@ static void tick(void)
                 break;
 
             next = msg->next_queue;
-
-            for (unsigned idx = 0; idx < topic->num_subscribers; idx++) {
-                if ((*topic->subscribers)[idx].client == NULL &&
-                        (*topic->subscribers)[idx].topic == NULL)
-                    continue;
-
-                dbg_printf("tick: sending message\n");
-
-                assert((*topic->subscribers)[idx].client != NULL);
-
-                if ((packet = alloc_packet((*topic->subscribers)[idx].client)) == NULL) {
-                    warn("tick: unable to alloc_packet for msg on topic <%s>", topic->name);
-                    continue; /* FIXME */
-                }
-
-                atomic_fetch_add_explicit(&msg->refcnt, 1, memory_order_relaxed);
-                packet->message = msg;
-                packet->type = MQTT_CP_PUBLISH;
-                packet->flags |= (msg->qos & 0x3) << 2;
-                if (msg->qos) {
-                    packet->packet_identifier = ++packet->owner->last_packet_id;
-                }
-                packet->reason_code = MQTT_SUCCESS;
-                /* TODO add packet to some outbound queue */
-
-                /* TODO make this async START */
-                if (send_cp_publish(packet) == -1) {
-                    warn("tick: unable to send_cp_publish");
-                    continue;
-                    /* FIXME alloc_packet leak */
-                }
-                free_packet(packet);
-                /* TODO async END */
-            }
-
-            if (atomic_load_explicit(&msg->refcnt, memory_order_acquire) == 0) {
-                /* TODO replace with list of subscribers to message, removal thereof,
-                 * then dequeue when none left */
-                if (dequeue_message(msg) == -1) {
-                    warn("tick: dequeue_message failed");
-                } else {
-                    msg->state = MSG_DEAD;
-                }
-            }
+            tick_msg(msg);
         }
         pthread_rwlock_unlock(&topic->pending_queue_lock);
     }
     pthread_rwlock_unlock(&global_topics_lock);
+}
 
-    /* Messages */
 
+/* Messages */
+static void message_tick(void)
+{
     pthread_rwlock_wrlock(&global_messages_lock);
     for (struct message *msg = global_message_list, *next; msg; msg = next)
     {
@@ -2242,6 +2679,13 @@ static void tick(void)
         free_message(msg, false);
     }
     pthread_rwlock_unlock(&global_messages_lock);
+}
+
+static void tick(void)
+{
+    client_tick();
+    topic_tick();
+    message_tick();
 }
 
 static int main_loop(int mother_fd)

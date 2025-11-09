@@ -57,19 +57,30 @@ typedef enum {
 #define MQTT_FLAG_SUBSCRIBE (1<<1)
 #define MQTT_FLAG_UNSUBSCRIBE (1<<1)
 
-#define MQTT_FLAG_PUBLISH_DUP (1<<3)
-#define MQTT_FLAG_PUBLISH_QOS (1<<2|1<<1)
 #define MQTT_FLAG_PUBLISH_RETAIN (1<<0)
+#define MQTT_FLAG_PUBLISH_QOS(x) (((x)&0x3) << 1U)
+#define MQTT_FLAG_PUBLISH_QOS0 (0)
+#define MQTT_FLAG_PUBLISH_QOS1 (1<<1)
+#define MQTT_FLAG_PUBLISH_QOS2 (1<<2)
+#define MQTT_FLAG_PUBLISH_QOS_MASK ((1<<1)|(1<<2))
+#define MQTT_FLAG_PUBLISH_DUP (1<<3)
 
 #define MQTT_CONNECT_FLAG_RESERVED      (1<<0)
 #define MQTT_CONNECT_FLAG_CLEAN_START   (1<<1)
 #define MQTT_CONNECT_FLAG_WILL_FLAG     (1<<2)
-#define MQTT_CONNECT_FLAG_WILL_QOS      ((1<<3)|(1<<4))
+#define MQTT_CONNECT_FLAG_WILL_QOS(x)   (((x)&0x3) << 3U)
+#define MQTT_CONNECT_FLAG_WILL_QOS0     (0)
+#define MQTT_CONNECT_FLAG_WILL_QOS1     (1<<3)
+#define MQTT_CONNECT_FLAG_WILL_QOS2     (1<<4)
+#define MQTT_CONNECT_FLAG_WILL_QOS_MASK ((1<<3)|(1<<4))
 #define MQTT_CONNECT_FLAG_WILL_RETAIN   (1<<5)
 #define MQTT_CONNECT_FLAG_PASSWORD      (1<<6)
 #define MQTT_CONNECT_FLAG_USERNAME      (1<<7)
 
-#define GET_QOS(x) (((x) & MQTT_CONNECT_FLAG_WILL_QOS) >> 3U)
+#define GET_WILL_QOS(x) (((x) & MQTT_CONNECT_FLAG_WILL_QOS_MASK) >> 3U)
+
+#define GET_QOS(x) ( ((x) & MQTT_FLAG_PUBLISH_QOS_MASK) >> 1U)
+#define SET_QOS(x,y) ( (x) | (((y) & MQTT_FLAG_PUBLISH_QOS_MASK) <<1U) )
 
 typedef enum {
     MQTT_TYPE_UNDEFINED = 0,
@@ -190,8 +201,10 @@ struct property {
 
 struct mqtt_packet {
     struct mqtt_packet *next;
-    struct mqtt_packet *next_client;
+
+    /* HEAD for next_client list */
     struct client *owner;
+    struct mqtt_packet *next_client;
 
     mqtt_control_packet_type type;
     ssize_t remaining_length;
@@ -206,6 +219,7 @@ struct mqtt_packet {
     unsigned property_count;
     unsigned num_will_props;
     uint8_t reason_code;
+
     alignas(16) _Atomic unsigned refcnt;
 };
 
@@ -237,6 +251,7 @@ struct message {
     struct message *next;
     struct message *next_queue;
     struct client *sender;
+    uint16_t sender_packet_identifier;
     struct topic *topic;
     const void *payload;
     uint8_t format;
@@ -245,6 +260,7 @@ struct message {
     message_state state;
     unsigned num_client_states;
     struct client_message_state (*client_states)[];
+    pthread_rwlock_t client_states_lock;
     alignas(16) _Atomic unsigned refcnt;
 };
 
@@ -261,10 +277,18 @@ struct subscription {
     uint8_t option;
 };
 
+struct packet_id_to_state {
+    uint16_t packet_identifier;
+    struct client_message_state *state;
+    struct message *message;
+};
+
 struct client {
     struct client *next;
     struct mqtt_packet *active_packets;
     pthread_rwlock_t subscriptions_lock;
+    pthread_rwlock_t active_packets_lock;
+    pthread_rwlock_t packet_ids_to_states_lock;
 
     const uint8_t *client_id;
     const uint8_t *username;
@@ -272,7 +296,6 @@ struct client {
     struct subscription (*subscriptions)[];
     client_state state;
     int fd;
-    unsigned qos;
     unsigned num_subscriptions;
     /* host byte order */
     in_addr_t remote_addr;
@@ -285,6 +308,10 @@ struct client {
     uint16_t keep_alive;
     time_t last_connected;
     time_t last_keep_alive;
+    mqtt_reason_codes disconnect_reason;
+
+    unsigned num_packet_id_to_state;
+    struct packet_id_to_state (*packet_ids_to_states)[];
 };
 
 struct topic {
@@ -300,5 +327,6 @@ struct topic {
 
 extern const mqtt_payload_required mqtt_packet_to_payload[MQTT_CP_MAX];
 extern const mqtt_types mqtt_property_to_type[MQTT_MAX_PROPERTY_IDENT];
+extern const uint8_t mqtt_packet_permitted_flags[MQTT_CP_MAX];
 
 #endif
