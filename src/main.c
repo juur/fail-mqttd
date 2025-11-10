@@ -26,7 +26,7 @@
 # define dbg_printf(...) printf(__VA_ARGS__)
 #endif
 
-typedef int (*control_func_t)(struct client *, struct mqtt_packet *, const void *);
+typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 
 static int mother_fd = -1;
 static bool running;
@@ -37,7 +37,7 @@ static bool running;
 #define MAX_MESSAGES 16384
 
 static pthread_rwlock_t global_packets_lock = PTHREAD_RWLOCK_INITIALIZER;
-static struct mqtt_packet *global_packet_list = NULL;
+static struct packet *global_packet_list = NULL;
 static unsigned num_packets = 0;
 
 static pthread_rwlock_t global_clients_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -259,9 +259,9 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     free(props);
 }
 
-[[gnu::nonnull]] static void free_packet(struct mqtt_packet *pck)
+[[gnu::nonnull]] static void free_packet(struct packet *pck)
 {
-    struct mqtt_packet *tmp;
+    struct packet *tmp;
 
     if (atomic_load_explicit(&pck->refcnt, memory_order_relaxed) > 0) {
         warn("free_packet: attempt to free packet with refcnt");
@@ -280,8 +280,8 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
             }
         }
         pck->next_client = NULL;
-        pck->owner = NULL;
         pthread_rwlock_unlock(&pck->owner->active_packets_lock);
+        pck->owner = NULL;
     }
 
     pthread_rwlock_wrlock(&global_packets_lock);
@@ -384,7 +384,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     client->next = NULL;
 
     pthread_rwlock_wrlock(&client->active_packets_lock);
-    for (struct mqtt_packet *p = client->active_packets, *next; p; p = next)
+    for (struct packet *p = client->active_packets, *next; p; p = next)
     {
         next = p->next_client;
         free_packet(p);
@@ -393,7 +393,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     pthread_rwlock_unlock(&client->active_packets_lock);
 
     pthread_rwlock_wrlock(&global_packets_lock);
-    for (struct mqtt_packet *p = global_packet_list; p; p = p->next)
+    for (struct packet *p = global_packet_list; p; p = p->next)
     {
         if (p->owner == client)
             p->owner = NULL; /* TODO locking? */
@@ -439,6 +439,9 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
         free (client->packet_ids_to_states);
     pthread_rwlock_unlock(&client->packet_ids_to_states_lock);
 
+    if (client->packet_buf)
+        free(client->packet_buf);
+
     pthread_rwlock_destroy(&client->subscriptions_lock);
     pthread_rwlock_destroy(&client->active_packets_lock);
     pthread_rwlock_destroy(&client->packet_ids_to_states_lock);
@@ -470,9 +473,9 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     return ret;
 }
 
-[[gnu::malloc,gnu::warn_unused_result]] static struct mqtt_packet *alloc_packet(struct client *owner)
+[[gnu::malloc,gnu::warn_unused_result]] static struct packet *alloc_packet(struct client *owner)
 {
-    struct mqtt_packet *ret;
+    struct packet *ret;
 
     errno = 0;
 
@@ -481,7 +484,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
         return NULL;
     }
 
-    if ((ret = calloc(1, sizeof(struct mqtt_packet))) == NULL)
+    if ((ret = calloc(1, sizeof(struct packet))) == NULL)
         return NULL;
 
     if (owner) {
@@ -541,6 +544,8 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 
     client->state = CS_NEW;
     client->fd = -1;
+    client->parse_state = READ_STATE_NEW;
+
     if (pthread_rwlock_init(&client->subscriptions_lock, NULL) == -1)
         goto fail;
     if (pthread_rwlock_init(&client->active_packets_lock, NULL) == -1)
@@ -1378,7 +1383,7 @@ fail:
  * Payload
  */
 
-[[gnu::nonnull]] static int send_cp_publish(struct mqtt_packet *pkt)
+[[gnu::nonnull]] static int send_cp_publish(struct packet *pkt)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -1747,7 +1752,7 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
     free(packet);
 
     pthread_rwlock_wrlock(&client->active_packets_lock);
-    for (struct mqtt_packet *tmp = client->active_packets; tmp; tmp = tmp->next_client)
+    for (struct packet *tmp = client->active_packets; tmp; tmp = tmp->next_client)
     {
         if (tmp->packet_identifier == packet_id && atomic_load_explicit(&tmp->refcnt, memory_order_relaxed) > 0) {
             atomic_fetch_sub_explicit(&tmp->refcnt, 1, memory_order_acq_rel);
@@ -1765,7 +1770,7 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
  */
 
 [[gnu::nonnull]] static int handle_cp_pubrel(struct client *client,
-        struct mqtt_packet *packet, const void *remain)
+        struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -1824,7 +1829,7 @@ fail:
 }
 
 [[gnu::nonnull]] static int handle_cp_pubrec(struct client *client,
-        struct mqtt_packet *packet, const void *remain)
+        struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -1898,7 +1903,7 @@ fail:
 }
 
 [[gnu::nonnull]] static int handle_cp_publish(struct client *client,
-        struct mqtt_packet *packet, const void *remain)
+        struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -2011,7 +2016,7 @@ fail:
 }
 
 [[gnu::nonnull]] static int handle_cp_subscribe(struct client *client,
-        struct mqtt_packet *packet, const void *remain)
+        struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -2151,7 +2156,7 @@ fail:
 }
 
 [[gnu::nonnull]] static int handle_cp_disconnect(struct client *client,
-        struct mqtt_packet *packet, const void *remain)
+        struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -2188,7 +2193,7 @@ fail:
 }
 
 [[gnu::nonnull]] static int handle_cp_pingreq(struct client *client,
-        struct mqtt_packet *packet, const void * /*remain*/)
+        struct packet *packet, const void * /*remain*/)
 {
     if (packet->remaining_length > 0) {
         errno = EINVAL;
@@ -2200,7 +2205,7 @@ fail:
 }
 
 [[gnu::nonnull]] static int handle_cp_connect(struct client *client,
-        struct mqtt_packet *packet, const void *remain)
+        struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -2424,6 +2429,145 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
  * other functions
  */
 
+
+[[gnu::nonnull]] static int parse_incoming(struct client *client)
+{
+    ssize_t rd_len;
+
+    switch (client->parse_state)
+    {
+        case READ_STATE_NEW:
+            client->read_offset = 0;
+            client->rl_offset = 0;
+            client->rl_multi = 1;
+            client->rl_value = 0;
+            client->read_need = sizeof(struct mqtt_fixed_header) + 1;
+            client->parse_state = READ_STATE_HEADER;
+            if (client->packet_buf) {
+                free(client->packet_buf);
+                client->packet_buf = NULL;
+            }
+            if (client->new_packet && client->new_packet->packet_identifier == 0)
+                free_packet(client->new_packet);
+            client->new_packet = NULL;
+            /* fall through */
+        case READ_STATE_HEADER:
+        case READ_STATE_MORE_HEADER:
+            rd_len = read(client->fd, &client->header_buffer[client->read_offset], client->read_need);
+            if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
+                return 0;
+            } else if (rd_len == -1) {
+                log_io_error(NULL, rd_len, client->read_need, false);
+                goto fail;
+            } else if (rd_len == 0) {
+eof:
+                /* EOF */
+                client->state = CS_DISCONNECTED;
+                close_socket(&client->fd);
+                client->last_connected = time(0);
+                client->parse_state = READ_STATE_NEW;
+                return 0;
+            } else if (rd_len < client->read_need) {
+                client->read_offset += rd_len;
+                client->read_need -= rd_len;
+                return 0;
+            } 
+
+            client->read_offset += rd_len;
+            client->read_need -= rd_len;
+
+            if (client->parse_state == READ_STATE_HEADER) {
+                struct mqtt_fixed_header *hdr = (void *)client->header_buffer;
+                
+                if (hdr->type >= MQTT_CP_MAX || hdr->type == 0)
+                    goto fail;
+                
+                if (control_functions[hdr->type] == NULL)
+                    goto fail;
+
+                if (hdr->flags & mqtt_packet_permitted_flags[hdr->type])
+                    goto fail;
+
+                client->parse_state = READ_STATE_MORE_HEADER;
+            } 
+
+            if (client->parse_state == READ_STATE_MORE_HEADER) {
+                uint8_t tmp;
+                struct mqtt_fixed_header *hdr = (void *)client->header_buffer;
+
+                if (client->rl_multi > 128*128*128)
+                    goto fail;
+
+                tmp = client->header_buffer[1 + client->rl_offset];
+
+                client->rl_value += (tmp & 127) * client->rl_multi;
+                client->rl_multi *= 128;
+
+                client->rl_offset++;
+                client->read_need++;
+                
+                if ( (tmp & 128) != 0 )
+                    return 0;
+
+                if (client->rl_value > MAX_PACKET_LENGTH)
+                    goto fail;
+
+                dbg_printf("parse_incoming: type=%u flags=%u remaining_length=%u\n",
+                        hdr->type, hdr->flags, client->rl_value);
+
+
+                if ((client->new_packet = alloc_packet(client)) == NULL)
+                    goto fail;
+
+                client->new_packet->remaining_length = client->rl_value;
+                client->new_packet->type = hdr->type;
+                client->new_packet->flags = hdr->flags;
+
+
+                if ((client->packet_buf = malloc(client->new_packet->remaining_length)) == NULL)
+                    goto fail;
+                
+                client->parse_state = READ_STATE_BODY;
+                client->packet_offset = 0;
+                client->read_need = client->new_packet->remaining_length;
+            }
+            break;
+        case READ_STATE_BODY:
+            rd_len = read(client->fd, &client->packet_buf[client->packet_offset], client->read_need);
+            if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return 0;
+            } else if (rd_len == -1) {
+                log_io_error(NULL, rd_len, client->read_need, false);
+                goto fail;
+            } else if (rd_len == 0) {
+                goto eof;
+            } else if (rd_len < client->read_need) {
+                client->packet_offset += rd_len;
+                client->read_need -= rd_len;
+                return 0;
+            }
+            client->parse_state = READ_STATE_NEW;
+            
+            if (control_functions[client->new_packet->type](client, client->new_packet, client->packet_buf) == -1)
+                goto fail;
+
+            break;
+    }
+    return 0;
+fail:
+    if (client->packet_buf) {
+        free(client->packet_buf);
+        client->packet_buf = NULL;
+    }
+    if (client->new_packet) {
+        free_packet(client->new_packet);
+        client->new_packet = NULL;
+    }
+    client->parse_state = READ_STATE_NEW;
+    return -1;
+}
+
+#if 0
 [[gnu::nonnull]] static int parse_incoming(struct client *client)
 {
     ssize_t rd_len;
@@ -2523,6 +2667,7 @@ fail:
         free_packet(new_packet);
     return -1;
 }
+#endif
 
 #define MAX_MESSAGES_PER_TICK 100
 
@@ -2563,7 +2708,7 @@ static void tick_msg(struct message *msg)
 {
     struct client_message_state *client_state;
     unsigned num_sent = 0;
-    struct mqtt_packet *packet;
+    struct packet *packet;
 
     if (msg->client_states == NULL)
         return;

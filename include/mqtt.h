@@ -199,12 +199,12 @@ struct property {
     };
 };
 
-struct mqtt_packet {
-    struct mqtt_packet *next;
+struct packet {
+    struct packet *next;
 
     /* HEAD for next_client list */
     struct client *owner;
-    struct mqtt_packet *next_client;
+    struct packet *next_client;
 
     mqtt_control_packet_type type;
     ssize_t remaining_length;
@@ -283,9 +283,17 @@ struct packet_id_to_state {
     struct message *message;
 };
 
+/* client.parse_state */
+enum {
+    READ_STATE_NEW,
+    READ_STATE_HEADER,
+    READ_STATE_MORE_HEADER,
+    READ_STATE_BODY,
+};
+
 struct client {
     struct client *next;
-    struct mqtt_packet *active_packets;
+    struct packet *active_packets;
     pthread_rwlock_t subscriptions_lock;
     pthread_rwlock_t active_packets_lock;
     pthread_rwlock_t packet_ids_to_states_lock;
@@ -309,6 +317,17 @@ struct client {
     time_t last_connected;
     time_t last_keep_alive;
     mqtt_reason_codes disconnect_reason;
+
+    uint8_t *packet_buf;
+    struct packet *new_packet;
+    int parse_state;
+    unsigned packet_offset;
+    unsigned read_offset;
+    unsigned read_need;
+    unsigned rl_value;
+    unsigned rl_multi;
+    unsigned rl_offset;
+    uint8_t header_buffer[sizeof(struct mqtt_fixed_header) + 4];
 
     unsigned num_packet_id_to_state;
     struct packet_id_to_state (*packet_ids_to_states)[];
