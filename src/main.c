@@ -31,27 +31,23 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 static int mother_fd = -1;
 static bool running;
 
-#define MAX_PACKETS 256
-#define MAX_CLIETNS 64
-#define MAX_TOPICS 1024
-#define MAX_MESSAGES 16384
+static const unsigned MAX_PACKETS = 256;
+static const unsigned MAX_CLIETNS = 64;
+static const unsigned MAX_TOPICS = 1024;
+static const unsigned MAX_MESSAGES = 16384;
 
-static pthread_rwlock_t global_packets_lock = PTHREAD_RWLOCK_INITIALIZER;
-static struct packet *global_packet_list = NULL;
-static unsigned num_packets = 0;
-
-static pthread_rwlock_t global_clients_lock = PTHREAD_RWLOCK_INITIALIZER;
-static struct client *global_client_list = NULL;
-static unsigned num_clients = 0;
-
-static pthread_rwlock_t global_topics_lock = PTHREAD_RWLOCK_INITIALIZER;
-static struct topic *global_topic_list = NULL;
-static unsigned num_topics = 0;
-
+static pthread_rwlock_t global_clients_lock  = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_rwlock_t global_messages_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_packets_lock  = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_topics_lock   = PTHREAD_RWLOCK_INITIALIZER;
+static struct client *global_client_list   = NULL;
 static struct message *global_message_list = NULL;
+static struct packet *global_packet_list   = NULL;
+static struct topic *global_topic_list     = NULL;
+static unsigned num_clients  = 0;
 static unsigned num_messages = 0;
-
+static unsigned num_packets  = 0;
+static unsigned num_topics   = 0;
 
 /*
  * forward declarations
@@ -1449,7 +1445,7 @@ fail:
     return 0;
 }
 
-[[gnu::nonnull]] static int send_cp_disconnect(struct client *client, mqtt_reason_codes reason_code)
+[[gnu::nonnull]] static int send_cp_disconnect(struct client *client, mqtt_reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -1517,7 +1513,7 @@ fail:
     return 0;
 }
 
-[[gnu::nonnull]] static int send_cp_connack(struct client *client, mqtt_reason_codes reason_code)
+[[gnu::nonnull]] static int send_cp_connack(struct client *client, mqtt_reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -1561,7 +1557,7 @@ fail:
     return 0;
 }
 
-static int send_cp_pubrec(struct client *client, uint16_t packet_id, mqtt_reason_codes reason_code)
+static int send_cp_pubrec(struct client *client, uint16_t packet_id, mqtt_reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -1608,7 +1604,7 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id, mqtt_reason
     return 0;
 }
 
-static int send_cp_pubcomp(struct client *client, uint16_t packet_id, mqtt_reason_codes reason_code)
+static int send_cp_pubcomp(struct client *client, uint16_t packet_id, mqtt_reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -1647,7 +1643,7 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id, mqtt_reaso
     return 0;
 }
 
-static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason_codes reason_code)
+static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -1774,8 +1770,8 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    mqtt_reason_codes reason_code = MQTT_UNSPECIFIED_ERROR;
-    [[maybe_unused]] mqtt_reason_codes pubrel_reason_code = 0;
+    mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    [[maybe_unused]] mqtt_reason_code_t pubrel_reason_code = 0;
     uint16_t tmp;
 
     dbg_printf("handle_cp_pubrel: bytes_left=%lu\n", bytes_left);
@@ -1833,8 +1829,8 @@ fail:
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    mqtt_reason_codes reason_code = MQTT_UNSPECIFIED_ERROR;
-    [[maybe_unused]] mqtt_reason_codes pubrec_reason_code = 0;
+    mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    [[maybe_unused]] mqtt_reason_code_t pubrec_reason_code = 0;
     uint16_t packet_identifier;
 
     errno = 0;
@@ -1909,7 +1905,7 @@ fail:
     size_t bytes_left = packet->remaining_length;
     uint8_t *topic_name = NULL;
     uint16_t packet_identifier = 0;
-    mqtt_reason_codes reason_code = MQTT_UNSPECIFIED_ERROR;
+    mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
     unsigned qos = 0;
     [[maybe_unused]] bool flag_retain;
     [[maybe_unused]] bool flag_dup;
@@ -2022,7 +2018,7 @@ fail:
     size_t bytes_left = packet->remaining_length;
     struct topic_sub_request *request = NULL;
     void *tmp;
-    mqtt_reason_codes reason_code = MQTT_UNSPECIFIED_ERROR;
+    mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
 
     errno = 0;
 
@@ -2209,7 +2205,7 @@ fail:
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    mqtt_reason_codes response_code = MQTT_UNSPECIFIED_ERROR;
+    mqtt_reason_code_t response_code = MQTT_UNSPECIFIED_ERROR;
     uint8_t *will_topic = NULL;
     uint8_t will_qos = 0;
     void *will_payload = NULL;
@@ -2433,6 +2429,11 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
 [[gnu::nonnull]] static int parse_incoming(struct client *client)
 {
     ssize_t rd_len;
+    mqtt_reason_code_t reason_code;
+    struct mqtt_fixed_header *hdr;
+
+    hdr = NULL;
+    reason_code = MQTT_MALFORMED_PACKET;
 
     switch (client->parse_state)
     {
@@ -2450,7 +2451,9 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
             if (client->new_packet && client->new_packet->packet_identifier == 0)
                 free_packet(client->new_packet);
             client->new_packet = NULL;
+
             /* fall through */
+
         case READ_STATE_HEADER:
         case READ_STATE_MORE_HEADER:
             rd_len = read(client->fd, &client->header_buffer[client->read_offset], client->read_need);
@@ -2471,17 +2474,17 @@ eof:
                 client->read_offset += rd_len;
                 client->read_need -= rd_len;
                 return 0;
-            } 
+            }
 
             client->read_offset += rd_len;
             client->read_need -= rd_len;
 
             if (client->parse_state == READ_STATE_HEADER) {
-                struct mqtt_fixed_header *hdr = (void *)client->header_buffer;
-                
+                hdr = (void *)client->header_buffer;
+
                 if (hdr->type >= MQTT_CP_MAX || hdr->type == 0)
                     goto fail;
-                
+
                 if (control_functions[hdr->type] == NULL)
                     goto fail;
 
@@ -2489,11 +2492,11 @@ eof:
                     goto fail;
 
                 client->parse_state = READ_STATE_MORE_HEADER;
-            } 
+            }
 
             if (client->parse_state == READ_STATE_MORE_HEADER) {
                 uint8_t tmp;
-                struct mqtt_fixed_header *hdr = (void *)client->header_buffer;
+                hdr = (void *)client->header_buffer;
 
                 if (client->rl_multi > 128*128*128)
                     goto fail;
@@ -2505,7 +2508,7 @@ eof:
 
                 client->rl_offset++;
                 client->read_need++;
-                
+
                 if ( (tmp & 128) != 0 )
                     return 0;
 
@@ -2514,7 +2517,6 @@ eof:
 
                 dbg_printf("parse_incoming: type=%u flags=%u remaining_length=%u\n",
                         hdr->type, hdr->flags, client->rl_value);
-
 
                 if ((client->new_packet = alloc_packet(client)) == NULL)
                     goto fail;
@@ -2526,14 +2528,19 @@ eof:
 
                 if ((client->packet_buf = malloc(client->new_packet->remaining_length)) == NULL)
                     goto fail;
-                
+
                 client->parse_state = READ_STATE_BODY;
                 client->packet_offset = 0;
                 client->read_need = client->new_packet->remaining_length;
             }
             break;
+
         case READ_STATE_BODY:
+            if (client->read_need == 0)
+                goto exec_control;
+
             rd_len = read(client->fd, &client->packet_buf[client->packet_offset], client->read_need);
+
             if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 return 0;
             } else if (rd_len == -1) {
@@ -2546,14 +2553,16 @@ eof:
                 client->read_need -= rd_len;
                 return 0;
             }
+exec_control:
             client->parse_state = READ_STATE_NEW;
-            
+
             if (control_functions[client->new_packet->type](client, client->new_packet, client->packet_buf) == -1)
                 goto fail;
 
             break;
     }
     return 0;
+
 fail:
     if (client->packet_buf) {
         free(client->packet_buf);
@@ -2563,7 +2572,11 @@ fail:
         free_packet(client->new_packet);
         client->new_packet = NULL;
     }
+
     client->parse_state = READ_STATE_NEW;
+    client->state = CS_CLOSING;
+    client->disconnect_reason = reason_code;
+
     return -1;
 }
 
@@ -2909,7 +2922,22 @@ static int main_loop(int mother_fd)
                 continue;
             }
 
+            int flags;
+
+            if ((flags = fcntl(child_fd, F_GETFL)) == -1) {
+                warn("main_loop: fcntl: F_GETFL");
+                goto shit_fd;
+            }
+
+            flags |= O_NONBLOCK;
+
+            if (fcntl(child_fd, F_SETFL, flags) == -1) {
+                warn("main_loop: fcntl: F_SETFL");
+                goto shit_fd;
+            }
+
             if ((new_client = alloc_client()) == NULL) {
+shit_fd:
                 close_socket(&child_fd);
                 warn("main_loop: alloc_client");
                 continue;
@@ -2922,6 +2950,7 @@ static int main_loop(int mother_fd)
             new_client->state = CS_ACTIVE;
             new_client->remote_port = ntohs(sin_client.sin_port);
             new_client->remote_addr = ntohl(sin_client.sin_addr.s_addr);
+
 
             dbg_printf("main_loop: new client from [%s:%u]\n", new_client->hostname, new_client->remote_port);
         }

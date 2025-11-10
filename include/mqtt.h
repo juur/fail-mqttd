@@ -180,7 +180,7 @@ typedef enum {
     MQTT_MAXIMUM_CONNECT_TIME = 160,
     MQTT_SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED = 161,
     MQTT_WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED = 162,
-} mqtt_reason_codes;
+} mqtt_reason_code_t;
 
 struct property {
     mqtt_types type;
@@ -284,12 +284,12 @@ struct packet_id_to_state {
 };
 
 /* client.parse_state */
-enum {
+typedef enum {
     READ_STATE_NEW,
     READ_STATE_HEADER,
     READ_STATE_MORE_HEADER,
     READ_STATE_BODY,
-};
+} read_state_t;
 
 struct client {
     struct client *next;
@@ -316,11 +316,11 @@ struct client {
     uint16_t keep_alive;
     time_t last_connected;
     time_t last_keep_alive;
-    mqtt_reason_codes disconnect_reason;
+    mqtt_reason_code_t disconnect_reason;
 
     uint8_t *packet_buf;
     struct packet *new_packet;
-    int parse_state;
+    read_state_t parse_state;
     unsigned packet_offset;
     unsigned read_offset;
     unsigned read_need;
