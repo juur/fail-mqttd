@@ -6,8 +6,6 @@
 #include <uchar.h>
 #include <arpa/inet.h>
 
-#define MAX_PACKET_LENGTH   (0x1000000UL)
-
 struct mqtt_fixed_header {
     unsigned flags:4;
     unsigned type:4;
@@ -76,6 +74,20 @@ typedef enum {
 #define MQTT_CONNECT_FLAG_WILL_RETAIN   (1<<5)
 #define MQTT_CONNECT_FLAG_PASSWORD      (1<<6)
 #define MQTT_CONNECT_FLAG_USERNAME      (1<<7)
+
+#define MQTT_SUBOPT_QOS0                 (0)
+#define MQTT_SUBOPT_QOS1                 (1<<0)
+#define MQTT_SUBOPT_QOS2                 (1<<1)
+#define MQTT_SUBOPT_QOS_MASK             ((1<<0)|(1<<1))
+#define MQTT_SUBOPT_QOS(x)               ((x)&0x3)
+#define MQTT_SUBOPT_NO_LOCAL             (1<<2)
+#define MQTT_SUBOPT_RETAIN_AS_PUBLISHED  (1<<3)
+#define MQTT_SUBOPT_RETAIN_HANDLING_MASK ((1<<5)|(1<<4))
+#define MQTT_SUBOPT_RETAIN_HANDLING(x)   (((x)&0x3) << 4U)
+#define MQTT_SUBOPT_RETAIN_HANDLING0     (0)
+#define MQTT_SUBOPT_RETAIN_HANDLING1     (1<<4)
+#define MQTT_SUBOPT_RETAIN_HANDLING2     (1<<5)
+#define MQTT_SUBOPT_RESERVED_MASK        ((1<<7)|(1<<6))
 
 #define GET_WILL_QOS(x) (((x) & MQTT_CONNECT_FLAG_WILL_QOS_MASK) >> 3U)
 

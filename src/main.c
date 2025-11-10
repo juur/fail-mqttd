@@ -35,6 +35,7 @@ static const unsigned MAX_PACKETS = 256;
 static const unsigned MAX_CLIETNS = 64;
 static const unsigned MAX_TOPICS = 1024;
 static const unsigned MAX_MESSAGES = 16384;
+static const unsigned MAX_PACKET_LENGTH = 0x1000000U;
 
 static pthread_rwlock_t global_clients_lock  = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_rwlock_t global_messages_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -1551,7 +1552,7 @@ fail:
 
     free(packet);
 
-    if (reason_code >= 0x80)
+    if (reason_code >= MQTT_UNSPECIFIED_ERROR)
         client->state = CS_CLOSING;
 
     return 0;
@@ -1778,7 +1779,7 @@ static int send_cp_puback(struct client *client, uint16_t packet_id, mqtt_reason
 
     errno = 0;
 
-    if (packet->flags != 0x2) {
+    if (packet->flags != MQTT_FLAG_PUBREL) {
         reason_code = MQTT_MALFORMED_PACKET;
         goto fail;
     }
@@ -2018,17 +2019,14 @@ fail:
     size_t bytes_left = packet->remaining_length;
     struct topic_sub_request *request = NULL;
     void *tmp;
-    mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    mqtt_reason_code_t reason_code = MQTT_MALFORMED_PACKET;
 
-    errno = 0;
+    errno = EINVAL;
 
-    if (packet->flags != 0x2) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (packet->flags != MQTT_FLAG_SUBSCRIBE)
         goto fail;
-    }
 
     if (bytes_left < 3) {
-        reason_code = MQTT_MALFORMED_PACKET;
         errno = ENOSPC;
         goto fail;
     }
@@ -2045,82 +2043,73 @@ fail:
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
                 &packet->property_count, MQTT_CP_SUBSCRIBE) == -1) {
-        reason_code = MQTT_MALFORMED_PACKET;
         goto fail;
     }
 
     /* Check for 0 topic filters */
-    if (bytes_left < 3) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left < 3)
         goto fail;
-    }
 
     if ((request = calloc(1, sizeof(struct topic_sub_request))) == NULL)
         goto fail;
 
     while (bytes_left)
     {
-        if (bytes_left < 3) {
-            reason_code = MQTT_MALFORMED_PACKET;
+        if (bytes_left < 3)
             goto fail;
-        }
 
         if ((tmp = realloc(request->topics,
-                        sizeof(uint8_t *) * (request->num_topics + 1))) == NULL)
+                        sizeof(uint8_t *) * (request->num_topics + 1))) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
+        }
         request->topics = tmp;
 
         const size_t u8_size = sizeof(uint8_t) * (request->num_topics + 1);
 
-        if ((tmp = realloc(request->options, u8_size)) == NULL)
+        if ((tmp = realloc(request->options, u8_size)) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
+        }
         request->options = tmp;
 
-        if ((tmp = realloc(request->response_codes, u8_size)) == NULL)
+        if ((tmp = realloc(request->response_codes, u8_size)) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
+        }
         request->response_codes = tmp;
 
-        if ((request->topics[request->num_topics] = read_utf8(&ptr,
-                        &bytes_left)) == NULL) {
-            reason_code = MQTT_MALFORMED_PACKET;
+        if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
-        }
 
-        if (bytes_left < 1) {
-            reason_code = MQTT_MALFORMED_PACKET;
+        if (bytes_left < 1)
             goto fail;
-        }
-
-        if (is_valid_topic_filter(request->topics[request->num_topics]) == -1)
-            request->response_codes[request->num_topics] = MQTT_TOPIC_FILTER_INVALID;
-        else
-            request->response_codes[request->num_topics] = MQTT_SUCCESS;
 
         /* Validate subscribe options byte */
 
         /* bits 7 & 6 are reserved */
-        if ((*ptr & 0xc0)) {
-            reason_code = MQTT_MALFORMED_PACKET;
+        if ((*ptr & MQTT_SUBOPT_RESERVED_MASK))
             goto fail;
-        }
 
         /* QoS can't be 3 */
-        if ((*ptr & 0x3) == 0x3) {
-            reason_code = MQTT_MALFORMED_PACKET;
+        if ((*ptr & MQTT_SUBOPT_QOS_MASK) == MQTT_SUBOPT_QOS_MASK)
             goto fail;
-        }
 
         /* retain handling can't be 3 */
-        if ((*ptr & 0x30) == 0x30) {
-            reason_code = MQTT_MALFORMED_PACKET;
+        if ((*ptr & MQTT_SUBOPT_RETAIN_HANDLING_MASK) == MQTT_SUBOPT_RETAIN_HANDLING_MASK)
             goto fail;
-        }
 
         if (!strncmp("$share/", (char *)request->topics[request->num_topics], 7)) {
-            if ((*ptr & 0x2)) {
-                reason_code = MQTT_MALFORMED_PACKET;
+            if ((*ptr & MQTT_SUBOPT_NO_LOCAL))
                 goto fail;
-            }
+            request->response_codes[request->num_topics] = MQTT_SHARED_SUBSCRIPTIONS_NOT_SUPPORTED;
+        }
+
+        if (is_valid_topic_filter(request->topics[request->num_topics]) == -1) {
+            request->response_codes[request->num_topics] = MQTT_TOPIC_FILTER_INVALID;
+        } else {
+            /* TODO why would response QoS be < request QoS ? */
+            request->response_codes[request->num_topics] = (*ptr & MQTT_SUBOPT_QOS_MASK);
         }
 
         /* TODO do something with the RETAIN flag */
@@ -2138,6 +2127,7 @@ fail:
         goto fail;
     }
 
+    errno = 0;
     int rc = send_cp_suback(client, packet->packet_identifier, request);
     /* TODO senda an error back? */
     free_topic_subs(request);
@@ -2512,8 +2502,10 @@ eof:
                 if ( (tmp & 128) != 0 )
                     return 0;
 
-                if (client->rl_value > MAX_PACKET_LENGTH)
+                if (client->rl_value > MAX_PACKET_LENGTH) {
+                    client->disconnect_reason = MQTT_PACKET_TOO_LARGE;
                     goto fail;
+                }
 
                 dbg_printf("parse_incoming: type=%u flags=%u remaining_length=%u\n",
                         hdr->type, hdr->flags, client->rl_value);
