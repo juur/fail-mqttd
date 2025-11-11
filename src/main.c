@@ -31,11 +31,14 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 static int mother_fd = -1;
 static bool running;
 
-static const unsigned MAX_PACKETS = 256;
-static const unsigned MAX_CLIETNS = 64;
-static const unsigned MAX_TOPICS = 1024;
-static const unsigned MAX_MESSAGES = 16384;
-static const unsigned MAX_PACKET_LENGTH = 0x1000000U;
+static constexpr unsigned MAX_PACKETS = 256;
+static constexpr unsigned MAX_CLIETNS = 64;
+static constexpr unsigned MAX_TOPICS = 1024;
+static constexpr unsigned MAX_MESSAGES = 16384;
+static constexpr unsigned MAX_PACKET_LENGTH = 0x1000000U;
+static constexpr unsigned MAX_MESSAGES_PER_TICK = 100;
+static constexpr unsigned MAX_PROPERTIES = 32;
+static constexpr unsigned MAX_RECEIVE_PUBS = 8;
 
 static pthread_rwlock_t global_clients_lock  = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_rwlock_t global_messages_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -235,9 +238,16 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 [[gnu::nonnull, gnu::access(read_write,1,2)]] static void free_properties(struct property (*props)[],
         unsigned count)
 {
+    mqtt_types type;
+
     for (unsigned i = 0; i < count; i++)
     {
-        switch ((*props)[i].type)
+        if ((*props)[i].ident > MQTT_MAX_PROPERTY_IDENT) /* TODO handle error */
+            continue;
+
+        type = mqtt_property_to_type[(*props)[i].ident];
+
+        switch (type)
         {
             case MQTT_TYPE_UTF8_STRING:
                 if ((*props)[i].utf8_string)
@@ -763,7 +773,171 @@ fail:
     return NULL;
 }
 
-#define MAX_PROPERTIES 32
+[[gnu::nonnull]] static ssize_t get_properties_size(const struct property (*props)[],
+        unsigned num_props)
+{
+    ssize_t ret;
+    const struct property *prop;
+    uint8_t tmp_out[4];
+    mqtt_types type;
+
+    if (num_props == 0)
+        return 0;
+
+    ret = 0;
+
+    for (unsigned idx = 0; idx < num_props; idx++)
+    {
+        prop = &(*props)[idx];
+        ret++; /* Property Type */
+
+        if (prop->ident > MQTT_MAX_PROPERTY_IDENT) {
+            errno = ERANGE;
+            return -1;
+        }
+
+        type = mqtt_property_to_type[prop->ident];
+
+        switch (type)
+        {
+            case MQTT_TYPE_BYTE:
+                ret++;
+                break;
+            case MQTT_TYPE_2BYTE:
+                ret += 2;
+                break;
+            case MQTT_TYPE_4BYTE:
+                ret += 4;
+                break;
+            case MQTT_TYPE_BINARY:
+                ret += prop->binary.len;
+                ret += 2;
+                break;
+            case MQTT_TYPE_UTF8_STRING:
+                ret += strlen((const char *)prop->utf8_string);
+                ret += 2;
+                break;
+            case MQTT_TYPE_VARBYTE:
+                ret += encode_var_byte(prop->varbyte, tmp_out);
+                break;
+            case MQTT_TYPE_UTF8_STRING_PAIR:
+                ret += strlen((const char *)prop->utf8_pair[0]);
+                ret += strlen((const char *)prop->utf8_pair[1]);
+                ret += 4; /* 2x2 */
+                break;
+            case MQTT_TYPE_UNDEFINED:
+            case MQTT_TYPE_MAX:
+                errno = EINVAL;
+                warnx("get_propertes_size: attempt to size undefined MQTT_TYPE");
+                return -1;
+        }
+    }
+
+    return ret;
+}
+
+static void do_one_string(const uint8_t *str, uint8_t **ptr) {
+    unsigned len;
+    uint16_t enclen;
+
+    if (str) {
+        len = strlen((const char *)str);
+        enclen = htons(len);
+    } else {
+        len = 0;
+        enclen = 0;
+    }
+    memcpy(ptr, &enclen, 2);
+    *ptr += 2;
+    if (len != 0) {
+        memcpy(ptr, str, len);
+        *ptr += len;
+    }
+}
+
+[[gnu::nonnull]] static int build_properties(const struct property (*props)[],
+        unsigned num_props, uint8_t **out)
+{
+    uint8_t *ptr = *out;
+    uint16_t tmp2byte;
+    uint32_t tmp4byte;
+    const struct property *prop;
+    mqtt_types type;
+
+    if (num_props == 0)
+        return 0;
+
+    for (unsigned idx = 0; idx < num_props; idx++)
+    {
+        prop = &(*props)[idx];
+
+        if (prop->ident > MQTT_MAX_PROPERTY_IDENT) {
+            errno = ERANGE;
+            goto fail;
+        }
+
+        type = mqtt_property_to_type[prop->ident];
+
+        *ptr = prop->ident;
+        ptr++;
+
+        switch (type)
+        {
+            case MQTT_TYPE_BYTE:
+                *ptr = prop->byte;
+                ptr++;
+                break;
+
+            case MQTT_TYPE_2BYTE:
+                tmp2byte = htons(prop->byte2);
+                memcpy(ptr, &tmp2byte, 2);
+                ptr += 2;
+                break;
+
+            case MQTT_TYPE_4BYTE:
+                tmp4byte = htonl(prop->byte4);
+                memcpy(ptr, &tmp4byte, 4);
+                ptr += 4;
+                break;
+
+            case MQTT_TYPE_VARBYTE:
+                encode_var_byte(prop->varbyte, ptr);
+                break;
+
+            case MQTT_TYPE_BINARY:
+                tmp2byte = htons(prop->binary.len);
+                memcpy(ptr, &tmp2byte, 2);
+                ptr += 2;
+                if (prop->binary.len) {
+                    memcpy(ptr, prop->binary.data, prop->binary.len);
+                    ptr += prop->binary.len;
+                }
+                break;
+
+            case MQTT_TYPE_UTF8_STRING:
+                do_one_string(prop->utf8_string, &ptr);
+                break;
+
+            case MQTT_TYPE_UTF8_STRING_PAIR:
+                do_one_string(prop->utf8_pair[0], &ptr);
+                do_one_string(prop->utf8_pair[1], &ptr);
+                break;
+
+            case MQTT_TYPE_UNDEFINED:
+            case MQTT_TYPE_MAX:
+                errno = EINVAL;
+                warnx("build_properties: invalid MQTT_TYPE");
+                goto fail;
+        }
+    }
+
+    *out = ptr;
+    return 0;
+
+fail:
+    return -1;
+}
+
 
 /* a type of -1U is used for situations where the properties are NOT the standard ones
  * in a packet, e.g. "will_properties" */
@@ -779,6 +953,7 @@ fail:
     struct property *prop;
     unsigned num_props = 0, skip;
     void *tmp;
+    mqtt_types type;
 
     errno = 0;
 
@@ -821,22 +996,23 @@ fail:
             errno = EINVAL;
             goto fail;
         }
-        prop->identifier = ident;
-        prop->type = mqtt_property_to_type[prop->identifier];
+        prop->ident = ident;
+
+        type = mqtt_property_to_type[prop->ident];
 
         /* TODO perform "is this valid for this control type?" */
 
         if (cp_type != -1U) /* for will_properties, there is cp_type */
-            switch (prop->identifier)
+            switch (prop->ident)
             {
                 default:
                     /* TODO MQTT requires skipping not failing */
-                    warn("parse_properties: unsupported property identifier %u\n", prop->identifier);
+                    warn("parse_properties: unsupported property identifier %u\n", prop->ident);
             }
 
         skip = 0;
 
-        switch (prop->type)
+        switch (type)
         {
             case MQTT_TYPE_BYTE:
                 if (*bytes_left < 1)
@@ -1384,6 +1560,10 @@ fail:
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
+
+    uint8_t proplen[4], remlen[4];
+    unsigned proplen_len, remlen_len, prop_len;
+
     uint16_t tmp, topic_len;
     const struct message *msg;
 
@@ -1392,31 +1572,48 @@ fail:
     assert(pkt->owner != NULL);
 
     errno = 0;
-
     msg = pkt->message;
 
-    length = sizeof(struct mqtt_fixed_header); /* [0] */
-    length += 1; /* [1] Remaining Length TODO calc properly */
+    /* Populate Properties */
 
-    length += 2; /* [2-3] UTF-8 length */
-    length += (topic_len = strlen((char *)pkt->message->topic->name)); /* [4..] */
+    const struct property props[] = {
+        { },
+    };
+    const unsigned num_props = 0; /* sizeof(props) / sizeof(struct property) */
+
+    /* Calculate the Remaining Length */
+
+    prop_len = get_properties_size(&props, num_props);
+    proplen_len = encode_var_byte(prop_len, proplen);
+
+    length = 0;
+
+    length += 2; /* UTF-8 length */
+    length += (topic_len = strlen((char *)pkt->message->topic->name)); /* Actual String */
 
     if ((pkt->flags & MQTT_FLAG_PUBLISH_QOS_MASK))
         length += 2; /* packet identifier */
 
-    length += 1; /* properties length */
-
     length += msg->payload_len;
 
+    remlen_len = encode_var_byte(length, remlen);
+
+    /* Calculate the total length including header */
+
+    length += sizeof(struct mqtt_fixed_header);
+    length += remlen_len;
+
+    /* Now build the packet */
+
     if ((ptr = packet = calloc(1, length)) == NULL)
-        return -1;
+        goto fail;
 
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_PUBLISH;
     ((struct mqtt_fixed_header *)ptr)->flags = pkt->flags;
     ptr++;
 
-    *ptr = length - sizeof(struct mqtt_fixed_header) - 1; /* Remaining Length */
-    ptr++;
+    memcpy(ptr, remlen, remlen_len);
+    ptr += remlen_len;
 
     tmp = htons(topic_len);
     memcpy(ptr, &tmp, 2);
@@ -1431,10 +1628,15 @@ fail:
         ptr += 2;
     }
 
-    /* properties length */
-    ptr += 1;
+    memcpy(ptr, proplen, proplen_len);
+    ptr += proplen_len;
+
+    if (build_properties(&props, num_props, &ptr) == -1)
+        goto fail;
 
     memcpy(ptr, msg->payload, msg->payload_len);
+
+    /* Now send the packet */
 
     if ((wr_len = write(pkt->owner->fd, packet, length)) != length) {
         free(packet);
@@ -1444,6 +1646,11 @@ fail:
     free(packet);
 
     return 0;
+
+fail:
+    if (packet)
+        free(packet);
+    return -1;
 }
 
 [[gnu::nonnull]] static int send_cp_disconnect(struct client *client, mqtt_reason_code_t reason_code)
@@ -1503,6 +1710,8 @@ fail:
     *ptr = 0;
     ptr++;
 
+    dbg_printf("send_cp_pingresp: sending\n");
+
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
         return log_io_error(NULL, wr_len, length, false);
@@ -1519,23 +1728,51 @@ fail:
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
 
+    uint8_t proplen[4], remlen[4];
+    unsigned proplen_len, remlen_len, prop_len;
+
     errno = 0;
 
-    length = sizeof(struct mqtt_fixed_header);
-    length += 1; /* remaining length 1byte */
+    /* Populate Properties */
 
-    length += 2; /* connack var header (1byte for flags, 1byte for code) */
-    length += 1; /* properties length (0) */
-    length += 0; /* properties TODO */
+    const struct property props[] = {
+        { .ident = MQTT_PROP_MAXIMUM_PACKET_SIZE               , .byte4 = MAX_PACKET_LENGTH } ,
+        { .ident = MQTT_PROP_RECEIVE_MAXIMUM                   , .byte2 = MAX_RECEIVE_PUBS  } ,
+        { .ident = MQTT_PROP_RETAIN_AVAILABLE                  , .byte  = 0                 } ,
+        { .ident = MQTT_PROP_WILDCARD_SUBSCRIPTION_AVAILABLE   , .byte  = 0                 } ,
+        { .ident = MQTT_PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE , .byte  = 0                 } ,
+        { .ident = MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE     , .byte  = 0                 } ,
+    };
+    const unsigned num_props = sizeof(props) / sizeof(struct property);
+
+    /* Calculate the Remaining Length */
+
+    prop_len = get_properties_size(&props, num_props);
+    proplen_len = encode_var_byte(prop_len, proplen);
+
+    length = 0;
+
+    length += 2;           /* connack var header (1byte for flags, 1byte for code) */
+    length += proplen_len; /* properties length (0) */
+    length += prop_len;    /* property[] */
+
+    remlen_len = encode_var_byte(length, remlen);
+
+    /* Calculate the total length including header */
+
+    length += sizeof(struct mqtt_fixed_header);
+    length += remlen_len;  /* remaining length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
 
+    /* Now build the packet */
+
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_CONNACK;
     ptr++;
 
-    *ptr = length - sizeof(struct mqtt_fixed_header) - 1; /* Remaining Length */
-    ptr++;
+    memcpy(ptr, remlen, remlen_len);
+    ptr += remlen_len;
 
     *ptr = 0;           /* Connect Ack Flags */
     ptr++;
@@ -1543,7 +1780,13 @@ fail:
     *ptr = reason_code; /* Connect Reason Code */
     ptr++;
 
-    /* properties length is set to 0 in calloc() */
+    memcpy(ptr, proplen, proplen_len);
+    ptr += proplen_len;
+
+    if (build_properties(&props, num_props, &ptr) == -1)
+        goto fail;
+
+    /* Now send the packet */
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
@@ -1556,6 +1799,15 @@ fail:
         client->state = CS_CLOSING;
 
     return 0;
+
+fail:
+    if (packet)
+        free(packet);
+
+    if (reason_code >= MQTT_UNSPECIFIED_ERROR)
+        client->state = CS_CLOSING;
+
+    return -1;
 }
 
 static int send_cp_pubrec(struct client *client, uint16_t packet_id, mqtt_reason_code_t reason_code)
@@ -2181,6 +2433,8 @@ fail:
 [[gnu::nonnull]] static int handle_cp_pingreq(struct client *client,
         struct packet *packet, const void * /*remain*/)
 {
+    dbg_printf("handle_cp_pingreq\n");
+
     if (packet->remaining_length > 0) {
         errno = EINVAL;
         send_cp_disconnect(client, MQTT_MALFORMED_PACKET);
@@ -2366,6 +2620,7 @@ fail:
             warn("handle_cp_connect: register_message");
             free(will_topic);
             will_topic = NULL;
+            will_payload = NULL; /* register_message frees in error */
             goto fail;
         }
         free(will_topic);
@@ -2445,7 +2700,10 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
             /* fall through */
 
         case READ_STATE_HEADER:
+            goto more;
+            /* fall through */
         case READ_STATE_MORE_HEADER:
+more:
             rd_len = read(client->fd, &client->header_buffer[client->read_offset], client->read_need);
             if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
                 return 0;
@@ -2482,9 +2740,13 @@ eof:
                     goto fail;
 
                 client->parse_state = READ_STATE_MORE_HEADER;
+
+                if (client->read_need == 0)
+                    goto lenread;
             }
 
             if (client->parse_state == READ_STATE_MORE_HEADER) {
+lenread:
                 uint8_t tmp;
                 hdr = (void *)client->header_buffer;
 
@@ -2524,10 +2786,13 @@ eof:
                 client->parse_state = READ_STATE_BODY;
                 client->packet_offset = 0;
                 client->read_need = client->new_packet->remaining_length;
+                if (client->read_need == 0)
+                    goto readbody;
             }
             break;
 
         case READ_STATE_BODY:
+readbody:
             if (client->read_need == 0)
                 goto exec_control;
 
@@ -2571,110 +2836,6 @@ fail:
 
     return -1;
 }
-
-#if 0
-[[gnu::nonnull]] static int parse_incoming(struct client *client)
-{
-    ssize_t rd_len;
-    struct mqtt_fixed_header hdr;
-    struct mqtt_packet *new_packet;
-    void *packet;
-    uint8_t tmp = 0;
-    uint32_t value = 0;
-    uint32_t multi = 1;
-
-    new_packet = NULL;
-    packet = NULL;
-
-    if ((rd_len = read(client->fd, &hdr, sizeof(hdr))) != sizeof(hdr)) {
-        if (rd_len == 0) {
-            /* Allow reconnection TODO */
-            client->state = CS_DISCONNECTED;
-            close_socket(&client->fd);
-            client->last_connected = time(0);
-            return 0;
-        }
-        log_io_error(NULL, rd_len, sizeof(hdr), false);
-        goto fail;
-    }
-
-    dbg_printf("parse_incoming: type=%u flags=%u\n", hdr.type, hdr.flags);
-
-    if (hdr.type >= MQTT_CP_MAX || hdr.type == 0) {
-        warnx("parse_incoming: invalid header type");
-        goto fail;
-    }
-
-    if (control_functions[hdr.type] == NULL) {
-        warnx("parse_incoming: unsupported packet %d", hdr.type);
-        goto fail;
-    }
-
-    if ((new_packet = alloc_packet(client)) == NULL) {
-        warn("parse_incoming: alloc_packet");
-        goto fail;
-    }
-
-    new_packet->type = hdr.type;
-    new_packet->flags = hdr.flags;
-
-    do {
-        if ((rd_len = read(client->fd, &tmp, 1)) != 1) {
-            log_io_error(NULL, rd_len, 1, false);
-            goto fail;
-        }
-        if (multi > 128*128*128) {
-            warnx("parse_incoming: invalid variable byte int");
-            goto fail;
-        }
-        value += (tmp & 127) * multi;
-        multi *= 128;
-    } while ((tmp & 128) != 0);
-    new_packet->remaining_length = value;
-
-    if (value > MAX_PACKET_LENGTH) {
-        warn("parse_incoming: packet too big");
-        goto fail;
-    }
-
-    if ((packet = malloc(new_packet->remaining_length)) == NULL) {
-        warn("malloc(packet_len)");
-        goto fail;
-    }
-
-    if ((rd_len = read(client->fd, packet, new_packet->remaining_length)) !=
-            new_packet->remaining_length) {
-        log_io_error(NULL, rd_len, new_packet->remaining_length, false);
-        goto fail;
-    }
-
-    /* per table 2-2 */
-    if (new_packet->flags & mqtt_packet_permitted_flags[new_packet->type]) {
-        goto fail;
-    }
-
-    if (control_functions[hdr.type](client, new_packet, packet) == -1) {
-        warn("parse_incoming: control_function returned error");
-        goto fail;
-    }
-
-    free(packet);
-
-    if (new_packet->packet_identifier == 0)
-        free_packet(new_packet);
-
-    return 0;
-
-fail:
-    if (packet)
-        free(packet);
-    if (new_packet)
-        free_packet(new_packet);
-    return -1;
-}
-#endif
-
-#define MAX_MESSAGES_PER_TICK 100
 
 /* Clients */
 
