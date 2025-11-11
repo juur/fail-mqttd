@@ -252,7 +252,7 @@ typedef enum {
 } message_state;
 
 struct client_message_state {
-    struct client *client;
+    struct session *session;
     time_t last_sent;
     uint16_t packet_identifier;
     time_t acknowledged_at;
@@ -261,7 +261,7 @@ struct client_message_state {
 struct message {
     struct message *next;
     struct message *next_queue;
-    struct client *sender;
+    struct session *sender;
     uint16_t sender_packet_identifier;
     struct topic *topic;
     const void *payload;
@@ -283,7 +283,7 @@ struct topic_sub_request {
 };
 
 struct subscription {
-    struct client *client;
+    struct session *session;
     struct topic *topic;
     uint8_t option;
 };
@@ -302,20 +302,35 @@ typedef enum {
     READ_STATE_BODY,
 } read_state_t;
 
+struct session {
+    struct session *next;
+    struct client *client;
+    
+    pthread_rwlock_t subscriptions_lock;
+    struct subscription (*subscriptions)[];
+    unsigned num_subscriptions;
+
+    pthread_rwlock_t packet_ids_to_states_lock;
+    unsigned num_packet_id_to_state;
+    struct packet_id_to_state (*packet_ids_to_states)[];
+
+    const uint8_t *client_id;
+
+    time_t last_connected;
+};
+
 struct client {
     struct client *next;
     struct packet *active_packets;
-    pthread_rwlock_t subscriptions_lock;
+    struct session *session;
+
     pthread_rwlock_t active_packets_lock;
-    pthread_rwlock_t packet_ids_to_states_lock;
 
     const uint8_t *client_id;
     const uint8_t *username;
     const uint8_t *password;
-    struct subscription (*subscriptions)[];
     client_state state;
     int fd;
-    unsigned num_subscriptions;
     /* host byte order */
     in_addr_t remote_addr;
     in_port_t remote_port;
@@ -340,8 +355,6 @@ struct client {
     unsigned rl_offset;
     uint8_t header_buffer[sizeof(struct mqtt_fixed_header) + 4];
 
-    unsigned num_packet_id_to_state;
-    struct packet_id_to_state (*packet_ids_to_states)[];
 };
 
 struct topic {
