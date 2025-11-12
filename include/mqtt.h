@@ -75,6 +75,9 @@ typedef enum {
 #define MQTT_CONNECT_FLAG_PASSWORD      (1<<6)
 #define MQTT_CONNECT_FLAG_USERNAME      (1<<7)
 
+#define MQTT_CONNACK_FLAG_SESSION_PRESENT (1<<0)
+#define MQTT_CONNACK_FLAG_RESERVED        (~(1<<0))
+
 #define MQTT_SUBOPT_QOS0                 (0)
 #define MQTT_SUBOPT_QOS1                 (1<<0)
 #define MQTT_SUBOPT_QOS2                 (1<<1)
@@ -251,6 +254,12 @@ typedef enum {
     MSG_DEAD = 2,
 } message_state;
 
+typedef enum {
+    SESSION_NEW = 0,
+    SESSION_ACTIVE = 1,
+    SESSION_DELETE = 2,
+} session_state_t;
+
 struct client_message_state {
     struct session *session;
     time_t last_sent;
@@ -307,7 +316,7 @@ struct session {
     struct client *client;
     
     pthread_rwlock_t subscriptions_lock;
-    struct subscription (*subscriptions)[];
+    struct subscription *(*subscriptions)[];
     unsigned num_subscriptions;
 
     pthread_rwlock_t packet_ids_to_states_lock;
@@ -317,6 +326,8 @@ struct session {
     const uint8_t *client_id;
 
     time_t last_connected;
+
+    session_state_t state;
 };
 
 struct client {
@@ -338,6 +349,7 @@ struct client {
     uint16_t last_packet_id;
     char hostname[INET_ADDRSTRLEN];
     uint8_t connect_flags;
+    uint8_t connect_response_flags;
     uint8_t protocol_version;
     uint16_t keep_alive;
     time_t last_connected;
@@ -360,7 +372,7 @@ struct client {
 struct topic {
     struct topic *next;
     const uint8_t *name;
-    struct subscription (*subscribers)[];
+    struct subscription *(*subscribers)[];
     struct message *pending_queue;
     pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;
