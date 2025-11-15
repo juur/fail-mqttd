@@ -197,6 +197,27 @@ typedef enum {
     MQTT_WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED = 162,
 } mqtt_reason_code_t;
 
+typedef enum {
+    CS_NEW = 0,
+    CS_ACTIVE = 1,
+    CS_CLOSING = 2,
+    CS_CLOSED = 3,
+    CS_DISCONNECTED = 4,
+} client_state;
+
+typedef enum {
+    MSG_NEW = 0,
+    MSG_ACTIVE = 1,
+    MSG_DEAD = 2,
+} message_state;
+
+typedef enum {
+    SESSION_NEW = 0,
+    SESSION_ACTIVE = 1,
+    SESSION_DELETE = 2,
+} session_state_t;
+
+
 struct property {
     mqtt_property_ident ident;
     union {
@@ -215,6 +236,7 @@ struct property {
 
 struct packet {
     struct packet *next;
+    id_t id;
 
     /* HEAD for next_client list */
     struct client *owner;
@@ -240,35 +262,34 @@ struct packet {
 struct client;
 struct subscription;
 
-typedef enum {
-    CS_NEW = 0,
-    CS_ACTIVE = 1,
-    CS_CLOSING = 2,
-    CS_CLOSED = 3,
-    CS_DISCONNECTED = 4,
-} client_state;
+struct message_delivery_state {
+    struct message_delivery_state *next;
+    id_t id;
+    struct session *session;
+    struct message *message;
 
-typedef enum {
-    MSG_NEW = 0,
-    MSG_ACTIVE = 1,
-    MSG_DEAD = 2,
-} message_state;
+    uint16_t packet_identifier;
 
-typedef enum {
-    SESSION_NEW = 0,
-    SESSION_ACTIVE = 1,
-    SESSION_DELETE = 2,
-} session_state_t;
+    time_t last_sent;
+    time_t acknowledged_at;
 
-struct client_message_state {
+    mqtt_reason_code_t client_reason;
+};
+
+/*
+    struct client_message_state {
+    id_t id;
     struct session *session;
     time_t last_sent;
     uint16_t packet_identifier;
     time_t acknowledged_at;
+    mqtt_reason_code_t client_response;
 };
+*/
 
 struct message {
     struct message *next;
+    id_t id;
     struct message *next_queue;
     struct session *sender;
     uint16_t sender_packet_identifier;
@@ -278,13 +299,20 @@ struct message {
     size_t payload_len;
     unsigned qos;
     message_state state;
-    unsigned num_client_states;
-    struct client_message_state (*client_states)[];
-    pthread_rwlock_t client_states_lock;
+    
+    //unsigned num_client_states;
+    //struct client_message_state (*client_states)[];
+    //pthread_rwlock_t client_states_lock;
+    
+    unsigned num_message_delivery_states;
+    struct message_delivery_state **delivery_states;
+    pthread_rwlock_t delivery_states_lock;
+    
     alignas(16) _Atomic unsigned refcnt;
 };
 
 struct topic_sub_request {
+    id_t id;
     const uint8_t **topics;
     uint8_t *options;
     uint8_t *response_codes;
@@ -292,16 +320,20 @@ struct topic_sub_request {
 };
 
 struct subscription {
+    id_t id;
     struct session *session;
     struct topic *topic;
     uint8_t option;
 };
 
+/*
 struct packet_id_to_state {
+    id_t id;
     uint16_t packet_identifier;
     struct client_message_state *state;
     struct message *message;
 };
+*/
 
 /* client.parse_state */
 typedef enum {
@@ -313,15 +345,20 @@ typedef enum {
 
 struct session {
     struct session *next;
+    id_t id;
     struct client *client;
     
     pthread_rwlock_t subscriptions_lock;
     struct subscription *(*subscriptions)[];
     unsigned num_subscriptions;
 
-    pthread_rwlock_t packet_ids_to_states_lock;
-    unsigned num_packet_id_to_state;
-    struct packet_id_to_state (*packet_ids_to_states)[];
+    //pthread_rwlock_t packet_ids_to_states_lock;
+    //unsigned num_packet_id_to_state;
+    //struct packet_id_to_state (*packet_ids_to_states)[];
+    
+    unsigned num_message_delivery_states;
+    struct message_delivery_state **delivery_states;
+    pthread_rwlock_t delivery_states_lock;
 
     const uint8_t *client_id;
 
@@ -332,22 +369,24 @@ struct session {
 
 struct client {
     struct client *next;
-    struct packet *active_packets;
+    id_t id;
     struct session *session;
 
     pthread_rwlock_t active_packets_lock;
+    struct packet *active_packets;
 
     const uint8_t *client_id;
     const uint8_t *username;
     const uint8_t *password;
     client_state state;
     int fd;
+    
     /* host byte order */
     in_addr_t remote_addr;
     in_port_t remote_port;
+    
     uint16_t password_len;
     uint16_t last_packet_id;
-    char hostname[INET_ADDRSTRLEN];
     uint8_t connect_flags;
     uint8_t connect_response_flags;
     uint8_t protocol_version;
@@ -356,6 +395,7 @@ struct client {
     time_t last_keep_alive;
     mqtt_reason_code_t disconnect_reason;
 
+    /* used by parse_incoming() */
     uint8_t *packet_buf;
     struct packet *new_packet;
     read_state_t parse_state;
@@ -366,11 +406,13 @@ struct client {
     unsigned rl_multi;
     unsigned rl_offset;
     uint8_t header_buffer[sizeof(struct mqtt_fixed_header) + 4];
-
+    
+    char hostname[INET_ADDRSTRLEN];
 };
 
 struct topic {
     struct topic *next;
+    id_t id;
     const uint8_t *name;
     struct subscription *(*subscribers)[];
     struct message *pending_queue;
@@ -381,7 +423,14 @@ struct topic {
 
 
 extern const mqtt_payload_required mqtt_packet_to_payload[MQTT_CP_MAX];
-extern const mqtt_types mqtt_property_to_type[MQTT_MAX_PROPERTY_IDENT];
+extern const char *const mqtt_packet_type_strings[MQTT_CP_MAX];
 extern const uint8_t mqtt_packet_permitted_flags[MQTT_CP_MAX];
+extern const mqtt_types mqtt_property_to_type[MQTT_MAX_PROPERTY_IDENT];
+
+extern const char *const client_state_strings[];
+extern const char *const message_state_strings[];
+extern const char *const session_state_strings[];
+extern const char *const mqtt_property_strings[MQTT_MAX_PROPERTY_IDENT];
+extern const char *const mqtt_packet_type_strings[MQTT_CP_MAX];
 
 #endif

@@ -42,21 +42,26 @@ static constexpr unsigned MAX_PROPERTIES        = 32;
 static constexpr unsigned MAX_RECEIVE_PUBS      = 8;
 static constexpr unsigned MAX_SESSIONS          = 128;
 
-static pthread_rwlock_t global_clients_lock  = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_sessions_lock = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_messages_lock = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_packets_lock  = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_topics_lock   = PTHREAD_RWLOCK_INITIALIZER;
-static struct client *global_client_list   = NULL;
-static struct message *global_message_list = NULL;
-static struct packet *global_packet_list   = NULL;
-static struct topic *global_topic_list     = NULL;
-static struct session *global_session_list = NULL;
-static unsigned num_clients  = 0;
-static unsigned num_messages = 0;
-static unsigned num_packets  = 0;
-static unsigned num_topics   = 0;
-static unsigned num_sessions = 0;
+static pthread_rwlock_t global_clients_lock                = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_sessions_lock               = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_messages_lock               = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_packets_lock                = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_topics_lock                 = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_message_delivery_states_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static struct client *global_client_list                                 = NULL;
+static struct message *global_message_list                               = NULL;
+static struct packet *global_packet_list                                 = NULL;
+static struct topic *global_topic_list                                   = NULL;
+static struct session *global_session_list                               = NULL;
+static struct message_delivery_state *global_message_delivery_state_list = NULL;
+
+static unsigned num_clients                 = 0;
+static unsigned num_messages                = 0;
+static unsigned num_packets                 = 0;
+static unsigned num_topics                  = 0;
+static unsigned num_sessions                = 0;
+static unsigned num_message_delivery_states = 0;
 
 static in_port_t opt_port = 1883;
 static struct in_addr opt_listen = {
@@ -67,7 +72,7 @@ static struct in_addr opt_listen = {
  * forward declarations
  */
 
-static int unsubscribe_from_topic(struct session *session, struct topic *topic);
+static int unsubscribe(struct subscription *sub);
 static int dequeue_message(struct message *msg);
 
 /*
@@ -133,6 +138,28 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     pthread_rwlock_unlock(&global_topics_lock);
 }
 
+static void dump_clients(void)
+{
+    pthread_rwlock_rdlock(&global_clients_lock);
+    for (struct client *client = global_client_list; client; client = client->next)
+    {
+        printf("{\"id\": %u, \"session\": {\"id\": %u}, \"client-id\": \"%s\"}%s\n",
+                client->id,
+                client->session->id,
+                client->client_id,
+                client->next ? "," : ""
+              );
+    }
+    pthread_rwlock_unlock(&global_clients_lock);
+}
+
+static void dump_all(void)
+{
+    printf("{\"clients\":[\n");
+    dump_clients();
+    printf("]}\n");
+}
+
 /*
  * allocators / deallocators
  */
@@ -180,7 +207,8 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 
 [[gnu::nonnull]] static void free_topic(struct topic *topic)
 {
-    dbg_printf("free_topic: <%s>\n",
+    dbg_printf("free_topic: id=%u <%s>\n",
+            topic->id,
             (topic->name == NULL) ? "" : (char *)topic->name
             );
 
@@ -197,7 +225,6 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     } pthread_rwlock_unlock(&global_topics_lock);
     topic->next = NULL;
 
-
     /* TODO check if we should have a wrlock here,
      * not inside unsubscribe_from_topic */
     if (topic->subscribers) {
@@ -211,13 +238,11 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
             for(unsigned idx = 0; idx < topic->num_subscribers; idx++)
             {
                 dbg_printf("free_topic: subscriber[%u]\n", idx);
-                if ((*topic->subscribers)[idx].session == NULL &&
-                        (*topic->subscribers)[idx].topic == NULL)
+                if ((*topic->subscribers)[idx] == NULL)
                     continue;
 
                 /* TODO should we handle the return code ? */
-                (void)unsubscribe_from_topic((*topic->subscribers)[idx].session,
-                        (*topic->subscribers)[idx].topic);
+                (void)unsubscribe((*topic->subscribers)[idx]);
             }
         }
 
@@ -289,6 +314,11 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 {
     struct packet *tmp;
 
+    dbg_printf("free_packet: %u owner=%u <%s>\n",
+            pck->id,
+            pck->owner ? pck->owner->id : 0,
+            pck->owner ? (char *)pck->owner->client_id : "");
+
     if (atomic_load_explicit(&pck->refcnt, memory_order_relaxed) > 0) {
         warn("free_packet: attempt to free packet with refcnt");
         return;
@@ -353,6 +383,11 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 
 [[gnu::nonnull]] static void free_message(struct message *msg, bool need_lock)
 {
+    dbg_printf("free_message: id=%u [%s] lock=%s topic=%u <%s>\n",
+            msg->id, message_state_strings[msg->state], need_lock ? "yes" : "no",
+            msg->topic ? msg->topic->id : 0,
+            msg->topic ? (char *)msg->topic->name : "");
+
     if (msg->topic) {
         warn("free_message: attempt to free with topic <%s> set", msg->topic->name);
         return;
@@ -381,10 +416,10 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     }
 
     /* TODO do this properly */
-    if (msg->client_states)
-        free(msg->client_states);
+    if (msg->delivery_states)
+        free(msg->delivery_states);
 
-    pthread_rwlock_destroy(&msg->client_states_lock);
+    pthread_rwlock_destroy(&msg->delivery_states_lock);
 
     num_messages--;
     free(msg);
@@ -393,6 +428,13 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 [[gnu::nonnull]] static void free_client(struct client *client, bool needs_lock)
 {
     struct client *tmp;
+
+    printf("free_client: id=%u [%s] lock=%s client_id=%s session=%u %s\n",
+            client->id, client_state_strings[client->state], 
+            needs_lock ? "yes" : "no",
+            (char *)client->client_id,
+            client->session ? client->session->id : 0,
+            client->session ? (char *)client->session->client_id : "");
 
     client->state = CS_CLOSED;
 
@@ -471,9 +513,11 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 {
     struct session *tmp;
 
-    printf("free_session: session=%p client=%p client_id=%s\n",
-            (void *)session, (void *)session->client,
-            (const char *)session->client_id);
+    printf("free_session: session=%u <%s> [%s] client=%u <%s>\n",
+            session->id, 
+            session->client_id, session_state_strings[session->state],
+            session->client ? session->client->id : 0,
+            session->client ? (char *)session->client->client_id : "");
 
     if (need_lock)
         pthread_rwlock_wrlock(&global_sessions_lock);
@@ -501,11 +545,9 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
         if (session->subscriptions) {
             while (session->num_subscriptions)
                 for (unsigned idx = 0; idx < session->num_subscriptions; idx++) {
-                    if ((*session->subscriptions)[idx].session == NULL &&
-                            (*session->subscriptions)[idx].topic == NULL)
+                    if ((*session->subscriptions)[idx] == NULL)
                         continue;
-                    unsubscribe_from_topic((*session->subscriptions)[idx].session,
-                            (*session->subscriptions)[idx].topic);
+                    unsubscribe((*session->subscriptions)[idx]);
                 }
             free(session->subscriptions);
             session->subscriptions = NULL;
@@ -514,20 +556,50 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     } pthread_rwlock_unlock(&session->subscriptions_lock);
 
     /* TODO do this properly */
-    pthread_rwlock_wrlock(&session->packet_ids_to_states_lock); {
-        if (session->packet_ids_to_states)
-            free (session->packet_ids_to_states);
-    } pthread_rwlock_unlock(&session->packet_ids_to_states_lock);
+    pthread_rwlock_wrlock(&session->delivery_states_lock); {
+        /* TODO iterate and free_message_delivery_state() */
+        if (session->delivery_states)
+            free (session->delivery_states);
+    } pthread_rwlock_unlock(&session->delivery_states_lock);
 
     if (session->client_id)
         free((void *)session->client_id);
 
     pthread_rwlock_destroy(&session->subscriptions_lock);
-    pthread_rwlock_destroy(&session->packet_ids_to_states_lock);
+    pthread_rwlock_destroy(&session->delivery_states_lock);
 
     free(session);
 }
 
+static _Atomic id_t subscription_id = 1;
+static _Atomic id_t session_id      = 1;
+static _Atomic id_t topic_id        = 1;
+static _Atomic id_t packet_id       = 1;
+static _Atomic id_t message_id      = 1;
+static _Atomic id_t client_id       = 1;
+static _Atomic id_t mds_id          = 1;
+
+
+[[gnu::malloc, gnu::nonnull]] static struct message_delivery_state *alloc_message_delivery_state(
+        struct message *message, struct session *session)
+{
+    struct message_delivery_state *ret;
+
+    if ((ret = calloc(1, sizeof(struct message_delivery_state))) == NULL)
+        goto fail;
+
+    ret->session = session;
+    ret->message = message;
+    ret->id = mds_id++;
+    
+    num_message_delivery_states++;
+    return ret;
+
+fail:
+    if (ret)
+        free(ret);
+    return NULL;
+}
 
 [[gnu::malloc]] static struct subscription *alloc_subscription(struct session *session, struct topic *topic)
 {
@@ -536,9 +608,13 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     if ((ret = calloc(1, sizeof(struct subscription))) == NULL)
         return NULL;
 
+    ret->id = subscription_id++;
     ret->topic = topic;
     ret->session = session;
 
+    dbg_printf("alloc_subscription: id=%u session=%u <%s> topic=%u <%s>\n",
+            ret->id, session->id, (char *)session->client_id,
+            topic->id, (char *)topic->name);
     return ret;
 }
 
@@ -558,7 +634,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 
     if (pthread_rwlock_init(&ret->subscriptions_lock, NULL) == -1)
         goto fail;
-    if (pthread_rwlock_init(&ret->packet_ids_to_states_lock, NULL) == -1)
+    if (pthread_rwlock_init(&ret->delivery_states_lock, NULL) == -1)
         goto fail;
 
     if (client) {
@@ -573,6 +649,10 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     num_sessions++;
     pthread_rwlock_unlock(&global_sessions_lock);
 
+    ret->id = session_id++;
+
+    printf("alloc_session: id=%u client=%u <%s>\n",
+            ret->id, client ? client->id : 0, client ? (char *)client->client_id : "");
     return ret;
 
 fail:
@@ -582,7 +662,7 @@ fail:
     return NULL;
 }
 
-[[gnu::malloc]] static struct topic *alloc_topic(const uint8_t *name)
+[[gnu::malloc, gnu::nonnull]] static struct topic *alloc_topic(const uint8_t *name)
 {
     struct topic *ret;
 
@@ -600,7 +680,10 @@ fail:
     pthread_rwlock_init(&ret->pending_queue_lock, NULL);
 
     ret->name = name;
+    ret->id = topic_id++;
     num_topics++;
+
+    dbg_printf("alloc_topic: id=%u <%s>\n", ret->id, (char *)name);
 
     return ret;
 }
@@ -634,6 +717,12 @@ fail:
     num_packets++;
     pthread_rwlock_unlock(&global_packets_lock);
 
+    ret->id = packet_id++;
+
+    dbg_printf("alloc_packet: id=%u owner=%u <%s>\n",
+            ret->id, owner ? owner->id : 0, owner ? ((char *)owner->client_id) : ""
+          );
+
     return ret;
 }
 
@@ -657,6 +746,8 @@ fail:
     global_message_list = msg;
     num_messages++;
     pthread_rwlock_unlock(&global_messages_lock);
+
+    msg->id = message_id++;
 
     return msg;
 }
@@ -687,6 +778,10 @@ fail:
     global_client_list = client;
     num_clients++;
     pthread_rwlock_unlock(&global_clients_lock);
+
+    client->id = client_id++;
+
+    printf("alloc_client: id=%u\n", client->id);
 
     return client;
 
@@ -1111,7 +1206,7 @@ fail:
     if (properties_length == 0 && errno)
         return -1;
 
-    dbg_printf("parse_properties: properties_length=%u\n", properties_length);
+    //dbg_printf("parse_properties: properties_length=%u\n", properties_length);
 
     if (properties_length == 0)
         return 0;
@@ -1260,12 +1355,65 @@ fail:
     return -1;
 }
 
+#if 0
+[[maybe_unused]] static int remove_from_packet_ids(struct client_message_state *cs,
+        struct message *msg)
+{
+    struct packet_id_to_state (*tmp)[];
+    pthread_rwlock_wrlock(&cs->session->packet_ids_to_states_lock);
+    unsigned tmp_size = cs->session->num_packet_id_to_state - 1;
+
+    tmp = NULL;
+
+    unsigned skip_idx;
+
+    for (skip_idx = 0; skip_idx < cs->session->num_packet_id_to_state; skip_idx++)
+        if ((*cs->session->packet_ids_to_states)[skip_idx].state == cs &&
+                (*cs->session->packet_ids_to_states)[skip_idx].message == msg &&
+                (*cs->session->packet_ids_to_states)[skip_idx].packet_identifier == cs->packet_identifier)
+            goto found_one;
+
+    goto fail;
+
+found_one:
+    if ((tmp = realloc(cs->session->packet_ids_to_states,
+                    sizeof(struct packet_id_to_state) * tmp_size)) == NULL) {
+        pthread_rwlock_unlock(&cs->session->packet_ids_to_states_lock);
+        goto fail;
+    }
+
+    for (unsigned src_idx = 0, dst_idx = 0; src_idx < cs->session->num_packet_id_to_state; src_idx++)
+    {
+        if (src_idx == skip_idx)
+            continue;
+
+        memcpy(&(*tmp)[dst_idx++], &(&cs->session->packet_ids_to_states)[src_idx], sizeof(struct packet_id_to_state));
+    }
+
+    cs->session->packet_ids_to_states = tmp;
+    cs->session->num_packet_id_to_state--;
+
+    pthread_rwlock_unlock(&cs->session->packet_ids_to_states_lock);
+
+    return 0;
+
+fail:
+    if (tmp)
+        free(tmp);
+    return -1;
+}
+
 static int add_to_packet_ids(struct client_message_state *cs,
         struct message *msg)
 {
     struct packet_id_to_state (*tmp)[];
     pthread_rwlock_wrlock(&cs->session->packet_ids_to_states_lock);
     unsigned tmp_size = cs->session->num_packet_id_to_state + 1;
+
+    printf("add_to_packet_ids: cms { id=%u packet_identifier=%u } msg=%u\n",
+            cs->id,
+            cs->packet_identifier,
+            msg->id);
 
     if ((tmp = realloc(cs->session->packet_ids_to_states,
                     sizeof(struct packet_id_to_state) * tmp_size)) == NULL) {
@@ -1276,6 +1424,7 @@ static int add_to_packet_ids(struct client_message_state *cs,
     (*tmp)[tmp_size - 1].packet_identifier = cs->packet_identifier;
     (*tmp)[tmp_size - 1].message = msg;
     (*tmp)[tmp_size - 1].state = cs;
+    (*tmp)[tmp_size - 1].id = cms_id++;
 
     cs->session->packet_ids_to_states = tmp;
     cs->session->num_packet_id_to_state = tmp_size;
@@ -1289,6 +1438,7 @@ fail:
 
     return -1;
 }
+#endif
 
 /*
  * signal handlers
@@ -1297,6 +1447,10 @@ fail:
 static void sh_sigint(int signum, siginfo_t * /*info*/, void * /*stuff*/)
 {
     dbg_printf("sh_sigint: received signal %u\n", signum);
+    if (signum == SIGHUP) {
+        dump_all();
+        return;
+    }
     if (running == false)
         _exit(EXIT_FAILURE);
     running = false;
@@ -1377,7 +1531,10 @@ static void free_all_topics(void)
     pthread_rwlock_rdlock(&topic->subscribers_lock);
     for (unsigned idx = 0; idx < topic->num_subscribers; idx++)
     {
-        if ((*topic->subscribers)[idx].session == session) {
+        if ((*topic->subscribers)[idx] == NULL)
+            continue;
+
+        if ((*topic->subscribers)[idx]->session == session) {
             pthread_rwlock_unlock(&topic->subscribers_lock);
             return idx;
         }
@@ -1405,6 +1562,34 @@ static void free_all_topics(void)
     return ret;
 }
 
+[[gnu::nonnull]] static int add_to_delivery_state(
+        struct message_delivery_state ***state_array, unsigned *array_length,
+        pthread_rwlock_t *lock, struct message_delivery_state *add)
+{
+    pthread_rwlock_wrlock(lock);
+
+    unsigned new_length = *array_length + 1;
+    struct message_delivery_state **tmp;
+
+    if ((tmp = realloc(*state_array, sizeof(struct message_delivery_state *) * new_length)) == NULL)
+        goto fail;
+
+    tmp[*array_length] = add;
+
+    *state_array = tmp;
+    *array_length = new_length;
+
+    pthread_rwlock_unlock(lock);
+    return 0;
+
+fail:
+    if (tmp)
+        free(tmp);
+
+    pthread_rwlock_unlock(lock);
+    return -1;
+}
+
 [[gnu::nonnull]] static int enqueue_message(struct topic *topic,
         struct message *msg)
 {
@@ -1420,11 +1605,20 @@ static void free_all_topics(void)
         return -1;
     }
 
-    for (unsigned idx = 0; idx < num; idx++)
+    bool found = false;
+    for (unsigned dst_idx = 0, src_idx = 0; src_idx < num; src_idx++)
     {
-        (*tmp)[idx].session = (*topic->subscribers)[idx].session;
+        if ((*topic->subscribers)[src_idx] == NULL)
+            continue;
+
+        (*tmp)[dst_idx].id = cms_id++;
+        (*tmp)[dst_idx++].session = (*topic->subscribers)[src_idx]->session;
+        found = true;
         /* refcnt TODO */
     }
+
+    if (found == false)
+        warnx("enqueue_message: failed to add to subscribers!");
 
     pthread_rwlock_unlock(&topic->subscribers_lock);
 
@@ -1534,35 +1728,41 @@ fail:
     return NULL;
 }
 
-[[gnu::nonnull]] static int add_subscription_to_topic(struct topic *topic,
-        struct session *session, uint8_t option)
+[[gnu::nonnull]] static int add_subscription_to_topic(struct subscription *new_sub)
 {
-    struct subscription (*tmp_subs)[];
+    struct subscription *(*tmp_subs)[] = NULL;
+    struct topic *topic = new_sub->topic;
 
     errno = 0;
 
-    size_t sub_size = sizeof(struct subscription) * (topic->num_subscribers + 1);
+    size_t sub_size = sizeof(struct subscription *) * (topic->num_subscribers + 1);
     if ((tmp_subs = (void *)realloc(topic->subscribers, sub_size)) == NULL)
-        return -1;
+        goto fail;
 
     topic->subscribers = tmp_subs;
-
-    (*topic->subscribers)[topic->num_subscribers].option = option;
-    (*topic->subscribers)[topic->num_subscribers].session = session;
-    (*topic->subscribers)[topic->num_subscribers].topic = topic;
-
+    (*topic->subscribers)[topic->num_subscribers] = new_sub;
     topic->num_subscribers++;
     return 0;
+
+fail:
+    if (tmp_subs)
+        free(tmp_subs);
+    return -1;
 }
 
 /* TODO locking */
-[[gnu::nonnull]] static int unsubscribe_from_topic(struct session *session,
-        struct topic *topic)
+[[gnu::nonnull]] static int unsubscribe(struct subscription *sub)
 {
-    struct subscription (*tmp_topic)[] = NULL;
-    struct subscription (*tmp_client)[] = NULL;
+    struct subscription *(*tmp_topic)[] = NULL;
+    struct subscription *(*tmp_client)[] = NULL;
     size_t topic_sub_size, topic_sub_cnt = 0, client_sub_size, client_sub_cnt = 0;
     unsigned old_idx, new_idx;
+
+    struct topic *topic;
+    struct session *session;
+
+    topic = sub->topic;
+    session = sub->session;
 
     errno = 0;
 
@@ -1573,9 +1773,8 @@ fail:
     pthread_rwlock_wrlock(&topic->subscribers_lock);
     for (unsigned idx = 0; idx < topic->num_subscribers; idx++)
     {
-        if ( (*topic->subscribers)[idx].topic == topic &&
-                (*topic->subscribers)[idx].session == session ) {
-            memset(&(*topic->subscribers)[idx], 0, sizeof(struct subscription));
+        if ( (*topic->subscribers)[idx] == sub) {
+            (*topic->subscribers)[idx] = NULL;
             break;
         }
     }
@@ -1584,13 +1783,12 @@ fail:
     pthread_rwlock_wrlock(&session->subscriptions_lock);
     for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
     {
-        if ( (*session->subscriptions)[idx].topic == topic &&
-                (*session->subscriptions)[idx].session == session ) {
-            memset(&(*session->subscriptions)[idx], 0, sizeof(struct subscription));
+        if ( (*session->subscriptions)[idx] == sub) {
+            (*session->subscriptions)[idx] = NULL;
             break;
         }
     }
-    pthread_rwlock_unlock(&session->subscriptions_lock);
+    pthread_rwlock_unlock(&session->subscriptions_lock); /* TODO hold lock until the end */
 
     /*
      * compact the topic list of subscribers
@@ -1598,24 +1796,22 @@ fail:
 
     for (unsigned idx = 0; idx < topic->num_subscribers; idx++)
     {
-        if ((*topic->subscribers)[idx].topic == NULL &&
-                (*topic->subscribers)[idx].session == NULL)
+        if ((*topic->subscribers)[idx] == NULL)
             continue;
         topic_sub_cnt++;
     }
 
-    topic_sub_size = topic_sub_cnt * sizeof(struct subscription);
+    topic_sub_size = topic_sub_cnt * sizeof(struct subscription *);
 
     if ((tmp_topic = calloc(1, topic_sub_size)) == NULL)
         goto fail;
 
     for (old_idx = 0, new_idx = 0; old_idx < topic->num_subscribers; old_idx++)
     {
-        if ((*topic->subscribers)[old_idx].topic == NULL &&
-                (*topic->subscribers)[old_idx].session == NULL)
+        if ((*topic->subscribers)[old_idx] == NULL)
             continue;
-        memcpy(&(*tmp_topic)[new_idx], &(*topic->subscribers)[old_idx],
-                sizeof(struct subscription));
+
+        (*tmp_topic)[new_idx] = (*topic->subscribers)[old_idx];
         new_idx++;
     }
 
@@ -1623,16 +1819,15 @@ fail:
      * compact the client list of subscriptions
      */
 
-    pthread_rwlock_wrlock(&session->subscriptions_lock);
+    pthread_rwlock_wrlock(&session->subscriptions_lock); /* HOLD lock from start to finish */
     for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
     {
-        if ((*session->subscriptions)[idx].topic == NULL &&
-                (*session->subscriptions)[idx].session == NULL)
+        if ((*session->subscriptions)[idx] == NULL)
             continue;
         client_sub_cnt++;
     }
 
-    client_sub_size = client_sub_cnt * sizeof(struct subscription);
+    client_sub_size = client_sub_cnt * sizeof(struct subscription *);
 
     if ((tmp_client = calloc(1, client_sub_size)) == NULL) {
         pthread_rwlock_unlock(&session->subscriptions_lock);
@@ -1641,11 +1836,9 @@ fail:
 
     for (old_idx = 0, new_idx = 0; old_idx < session->num_subscriptions; old_idx++)
     {
-        if ((*session->subscriptions)[old_idx].topic == NULL &&
-                (*session->subscriptions)[old_idx].session == NULL)
+        if ((*session->subscriptions)[old_idx] == NULL)
             continue;
-        memcpy(&(*tmp_client)[new_idx], &(*session->subscriptions)[old_idx],
-                sizeof(struct subscription));
+        (*tmp_client)[new_idx] = (*session->subscriptions)[old_idx];
         new_idx++;
     }
 
@@ -1665,10 +1858,11 @@ fail:
     printf("unsubscribe_from_topic: client_sub_cnt now %lu\n", client_sub_cnt);
 
     pthread_rwlock_unlock(&session->subscriptions_lock);
+    free_subscription(sub);
+    
     return 0;
 
 fail:
-
     if (tmp_client)
         free(tmp_client);
     if (tmp_topic)
@@ -1680,13 +1874,13 @@ fail:
 [[gnu::nonnull]] static int subscribe_to_topics(struct session *session,
         struct topic_sub_request *request)
 {
-    struct subscription (*tmp_subs)[] = NULL;
+    struct subscription *(*tmp_subs)[] = NULL;
     struct topic *tmp_topic = NULL;
 
     errno = 0;
 
     pthread_rwlock_wrlock(&session->subscriptions_lock);
-    size_t sub_size = sizeof(struct subscription) * (session->num_subscriptions + request->num_topics);
+    size_t sub_size = sizeof(struct subscription *) * (session->num_subscriptions + request->num_topics);
 
     if ((tmp_subs = (void *)realloc(session->subscriptions, sub_size)) == NULL) {
         for (unsigned idx = 0; idx < request->num_topics; idx++)
@@ -1700,8 +1894,7 @@ fail:
 
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
-        memset(&(*session->subscriptions)[session->num_subscriptions + idx],
-                0, sizeof(struct subscription));
+        (*session->subscriptions)[session->num_subscriptions + idx] = NULL;
 
         if (request->response_codes[idx] > MQTT_GRANTED_QOS_2) {
             dbg_printf("subscribe_to_topics: response code is %u\n",
@@ -1722,19 +1915,24 @@ fail:
         }
 
         int existing_idx;
+        struct subscription *new_sub;
 
         if ((existing_idx = find_subscription(session, tmp_topic)) == -1 && errno == ENOENT) {
-            if (add_subscription_to_topic(tmp_topic, session, request->options[idx]) == -1) {
+
+            if ((new_sub = alloc_subscription(session, tmp_topic)) == NULL)
+                goto fail;
+            new_sub->option = request->options[idx];
+
+            if (add_subscription_to_topic(new_sub) == -1) {
                 warn("subscribe_to_topics: add_subscription_to_topic <%s>",
                         tmp_topic->name);
                 request->response_codes[idx] = MQTT_UNSPECIFIED_ERROR;
+                free_subscription(new_sub);
                 continue;
             }
 
             /* TODO refactor to add_subscription_to_session() */
-            (*session->subscriptions)[session->num_subscriptions + idx].session = session;
-            (*session->subscriptions)[session->num_subscriptions + idx].topic = tmp_topic;
-            (*session->subscriptions)[session->num_subscriptions + idx].option = request->options[idx];
+            (*session->subscriptions)[session->num_subscriptions + idx] = new_sub;
         } else if (existing_idx == -1) {
             warn("subscribe_to_topics: find_subscription");
             request->response_codes[idx] = MQTT_UNSPECIFIED_ERROR;
@@ -1742,13 +1940,7 @@ fail:
         } else {
             /* Update the existing subscription's options (e.g. QoS) */
             dbg_printf("subscribe_to_topics: updating existing subscription\n");
-            (*tmp_topic->subscribers)[existing_idx].option = request->options[idx];
-            for (unsigned sess_idx = 0; sess_idx < session->num_subscriptions; sess_idx++) {
-                if ((*session->subscriptions)[sess_idx].topic == tmp_topic) {
-                    (*session->subscriptions)[sess_idx].option = request->options[idx];
-                    break;
-                }
-            }
+            (*tmp_topic->subscribers)[existing_idx]->option = request->options[idx];
         }
 
         free((void *)request->topics[idx]);
@@ -1758,7 +1950,7 @@ fail:
             session->num_subscriptions++;
     }
 
-    dbg_printf("subscribe_to_topics: num_subscriptions now %u [+%u]",
+    dbg_printf("subscribe_to_topics: num_subscriptions now %u [+%u]\n",
             session->num_subscriptions, request->num_topics);
     pthread_rwlock_unlock(&session->subscriptions_lock);
     return 0;
@@ -1799,6 +1991,8 @@ fail:
     assert(pkt->message != NULL);
     assert(pkt->message->topic != NULL);
     assert(pkt->owner != NULL);
+
+    printf("send_cp_publish: owner=%s\n", (char *)pkt->owner->client_id);
 
     errno = 0;
     msg = pkt->message;
@@ -1917,6 +2111,8 @@ fail:
         free(packet);
         return log_io_error(NULL, wr_len, length, false);
     }
+
+    dbg_printf("send_cp_disconnect: sent code was %u\n", reason_code);
 
     free(packet);
     client->state = CS_CLOSING;
@@ -2319,13 +2515,103 @@ fail:
     return -1;
 }
 
+[[gnu::nonnull]] static int handle_cp_puback(struct client *client,
+        struct packet *packet, const void *remain)
+{
+    const uint8_t *ptr = remain;
+    size_t bytes_left = packet->remaining_length;
+    mqtt_reason_code_t reason_code, puback_reason_code;
+    uint16_t packet_identifier;
+
+    printf("handle_cp_puback: client=%u <%s>\n", client->id, (char *)client->client_id);
+
+    errno = 0;
+
+    if (bytes_left < 2) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+
+    memcpy(&packet_identifier, ptr, 2);
+    bytes_left -= 2;
+    ptr += 2;
+    packet_identifier = ntohs(packet_identifier);
+
+    if (packet_identifier == 0) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
+
+    if (bytes_left == 0) {
+        puback_reason_code = MQTT_SUCCESS;
+        goto skip_reason;
+    }
+
+    puback_reason_code = *ptr;
+    ptr++;
+    bytes_left--;
+
+skip_reason:
+
+    if (bytes_left == 0)
+        goto skip_property_length;
+
+    if (parse_properties(&ptr, &bytes_left, &packet->properties,
+                &packet->property_count, MQTT_CP_PUBACK)) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+
+skip_property_length:
+    /* TODO record acknowledgment */
+
+
+    printf("handle_cp_puback: reason_code=%u packet_identifier=%u\n",
+            puback_reason_code, packet_identifier);
+
+    pthread_rwlock_rdlock(&client->session->packet_ids_to_states_lock);
+    bool found = false; 
+    for (unsigned idx = 0; idx < client->session->num_packet_id_to_state; idx++)
+    {
+        printf("handle_cp_puback: comparing %u with %u\n", packet_identifier,
+                (*client->session->packet_ids_to_states)[idx].packet_identifier);
+        if ((*client->session->packet_ids_to_states)[idx].packet_identifier == packet_identifier) {
+            struct packet_id_to_state *ptos = &(*client->session->packet_ids_to_states)[idx];
+            if (ptos->state == NULL)
+                warnx("send_cp_puback: packet_ids_to_states[%u] is NULL on packet_identifier=%u", idx, packet_identifier);
+            ptos->state->acknowledged_at = time(0);
+            ptos->state->client_response = puback_reason_code;
+            found = true;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&client->session->packet_ids_to_states_lock);
+
+    if (found == false) {
+        reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
+        errno = ENOENT;
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    if (reason_code == MQTT_PROTOCOL_ERROR || reason_code == MQTT_MALFORMED_PACKET) {
+        errno = EINVAL;
+        client->state = CS_CLOSING;
+        client->disconnect_reason = reason_code;
+    }
+
+    return -1;
+}
+
 [[gnu::nonnull]] static int handle_cp_pubrec(struct client *client,
         struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
     mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
-    [[maybe_unused]] mqtt_reason_code_t pubrec_reason_code = 0;
+    mqtt_reason_code_t pubrec_reason_code;
     uint16_t packet_identifier;
 
     errno = 0;
@@ -2348,6 +2634,7 @@ fail:
     /* The Reason Code and Property Length can be omitted if the Reason Code
      * is 0x00 (Success) and there are no Properties. */
     if (bytes_left == 0) {
+        pubrec_reason_code = MQTT_SUCCESS;
         goto skip_props;
     }
 
@@ -2369,6 +2656,7 @@ skip_props:
         if ((*client->session->packet_ids_to_states)[idx].packet_identifier == packet_identifier) {
             struct packet_id_to_state *ptos = &(*client->session->packet_ids_to_states)[idx];
             ptos->state->acknowledged_at = time(0);
+            ptos->state->client_response = pubrec_reason_code;
             found = true;
             break;
         }
@@ -2772,7 +3060,7 @@ fail:
         warn("read_utf8");
         goto fail;
     }
-    dbg_printf("client_id=<%s>\n", (char *)client->client_id);
+    dbg_printf("handle_cp_connect: client_id=<%s> ", (char *)client->client_id);
 
     if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
         dbg_printf("clean_start ");
@@ -2934,6 +3222,7 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
     [MQTT_CP_SUBSCRIBE]  = handle_cp_subscribe,
     [MQTT_CP_PUBREC]     = handle_cp_pubrec,
     [MQTT_CP_PUBREL]     = handle_cp_pubrel,
+    [MQTT_CP_PUBACK]     = handle_cp_puback,
 };
 
 /*
@@ -2953,6 +3242,7 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
     switch (client->parse_state)
     {
         case READ_STATE_NEW:
+            dbg_printf("\nparse_incoming: READ_STATE_NEW client=%u <%s>\n", client->id, (char *)client->client_id);
             client->read_offset = 0;
             client->rl_offset = 0;
             client->rl_multi = 1;
@@ -3004,14 +3294,20 @@ eof:
             if (client->parse_state == READ_STATE_HEADER) {
                 hdr = (void *)client->header_buffer;
 
-                if (hdr->type >= MQTT_CP_MAX || hdr->type == 0)
+                if (hdr->type >= MQTT_CP_MAX || hdr->type == 0) {
+                    warnx("hdr->type");
                     goto fail;
+                }
 
-                if (control_functions[hdr->type] == NULL)
+                if (control_functions[hdr->type] == NULL) {
+                    warnx("no func for %u", hdr->type);
                     goto fail;
+                }
 
-                if (hdr->flags & mqtt_packet_permitted_flags[hdr->type])
+                if (hdr->flags & mqtt_packet_permitted_flags[hdr->type]) {
+                    warnx("illegal flags");
                     goto fail;
+                }
 
                 client->parse_state = READ_STATE_MORE_HEADER;
 
@@ -3024,8 +3320,10 @@ lenread:
                 uint8_t tmp;
                 hdr = (void *)client->header_buffer;
 
-                if (client->rl_multi > 128*128*128)
+                if (client->rl_multi > 128*128*128) {
+                    warn("var len overflow");
                     goto fail;
+                }
 
                 tmp = client->header_buffer[1 + client->rl_offset];
 
@@ -3043,19 +3341,23 @@ lenread:
                     goto fail;
                 }
 
-                dbg_printf("parse_incoming: type=%u flags=%u remaining_length=%u\n",
-                        hdr->type, hdr->flags, client->rl_value);
+                dbg_printf("parse_incoming: type=%u <%s> flags=%u remaining_length=%u\n",
+                        hdr->type, mqtt_packet_type_strings[hdr->type],
+                        hdr->flags, client->rl_value);
 
-                if ((client->new_packet = alloc_packet(client)) == NULL)
+                if ((client->new_packet = alloc_packet(client)) == NULL) {
+                    warn("alloc_packet");
                     goto fail;
+                }
 
                 client->new_packet->remaining_length = client->rl_value;
                 client->new_packet->type = hdr->type;
                 client->new_packet->flags = hdr->flags;
 
-
-                if ((client->packet_buf = malloc(client->new_packet->remaining_length)) == NULL)
+                if ((client->packet_buf = malloc(client->new_packet->remaining_length)) == NULL) {
+                    warn("malloc(%lu)", client->new_packet->remaining_length);
                     goto fail;
+                }
 
                 client->parse_state = READ_STATE_BODY;
                 client->packet_offset = 0;
@@ -3090,8 +3392,10 @@ exec_control:
             client->parse_state = READ_STATE_NEW;
 
             if (control_functions[client->new_packet->type](client,
-                        client->new_packet, client->packet_buf) == -1)
+                        client->new_packet, client->packet_buf) == -1) {
+                warn("control_function");
                 goto fail;
+            }
 
             break;
     }
@@ -3161,6 +3465,8 @@ static void tick_msg(struct message *msg)
     if (msg->client_states == NULL)
         return;
 
+    time_t now = time(0);
+
     pthread_rwlock_wrlock(&msg->client_states_lock);
     for (unsigned idx = 0; idx < msg->num_client_states; idx++) {
         client_state = &(*msg->client_states)[idx];
@@ -3170,13 +3476,18 @@ static void tick_msg(struct message *msg)
             continue;
         }
 
+        if (client_state->last_sent && now > (client_state->last_sent + 5))
+            continue;
+
         if (client_state->session == NULL ||
                 client_state->session->client == NULL) {
-            warnx("tick_msg: client_state->client is NULL");
+            warnx("tick_msg: client_state->session is NULL");
+            _exit(0);
             continue;
         }
 
-        dbg_printf("tick: sending message\n");
+        dbg_printf("tick: sending message: acknowledged_at=%lu last_sent=%lu\n",
+                client_state->acknowledged_at, client_state->last_sent);
 
         if ((packet = alloc_packet(client_state->session->client)) == NULL) {
             warn("tick: unable to alloc_packet for msg on topic <%s>",
@@ -3202,6 +3513,7 @@ static void tick_msg(struct message *msg)
                 warn("tick: unable to add_to_packet_ids");
                 /* FIXME alloc_packet leak */
             }
+            dbg_printf("tick_msg: linked client_state=%u\n", client_state->id);
         }
 
         packet->reason_code = MQTT_SUCCESS;
@@ -3232,6 +3544,23 @@ static void tick_msg(struct message *msg)
             msg->state = MSG_DEAD;
         }
 
+        for (unsigned idx = 0; idx < msg->num_client_states; idx++)
+        {
+            struct client_message_state *cms = &(*msg->client_states)[idx];
+
+            printf("tick_msg: idx=%u cms=%p\n", idx, (void *)cms);
+
+            if (cms->session == NULL)
+                continue;
+
+            for (unsigned id_idx = 0; id_idx < cms->session->num_packet_id_to_state; id_idx++)
+            {
+                struct packet_id_to_state *pids = &(*cms->session->packet_ids_to_states)[id_idx];
+
+                if (pids->message == msg)
+                    memset(pids, 0, sizeof(struct packet_id_to_state));
+            }
+        }
         msg->num_client_states = 0;
         free(msg->client_states);
         msg->client_states = NULL;
@@ -3350,7 +3679,7 @@ static int main_loop(int mother_fd)
         tv.tv_usec = 10000;
 
         if (has_clients == false) {
-            dbg_printf("main_loop: no connections, going to sleep\n");
+            dbg_printf("\nmain_loop: no connections, going to sleep\n");
             rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, NULL);
         } else {
             rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv);
@@ -3428,7 +3757,6 @@ shit_fd:
                     if (parse_incoming(clnt) == -1) {
                         /* TODO do something? */ ;
                     }
-                    dbg_printf("\n");
                 }
 
                 if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_out)) {
@@ -3501,7 +3829,11 @@ int main(int argc, char *argv[])
     if (sigaction(SIGINT, &sa, NULL) == -1)
         err(EXIT_FAILURE, "sigaction(SIGINT)");
     if (sigaction(SIGQUIT, &sa, NULL) == -1)
-        err(EXIT_FAILURE, "sigaction(SIGINT)");
+        err(EXIT_FAILURE, "sigaction(SIGQUIT)");
+    if (sigaction(SIGTERM, &sa, NULL) == -1)
+        err(EXIT_FAILURE, "sigaction(SIGTERM)");
+    if (sigaction(SIGHUP, &sa, NULL) == -1)
+        err(EXIT_FAILURE, "sigaction(SIGHUP)");
 
     atexit(close_all_sockets);
     atexit(free_all_messages);

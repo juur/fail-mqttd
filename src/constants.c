@@ -114,3 +114,23 @@ const char *const mqtt_property_strings[MQTT_MAX_PROPERTY_IDENT] = {
     [MQTT_PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE] = "SUBSCRIPTION_IDENTIFIER_AVAILABLE",
     [MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE]     = "SHARED_SUBSCRIPTION_AVAILABLE",
 };
+
+const char *const client_state_strings[] = {
+    [CS_NEW] = "NEW",
+    [CS_ACTIVE] = "ACTIVE",
+    [CS_CLOSING] = "CLOSING",
+    [CS_CLOSED] = "CLOSED",
+    [CS_DISCONNECTED] = "DISCONNECTED"
+};
+
+const char *const message_state_strings[] = {
+    [MSG_NEW] = "NEW",
+    [MSG_ACTIVE] = "ACTIVE",
+    [MSG_DEAD] = "DEAD",
+};
+
+const char *const session_state_strings[] = {
+    [SESSION_NEW] = "NEW",
+    [SESSION_ACTIVE] = "ACTIVE",
+    [SESSION_DELETE] = "DELETE",
+};
