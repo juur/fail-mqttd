@@ -270,22 +270,14 @@ struct message_delivery_state {
 
     uint16_t packet_identifier;
 
-    time_t last_sent;
-    time_t acknowledged_at;
+                                /*   QoS=1     |   QoS=2     */
+    time_t last_sent;           /*   PUBLISH-> |   PUBLISH-> */
+    time_t acknowledged_at;     /* ->PUBACK    | ->PUBREC    */
+    time_t released_at;         /* ->PUBACK    |   PUBREL->  */
+    time_t completed_at;        /* ->PUBACK    | ->PUBCOMP   */
 
     mqtt_reason_code_t client_reason;
 };
-
-/*
-    struct client_message_state {
-    id_t id;
-    struct session *session;
-    time_t last_sent;
-    uint16_t packet_identifier;
-    time_t acknowledged_at;
-    mqtt_reason_code_t client_response;
-};
-*/
 
 struct message {
     struct message *next;
@@ -300,13 +292,15 @@ struct message {
     unsigned qos;
     message_state state;
     
-    //unsigned num_client_states;
-    //struct client_message_state (*client_states)[];
-    //pthread_rwlock_t client_states_lock;
-    
     unsigned num_message_delivery_states;
     struct message_delivery_state **delivery_states;
     pthread_rwlock_t delivery_states_lock;
+
+                                /*   QoS=1    |   QoS=2     */
+    time_t accepted_at;         /* ->PUBLISH  | ->PUBLISH   */
+    time_t acknowledged_at;     /*   PUBACK-> |   PUBREC->  */
+    time_t released_at;         /*   PUBACK-> | ->PUBREL    */
+    time_t completed_at;        /*   PUBACK-> |   PUBCOMP-> */
     
     alignas(16) _Atomic unsigned refcnt;
 };
@@ -326,15 +320,6 @@ struct subscription {
     uint8_t option;
 };
 
-/*
-struct packet_id_to_state {
-    id_t id;
-    uint16_t packet_identifier;
-    struct client_message_state *state;
-    struct message *message;
-};
-*/
-
 /* client.parse_state */
 typedef enum {
     READ_STATE_NEW,
@@ -352,10 +337,6 @@ struct session {
     struct subscription *(*subscriptions)[];
     unsigned num_subscriptions;
 
-    //pthread_rwlock_t packet_ids_to_states_lock;
-    //unsigned num_packet_id_to_state;
-    //struct packet_id_to_state (*packet_ids_to_states)[];
-    
     unsigned num_message_delivery_states;
     struct message_delivery_state **delivery_states;
     pthread_rwlock_t delivery_states_lock;
