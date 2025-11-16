@@ -346,6 +346,8 @@ struct session {
     time_t last_connected;
 
     session_state_t state;
+
+    alignas(16) _Atomic unsigned refcnt;
 };
 
 struct client {
@@ -387,6 +389,8 @@ struct client {
     unsigned rl_multi;
     unsigned rl_offset;
     uint8_t header_buffer[sizeof(struct mqtt_fixed_header) + 4];
+
+    alignas(16) _Atomic unsigned refcnt;
     
     char hostname[INET_ADDRSTRLEN];
 };

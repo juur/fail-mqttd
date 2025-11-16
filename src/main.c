@@ -151,7 +151,7 @@ static void dump_clients(void)
     pthread_rwlock_rdlock(&global_clients_lock);
     for (struct client *client = global_client_list; client; client = client->next)
     {
-        printf("{\"id\": %u, \"session\": {\"id\": %u}, \"client-id\": \"%s\"}%s\n",
+        dbg_printf("{\"id\": %u, \"session\": {\"id\": %u}, \"client-id\": \"%s\"}%s\n",
                 client->id,
                 client->session->id,
                 client->client_id,
@@ -163,9 +163,9 @@ static void dump_clients(void)
 
 static void dump_all(void)
 {
-    printf("{\"clients\":[\n");
+    dbg_printf("{\"clients\":[\n");
     dump_clients();
-    printf("]}\n");
+    dbg_printf("]}\n");
 }
 
 /*
@@ -241,7 +241,7 @@ static void dump_all(void)
 
         /* keep going, but restart if we unsubscribe as the array
          * will be modified */
-        while (topic->num_subscribers)
+        while (topic->num_subscribers && topic->subscribers)
         {
             for(unsigned idx = 0; idx < topic->num_subscribers; idx++)
             {
@@ -251,7 +251,6 @@ static void dump_all(void)
 
                 /* TODO should we handle the return code ? */
                 (void)unsubscribe((*topic->subscribers)[idx]);
-                (*topic->subscribers)[idx] = NULL;
             }
         }
 
@@ -338,6 +337,9 @@ static void dump_all(void)
     } pthread_rwlock_unlock(&global_message_delivery_states_lock);
     mds->next = NULL;
 
+    assert(mds->session == NULL);
+    assert(mds->message == NULL);
+
     free(mds);
     num_message_delivery_states--;
 }
@@ -345,44 +347,46 @@ static void dump_all(void)
 [[gnu::nonnull]] static void free_packet(struct packet *pck)
 {
     struct packet *tmp;
+    unsigned lck;
 
     dbg_printf("     free_packet: id=%u owner=%u <%s>\n",
             pck->id,
             pck->owner ? pck->owner->id : 0,
             pck->owner ? (char *)pck->owner->client_id : "");
 
-    if (atomic_load_explicit(&pck->refcnt, memory_order_relaxed) > 0) {
-        warn("free_packet: attempt to free packet with refcnt");
+    if ((lck = atomic_load_explicit(&pck->refcnt, memory_order_relaxed)) > 0) {
+        warnx("free_packet: attempt to free with refcnt=%u", lck);
+        abort();
         return;
     }
 
     if (pck->owner) {
-        pthread_rwlock_wrlock(&pck->owner->active_packets_lock); {
-            if (pck->owner->active_packets == pck) {
-                pck->owner->active_packets = pck->next_client;
-            } else for (tmp = pck->owner->active_packets; tmp; tmp = tmp->next_client)
-            {
-                if (tmp->next_client == pck) {
-                    tmp->next_client = pck->next_client;
-                    break;
-                }
-            }
-            pck->next_client = NULL;
-        } pthread_rwlock_unlock(&pck->owner->active_packets_lock);
-        pck->owner = NULL;
-    }
-
-    pthread_rwlock_wrlock(&global_packets_lock); {
-        if (pck == global_packet_list) {
-            global_packet_list = pck->next;
-        } else for (tmp = global_packet_list; tmp; tmp = tmp->next)
+        pthread_rwlock_wrlock(&pck->owner->active_packets_lock);
+        if (pck->owner->active_packets == pck) {
+            pck->owner->active_packets = pck->next_client;
+        } else for (tmp = pck->owner->active_packets; tmp; tmp = tmp->next_client)
         {
-            if (tmp->next == pck) {
-                tmp->next = pck->next;
+            if (tmp->next_client == pck) {
+                tmp->next_client = pck->next_client;
                 break;
             }
         }
-    } pthread_rwlock_unlock(&global_packets_lock);
+        pck->next_client = NULL;
+        pthread_rwlock_unlock(&pck->owner->active_packets_lock);
+        pck->owner = NULL;
+    }
+
+    pthread_rwlock_wrlock(&global_packets_lock);
+    if (pck == global_packet_list) {
+        global_packet_list = pck->next;
+    } else for (tmp = global_packet_list; tmp; tmp = tmp->next)
+    {
+        if (tmp->next == pck) {
+            tmp->next = pck->next;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&global_packets_lock);
     pck->next = NULL;
 
     if (pck->payload) {
@@ -415,13 +419,24 @@ static void dump_all(void)
 
 [[gnu::nonnull]] static void free_message(struct message *msg, bool need_lock)
 {
+    struct message *tmp;
+    unsigned lck;
+
     dbg_printf("     free_message: id=%u [%s] lock=%s topic=%u <%s>\n",
-            msg->id, message_state_strings[msg->state], need_lock ? "yes" : "no",
+            msg->id, message_state_strings[msg->state],
+            need_lock ? "yes" : "no",
             msg->topic ? msg->topic->id : 0,
             msg->topic ? (char *)msg->topic->name : "");
 
+    if ((lck = atomic_load_explicit(&msg->refcnt, memory_order_relaxed)) > 0) {
+        warn("free_message: attempt to free with refcnt=%u", lck);
+        abort();
+        return;
+    }
+
     if (msg->topic) {
-        warn("free_message: attempt to free with topic <%s> set", msg->topic->name);
+        warn("free_message: attempt to free with topic <%s> set",
+                msg->topic->name);
         return;
     }
 
@@ -430,7 +445,7 @@ static void dump_all(void)
     {
         if (global_message_list == msg) {
             global_message_list = msg->next;
-        } else for (struct message *tmp = global_message_list; tmp; tmp = tmp->next) {
+        } else for (tmp = global_message_list; tmp; tmp = tmp->next) {
             if (tmp->next == msg) {
                 tmp->next = msg->next;
                 break;
@@ -467,6 +482,12 @@ static void dump_all(void)
             (char *)client->client_id,
             client->session ? client->session->id : 0,
             client->session ? (char *)client->session->client_id : "");
+
+    if (atomic_load_explicit(&client->refcnt, memory_order_relaxed) > 0) {
+        warn("free_client: attempt to free with refcnt");
+        abort();
+        return;
+    }
 
     client->state = CS_CLOSED;
 
@@ -551,6 +572,12 @@ static void dump_all(void)
             session->client ? session->client->id : 0,
             session->client ? (char *)session->client->client_id : "");
 
+    if (atomic_load_explicit(&session->refcnt, memory_order_relaxed) > 0) {
+        warn("free_session: attempt to free with refcnt");
+        abort();
+        return;
+    }
+
     if (need_lock)
         pthread_rwlock_wrlock(&global_sessions_lock);
     {
@@ -573,20 +600,20 @@ static void dump_all(void)
     if (need_lock)
         pthread_rwlock_unlock(&global_sessions_lock);
 
-    pthread_rwlock_wrlock(&session->subscriptions_lock); {
-        if (session->subscriptions) {
-            while (session->num_subscriptions)
-                for (unsigned idx = 0; idx < session->num_subscriptions; idx++) {
-                    if ((*session->subscriptions)[idx] == NULL)
-                        continue;
-                    unsubscribe((*session->subscriptions)[idx]);
-                    (*session->subscriptions)[idx] = NULL;
-                }
-            free(session->subscriptions);
-            session->subscriptions = NULL;
-            session->num_subscriptions = 0;
-        }
-    } pthread_rwlock_unlock(&session->subscriptions_lock);
+    pthread_rwlock_wrlock(&session->subscriptions_lock);
+    if (session->subscriptions) {
+        while (session->num_subscriptions)
+            for (unsigned idx = 0; idx < session->num_subscriptions; idx++) {
+                if ((*session->subscriptions)[idx] == NULL)
+                    continue;
+                unsubscribe((*session->subscriptions)[idx]);
+                (*session->subscriptions)[idx] = NULL;
+            }
+        free(session->subscriptions);
+        session->subscriptions = NULL;
+        session->num_subscriptions = 0;
+    }
+    pthread_rwlock_unlock(&session->subscriptions_lock);
 
     /* TODO do this properly */
     pthread_rwlock_wrlock(&session->delivery_states_lock); {
@@ -604,7 +631,8 @@ static void dump_all(void)
     free(session);
 }
 
-[[gnu::malloc, gnu::nonnull]] static struct message_delivery_state *alloc_message_delivery_state(
+    [[gnu::malloc, gnu::nonnull]]
+static struct message_delivery_state *alloc_message_delivery_state(
         struct message *message, struct session *session)
 {
     struct message_delivery_state *ret;
@@ -615,6 +643,13 @@ static void dump_all(void)
     ret->session = session;
     ret->message = message;
     ret->id = mds_id++;
+
+    atomic_fetch_add_explicit(&session->refcnt, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&message->refcnt, 1, memory_order_relaxed);
+
+    dbg_printf("     alloc_message_delivery_state: session=%u[%u] message=%u[%u]\n",
+            session->id, session->refcnt,
+            message->id, message->refcnt);
 
     pthread_rwlock_wrlock(&global_message_delivery_states_lock);
     ret->next = global_message_delivery_state_list;
@@ -1329,7 +1364,7 @@ fail:
                     goto fail;
 
                 memcpy(&prop->binary.len, *ptr, 2);
-                ptr += 2;
+                *ptr += 2;
                 *bytes_left -= 2;
                 prop->binary.len = ntohs(prop->binary.len);
 
@@ -1391,7 +1426,7 @@ fail:
 
 static void sh_sigint(int signum, siginfo_t * /*info*/, void * /*stuff*/)
 {
-    dbg_printf("   sh_sigint: received signal %u\n", signum);
+    dbg_printf("     sh_sigint: received signal %u\n", signum);
     if (signum == SIGHUP) {
         dump_all();
         return;
@@ -1521,7 +1556,16 @@ static void free_all_topics(void)
     unsigned new_length = *array_length - 1;
     struct message_delivery_state **tmp = NULL;
 
+    dbg_printf("     remove_delivery_state: array_length=%u new_length=%u rem=%u\n",
+            *array_length, new_length, rem->id);
+
     errno = 0;
+
+    if (*array_length == 0) {
+        warnx("remove_delivery_state: is empty");
+        errno = EINVAL;
+        return -1;
+    }
 
     if (new_length == 0) {
         if (*state_array)
@@ -1541,21 +1585,23 @@ static void free_all_topics(void)
 
     for (new_idx = 0, old_idx = 0; new_idx < new_length; old_idx++)
     {
+        dbg_printf("     remove_delivery_state: new_idx=%u old_idx=%u\n",
+                new_idx, old_idx);
+
         if (old_idx >= *array_length)
             break;
 
-        if (*state_array[old_idx] != rem) {
+        if ((*state_array)[old_idx] == rem) {
+            found = true;
             continue;
         }
 
-        tmp[new_idx++] = *state_array[old_idx];
+        tmp[new_idx++] = (*state_array)[old_idx];
     }
 
-    while (new_idx < new_length)
-        tmp[new_idx++] = NULL;
-
     if (found == true) {
-        free(*state_array);
+        if (*state_array)
+            free(*state_array);
         *state_array = tmp;
         *array_length = new_length;
         return 0;
@@ -1576,10 +1622,11 @@ fail:
 {
     pthread_rwlock_wrlock(lock);
 
-    unsigned new_length = *array_length + 1;
+    const unsigned new_length = *array_length + 1;
+    const size_t new_size = sizeof(struct message_delivery_state *) * new_length;
     struct message_delivery_state **tmp;
 
-    if ((tmp = realloc(*state_array, sizeof(struct message_delivery_state *) * new_length)) == NULL)
+    if ((tmp = realloc(*state_array, new_size)) == NULL)
         goto fail;
 
     tmp[*array_length] = add;
@@ -1603,6 +1650,10 @@ fail:
 {
     struct message_delivery_state *mds;
 
+    assert(topic->id);
+    assert(msg->id);
+    assert(msg->state == MSG_NEW);
+
     errno = 0;
 
     pthread_rwlock_rdlock(&topic->subscribers_lock);
@@ -1615,6 +1666,9 @@ fail:
 
         struct session *session = (*topic->subscribers)[src_idx]->session;
 
+        assert(session);
+        assert(session->id);
+
         /* TODO lock the subscriber? */
 
         if ((mds = alloc_message_delivery_state(msg, session)) == NULL) {
@@ -1623,17 +1677,25 @@ fail:
             continue;
         }
 
-        if (add_to_delivery_state(&msg->delivery_states, &msg->num_message_delivery_states,
-                    &msg->delivery_states_lock, mds) == -1) {
+        if (add_to_delivery_state(
+                    &msg->delivery_states,
+                    &msg->num_message_delivery_states,
+                    &msg->delivery_states_lock,
+                    mds) == -1) {
             warn("enqueue_message: add_to_delivery_state(msg)");
             /* TODO ??? */
+            free_message_delivery_state(mds);
             continue;
         }
 
-        if (add_to_delivery_state(&session->delivery_states, &session->num_message_delivery_states,
-                    &session->delivery_states_lock, mds) == -1) {
+        if (add_to_delivery_state(
+                    &session->delivery_states,
+                    &session->num_message_delivery_states,
+                    &session->delivery_states_lock,
+                    mds) == -1) {
             warn("enqueue_message: add_to_delivery_state(session)");
             /* TODO ??? */
+            /* We can't free mds as msg->delivery_states still points to it */
             continue;
         }
     }
@@ -1823,6 +1885,11 @@ fail:
 
     topic_sub_size = topic_sub_cnt * sizeof(struct subscription *);
 
+    if (topic_sub_cnt == 0) {
+        tmp_topic = NULL;
+        goto skip_topic;
+    }
+
     if ((tmp_topic = calloc(1, topic_sub_size)) == NULL)
         goto fail;
 
@@ -1834,6 +1901,8 @@ fail:
         (*tmp_topic)[new_idx] = (*topic->subscribers)[old_idx];
         new_idx++;
     }
+
+skip_topic:
 
     /*
      * compact the client list of subscriptions
@@ -1847,7 +1916,14 @@ fail:
         client_sub_cnt++;
     }
 
+
+
     client_sub_size = client_sub_cnt * sizeof(struct subscription *);
+
+    if (client_sub_cnt == 0) {
+        tmp_client = NULL;
+        goto skip_client;
+    }
 
     if ((tmp_client = calloc(1, client_sub_size)) == NULL) {
         pthread_rwlock_unlock(&session->subscriptions_lock);
@@ -1866,8 +1942,12 @@ fail:
      * free the old ones and replace
      */
 
-    free(session->subscriptions);
-    free(topic->subscribers);
+skip_client:
+
+    if (session->subscriptions)
+        free(session->subscriptions);
+    if (topic->subscribers)
+        free(topic->subscribers);
 
     topic->subscribers = tmp_topic;
     session->subscriptions = tmp_client;
@@ -1877,8 +1957,11 @@ fail:
 
     dbg_printf("     unsubscribe_from_topic: client_sub_cnt now %lu\n", client_sub_cnt);
 
-    pthread_rwlock_unlock(&session->subscriptions_lock);
+    sub->topic = NULL;
+    sub->session = NULL;
     free_subscription(sub);
+
+    pthread_rwlock_unlock(&session->subscriptions_lock);
 
     return 0;
 
@@ -2333,7 +2416,9 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     length = sizeof(struct mqtt_fixed_header);
     length +=1; /* Remaining Length */
 
-    length +=3;
+    length +=2; /* Packet Identifier */
+    length +=1; /* Reason Code */
+    length +=1; /* Properties Length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
@@ -2349,6 +2434,9 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     ptr += 2;
 
     *ptr = reason_code;
+    ptr++;
+
+    *ptr = 0; /* No properties */
     ptr++;
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
@@ -2572,7 +2660,7 @@ skip_props:
         }
     }
     pthread_rwlock_unlock(&global_messages_lock);
-    
+
     if (send_cp_pubcomp(client, packet->packet_identifier, MQTT_PACKET_IDENTIFIER_NOT_FOUND) == -1)
         goto fail;
 
@@ -2748,6 +2836,7 @@ fail:
 
     pubrec_reason_code = *ptr;
     ptr++;
+    bytes_left--;
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
                 &packet->property_count, MQTT_CP_PUBREC) == -1) {
@@ -3618,6 +3707,7 @@ static void tick_msg(struct message *msg)
             continue;
         }
 
+        atomic_fetch_add_explicit(&msg->refcnt, 1, memory_order_relaxed);
         packet->message = msg;
         packet->type = MQTT_CP_PUBLISH;
         packet->flags |= MQTT_FLAG_PUBLISH_QOS(msg->qos);
@@ -3652,6 +3742,9 @@ static void tick_msg(struct message *msg)
         /* TODO async END */
     }
 
+    dbg_printf("     tick_msg: num_sent=%u num_message_delivery_states=%u\n",
+            num_sent, msg->num_message_delivery_states);
+
     /* We have now sent everything */
     if (num_sent == msg->num_message_delivery_states) { /* TODO this doesn't handle holes? */
         /* TODO replace with list of subscribers to message, removal thereof,
@@ -3662,16 +3755,23 @@ static void tick_msg(struct message *msg)
             msg->state = MSG_DEAD;
         }
 
-        while (msg->num_message_delivery_states && msg->delivery_states) {
+        while (msg->num_message_delivery_states && msg->delivery_states)
+        {
             struct message_delivery_state *mds = msg->delivery_states[0];
 
             if (mds == NULL)
                 continue;
 
-            dbg_printf("tick_msg: unlink %u\n", mds->id);
+            dbg_printf("     tick_msg: unlink %u from session %u[%u] and message %u[%u]\n",
+                    mds->id,
+                    mds->session ? mds->session->id : 0,
+                    mds->session ? mds->session->refcnt : 0,
+                    mds->message ? mds->message->id : 0,
+                    mds->message ? mds->message->refcnt : 0);
 
             remove_delivery_state(&msg->delivery_states,
                     &msg->num_message_delivery_states, mds);
+            atomic_fetch_sub_explicit(&mds->message->refcnt, 1, memory_order_acq_rel);
             mds->message = NULL;
 
             if (mds->session) {
@@ -3679,6 +3779,7 @@ static void tick_msg(struct message *msg)
                 remove_delivery_state(&mds->session->delivery_states,
                         &mds->session->num_message_delivery_states, mds);
                 pthread_rwlock_unlock(&mds->session->delivery_states_lock);
+                atomic_fetch_sub_explicit(&mds->session->refcnt, 1, memory_order_acq_rel);
                 mds->session = NULL;
             }
 
