@@ -29,8 +29,16 @@
 
 typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 
+/*
+ * misc. globals
+ */
+
 static int mother_fd = -1;
 static bool running;
+
+/*
+ * unique ids
+ */
 
 static _Atomic id_t subscription_id = 1;
 static _Atomic id_t session_id      = 1;
@@ -39,6 +47,10 @@ static _Atomic id_t packet_id       = 1;
 static _Atomic id_t message_id      = 1;
 static _Atomic id_t client_id       = 1;
 static _Atomic id_t mds_id          = 1;
+
+/*
+ * magic numbers
+ */
 
 static constexpr unsigned MAX_PACKETS           = 256;
 static constexpr unsigned MAX_CLIETNS           = 64;
@@ -49,6 +61,10 @@ static constexpr unsigned MAX_MESSAGES_PER_TICK = 100;
 static constexpr unsigned MAX_PROPERTIES        = 32;
 static constexpr unsigned MAX_RECEIVE_PUBS      = 8;
 static constexpr unsigned MAX_SESSIONS          = 128;
+
+/*
+ * global lists and associated locks & counts
+ */
 
 static pthread_rwlock_t global_clients_lock                = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_rwlock_t global_sessions_lock               = PTHREAD_RWLOCK_INITIALIZER;
@@ -71,6 +87,10 @@ static unsigned num_topics                  = 0;
 static unsigned num_sessions                = 0;
 static unsigned num_message_delivery_states = 0;
 
+/*
+ * command line options
+ */
+
 static in_port_t opt_port = 1883;
 static struct in_addr opt_listen = {
     .s_addr = INADDR_LOOPBACK
@@ -87,11 +107,20 @@ static int dequeue_message(struct message *msg);
  * command line stuff
  */
 
+/**
+ * show version to the specified FILE
+ * @param fp FILE to output to.
+ */
 [[gnu::nonnull]] static void show_version(FILE *fp)
 {
     fprintf(fp, "fail-mqttd " VERSION "\n" "\n" "Written by http://github.com/juur");
 }
 
+/**
+ * show usage information to the specified file
+ * @param fp FILE to output to.
+ * @param name typically argv[0] from main() to display
+ */
 [[gnu::nonnull]] static void show_usage(FILE *fp, const char *name)
 {
     fprintf(fp, "fail-mqttd -- a terrible implementation of MQTT\n" "\n"
@@ -2711,7 +2740,7 @@ skip_props:
             continue;
 
         if (message->sender_packet_identifier == packet->packet_identifier) {
-            message->released_at = time(0);
+            message->sender_status.released_at = time(0);
             pthread_rwlock_unlock(&global_messages_lock);
             return send_cp_pubcomp(client, packet->packet_identifier, MQTT_SUCCESS);
         }
@@ -3113,22 +3142,22 @@ fail:
 
     time_t now = time(0);
 
-    msg->accepted_at = now;
+    msg->sender_status.accepted_at = now;
 
     if (qos == 0) {
-        msg->acknowledged_at = now;
-        msg->released_at = now;
-        msg->completed_at = now;
+        msg->sender_status.acknowledged_at = now;
+        msg->sender_status.released_at = now;
+        msg->sender_status.completed_at = now;
     } if (qos == 1) {
         if (send_cp_puback(client, packet_identifier, MQTT_SUCCESS) == -1)
             goto fail;
-        msg->acknowledged_at = now;
-        msg->released_at = now;
-        msg->completed_at = now;
+        msg->sender_status.acknowledged_at = now;
+        msg->sender_status.released_at = now;
+        msg->sender_status.completed_at = now;
     } else if (qos == 2) {
         if (send_cp_pubrec(client, packet_identifier, MQTT_SUCCESS) == -1)
             goto fail;
-        msg->acknowledged_at = now;
+        msg->sender_status.acknowledged_at = now;
     }
 
     return 0;

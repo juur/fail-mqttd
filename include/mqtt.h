@@ -275,7 +275,10 @@ struct message_delivery_state {
     uint16_t packet_identifier;
 
                                 /*   QoS=1     |   QoS=2     */
-    time_t last_sent;           /*   PUBLISH-> |   PUBLISH-> */
+    union {
+      time_t last_sent;         /*   PUBLISH-> |   PUBLISH-> */
+      time_t accepted_at;
+    };
     time_t acknowledged_at;     /* ->PUBACK    | ->PUBREC    */
     time_t released_at;         /* ->PUBACK    |   PUBREL->  */
     time_t completed_at;        /* ->PUBACK    | ->PUBCOMP   */
@@ -295,17 +298,20 @@ struct message {
     size_t payload_len;
     unsigned qos;
     message_state state;
-    
+
     unsigned num_message_delivery_states;
     struct message_delivery_state **delivery_states;
     pthread_rwlock_t delivery_states_lock;
 
+    struct message_delivery_state sender_status;
+#if 0
                                 /*   QoS=1    |   QoS=2     */
     time_t accepted_at;         /* ->PUBLISH  | ->PUBLISH   */
     time_t acknowledged_at;     /*   PUBACK-> |   PUBREC->  */
     time_t released_at;         /*   PUBACK-> | ->PUBREL    */
     time_t completed_at;        /*   PUBACK-> |   PUBCOMP-> */
-    
+#endif
+
     alignas(16) _Atomic unsigned refcnt;
 };
 
@@ -336,7 +342,7 @@ struct session {
     struct session *next;
     id_t id;
     struct client *client;
-    
+
     pthread_rwlock_t subscriptions_lock;
     struct subscription *(*subscriptions)[];
     unsigned num_subscriptions;
@@ -367,11 +373,11 @@ struct client {
     const uint8_t *password;
     client_state state;
     int fd;
-    
+
     /* host byte order */
     in_addr_t remote_addr;
     in_port_t remote_port;
-    
+
     uint16_t password_len;
     uint16_t last_packet_id;
     uint8_t connect_flags;
@@ -395,7 +401,7 @@ struct client {
     uint8_t header_buffer[sizeof(struct mqtt_fixed_header) + 4];
 
     alignas(16) _Atomic unsigned refcnt;
-    
+
     char hostname[INET_ADDRSTRLEN];
 };
 
