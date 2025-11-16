@@ -217,6 +217,10 @@ typedef enum {
     SESSION_DELETE = 2,
 } session_state_t;
 
+typedef enum {
+    ROLE_SEND = 0,
+    ROLE_RECV = 1,
+} role_t;
 
 struct property {
     mqtt_property_ident ident;
