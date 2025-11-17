@@ -111,7 +111,8 @@ static int dequeue_message(struct message *msg);
  * show version to the specified FILE
  * @param fp FILE to output to.
  */
-[[gnu::nonnull]] static void show_version(FILE *fp)
+[[gnu::nonnull]]
+static void show_version(FILE *fp)
 {
     fprintf(fp, "fail-mqttd " VERSION "\n" "\n" "Written by http://github.com/juur");
 }
@@ -121,7 +122,8 @@ static int dequeue_message(struct message *msg);
  * @param fp FILE to output to.
  * @param name typically argv[0] from main() to display
  */
-[[gnu::nonnull]] static void show_usage(FILE *fp, const char *name)
+[[gnu::nonnull]]
+static void show_usage(FILE *fp, const char *name)
 {
     fprintf(fp, "fail-mqttd -- a terrible implementation of MQTT\n" "\n"
             "Usage: %s [-hV] [-H ADDR] [-p PORT] [TOPIC..]\n"
@@ -164,7 +166,8 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     return -1;
 }
 
-[[maybe_unused]] static void dump_topics(void)
+[[maybe_unused]]
+static void dump_topics(void)
 {
     dbg_printf("   global_topics:\n");
     pthread_rwlock_rdlock(&global_topics_lock);
@@ -201,7 +204,8 @@ static void dump_all(void)
  * allocators / deallocators
  */
 
-[[gnu::nonnull]] static void close_socket(int *fd)
+[[gnu::nonnull]]
+static void close_socket(int *fd)
 {
     if (*fd != -1) {
         shutdown(*fd, SHUT_RDWR);
@@ -210,12 +214,14 @@ static void dump_all(void)
     }
 }
 
-[[gnu::nonnull]] static void free_subscription(struct subscription *sub)
+[[gnu::nonnull]]
+static void free_subscription(struct subscription *sub)
 {
     free(sub);
 }
 
-[[gnu::nonnull]] static void free_topic_subs(struct topic_sub_request *request)
+[[gnu::nonnull]]
+static void free_topic_subs(struct topic_sub_request *request)
 {
     if (request->topics) {
         for (unsigned cnt = 0; cnt < request->num_topics; cnt++)
@@ -242,7 +248,8 @@ static void dump_all(void)
     free(request);
 }
 
-[[gnu::nonnull]] static void free_topic(struct topic *topic)
+[[gnu::nonnull]]
+static void free_topic(struct topic *topic)
 {
     dbg_printf("     free_topic: id=%u <%s>\n",
             topic->id,
@@ -316,7 +323,8 @@ static void dump_all(void)
     free(topic);
 }
 
-[[gnu::nonnull, gnu::access(read_write,1,2)]] static void free_properties(
+[[gnu::nonnull, gnu::access(read_write,1,2)]]
+static void free_properties(
         struct property (*props)[], unsigned count)
 {
     mqtt_types type;
@@ -347,7 +355,8 @@ static void dump_all(void)
     free(props);
 }
 
-[[gnu::nonnull]] static void free_message_delivery_state(struct message_delivery_state *mds)
+[[gnu::nonnull]]
+static void free_message_delivery_state(struct message_delivery_state *mds)
 {
     dbg_printf("     free_message_delivery_state: id=%u\n",
             mds->id);
@@ -373,7 +382,8 @@ static void dump_all(void)
     num_message_delivery_states--;
 }
 
-[[gnu::nonnull]] static void free_packet(struct packet *pck)
+[[gnu::nonnull]]
+static void free_packet(struct packet *pck)
 {
     struct packet *tmp;
     unsigned lck;
@@ -446,7 +456,8 @@ static void dump_all(void)
     free(pck);
 }
 
-[[gnu::nonnull]] static void free_message(struct message *msg, bool need_lock)
+[[gnu::nonnull]]
+static void free_message(struct message *msg, bool need_lock)
 {
     struct message *tmp;
     unsigned lck;
@@ -501,7 +512,8 @@ static void dump_all(void)
     free(msg);
 }
 
-[[gnu::nonnull]] static void free_client(struct client *client, bool needs_lock)
+[[gnu::nonnull]]
+static void free_client(struct client *client, bool needs_lock)
 {
     struct client *tmp;
 
@@ -590,8 +602,8 @@ static void dump_all(void)
     free(client);
 }
 
-[[gnu::nonnull]] static void free_session(struct session *session,
-        bool need_lock)
+[[gnu::nonnull]]
+static void free_session(struct session *session, bool need_lock)
 {
     struct session *tmp;
 
@@ -660,7 +672,7 @@ static void dump_all(void)
     free(session);
 }
 
-    [[gnu::malloc, gnu::nonnull]]
+[[gnu::malloc, gnu::nonnull]]
 static struct message_delivery_state *alloc_message_delivery_state(
         struct message *message, struct session *session)
 {
@@ -693,7 +705,9 @@ fail:
     return NULL;
 }
 
-[[gnu::malloc]] static struct subscription *alloc_subscription(struct session *session, struct topic *topic)
+[[gnu::malloc]]
+static struct subscription *alloc_subscription(struct session *session,
+        struct topic *topic)
 {
     struct subscription *ret = NULL;
 
@@ -710,7 +724,8 @@ fail:
     return ret;
 }
 
-[[gnu::malloc]] static struct session *alloc_session(struct client *client)
+[[gnu::malloc]]
+static struct session *alloc_session(struct client *client)
 {
     struct session *ret;
 
@@ -754,7 +769,8 @@ fail:
     return NULL;
 }
 
-[[gnu::malloc, gnu::nonnull]] static struct topic *alloc_topic(const uint8_t *name)
+[[gnu::malloc, gnu::nonnull]]
+static struct topic *alloc_topic(const uint8_t *name)
 {
     struct topic *ret;
 
@@ -780,8 +796,8 @@ fail:
     return ret;
 }
 
-[[gnu::malloc,gnu::warn_unused_result]] static struct packet *alloc_packet(
-        struct client *owner)
+[[gnu::malloc,gnu::warn_unused_result]]
+static struct packet *alloc_packet(struct client *owner)
 {
     struct packet *ret;
 
@@ -818,7 +834,8 @@ fail:
     return ret;
 }
 
-[[gnu::malloc]] static struct message *alloc_message(void)
+[[gnu::malloc]]
+static struct message *alloc_message(void)
 {
     struct message *msg;
 
@@ -844,7 +861,8 @@ fail:
     return msg;
 }
 
-[[gnu::malloc]] static struct client *alloc_client(void)
+[[gnu::malloc]]
+static struct client *alloc_client(void)
 {
     struct client *client;
 
@@ -911,7 +929,8 @@ static struct session *find_session(struct client *client)
  * packet parsing helpers
  */
 
-[[gnu::nonnull]] static int is_valid_topic_name(const uint8_t *name)
+[[gnu::nonnull]]
+static int is_valid_topic_name(const uint8_t *name)
 {
     const uint8_t *ptr;
 
@@ -933,7 +952,8 @@ static struct session *find_session(struct client *client)
     return 0;
 }
 
-[[gnu::nonnull]] static int is_valid_topic_filter(const uint8_t *name)
+[[gnu::nonnull]]
+static int is_valid_topic_filter(const uint8_t *name)
 {
     const uint8_t *ptr;
 
@@ -975,8 +995,8 @@ static struct session *find_session(struct client *client)
     return 0;
 }
 
-[[gnu::nonnull, maybe_unused]] static int encode_var_byte(uint32_t value,
-        uint8_t out[4])
+[[gnu::nonnull]]
+static int encode_var_byte(uint32_t value, uint8_t out[4])
 {
     uint8_t byte;
     int out_len = 0;
@@ -992,8 +1012,8 @@ static struct session *find_session(struct client *client)
     return out_len;
 }
 
-[[gnu::nonnull]] static uint32_t read_var_byte(const uint8_t **const ptr,
-        size_t *bytes_left)
+[[gnu::nonnull]]
+static uint32_t read_var_byte(const uint8_t **const ptr, size_t *bytes_left)
 {
     uint32_t value = 0;
     uint32_t multi = 1;
@@ -1019,8 +1039,9 @@ static struct session *find_session(struct client *client)
     return value;
 }
 
-[[gnu::nonnull]] static void *read_binary(const uint8_t **const ptr,
-        size_t *bytes_left, uint16_t *length)
+[[gnu::nonnull]]
+static void *read_binary(const uint8_t **const ptr, size_t *bytes_left,
+        uint16_t *length)
 {
     void *blob = NULL;
     uint16_t tmp;
@@ -1058,8 +1079,8 @@ static struct session *find_session(struct client *client)
     return blob;
 }
 
-[[gnu::nonnull]] static uint8_t *read_utf8(const uint8_t **const ptr,
-        size_t *bytes_left)
+[[gnu::nonnull]]
+static uint8_t *read_utf8(const uint8_t **const ptr, size_t *bytes_left)
 {
     uint16_t str_len;
     uint8_t *string;
@@ -1109,8 +1130,9 @@ fail:
     return NULL;
 }
 
-[[gnu::nonnull]] static ssize_t get_properties_size(
-        const struct property (*props)[], unsigned num_props)
+[[gnu::nonnull]]
+static ssize_t get_properties_size(const struct property (*props)[],
+        unsigned num_props)
 {
     ssize_t ret;
     const struct property *prop;
@@ -1172,7 +1194,9 @@ fail:
     return ret;
 }
 
-static void do_one_string(const uint8_t *str, uint8_t **ptr) {
+[[gnu::nonnull(2)]]
+static void do_one_string(const uint8_t *str, uint8_t **ptr)
+{
     unsigned len;
     uint16_t enclen;
 
@@ -1191,7 +1215,8 @@ static void do_one_string(const uint8_t *str, uint8_t **ptr) {
     }
 }
 
-[[gnu::nonnull]] static int build_properties(const struct property (*props)[],
+[[gnu::nonnull]]
+static int build_properties(const struct property (*props)[],
         unsigned num_props, uint8_t **out)
 {
     uint8_t *ptr = *out;
@@ -1279,7 +1304,8 @@ fail:
 
 /* a type of -1U is used for situations where the properties are NOT the standard ones
  * in a packet, e.g. "will_properties" */
-[[gnu::nonnull]] static int parse_properties(
+[[gnu::nonnull]]
+static int parse_properties(
         const uint8_t **ptr, size_t *bytes_left,
         struct property (**store_props)[], unsigned *store_num_props,
         mqtt_control_packet_type cp_type)
@@ -1522,8 +1548,8 @@ static void free_all_topics(void)
  * message distribution
  */
 
-[[gnu::nonnull, gnu::warn_unused_result]] static struct topic *find_topic(
-        const uint8_t *name)
+[[gnu::nonnull, gnu::warn_unused_result]]
+static struct topic *find_topic(const uint8_t *name)
 {
     errno = 0;
 
@@ -1541,8 +1567,8 @@ static void free_all_topics(void)
 }
 
 
-[[gnu::nonnull]] static int find_subscription(struct session *session,
-        struct topic *topic)
+[[gnu::nonnull]]
+static int find_subscription(struct session *session, struct topic *topic)
 {
     pthread_rwlock_rdlock(&topic->subscribers_lock);
     for (unsigned idx = 0; idx < topic->num_subscribers; idx++)
@@ -1560,7 +1586,8 @@ static void free_all_topics(void)
     return -1;
 }
 
-[[gnu::nonnull, gnu::warn_unused_result]] static struct topic *register_topic(
+[[gnu::nonnull, gnu::warn_unused_result]]
+static struct topic *register_topic(
         const uint8_t *name)
 {
     struct topic *ret;
@@ -1578,7 +1605,8 @@ static void free_all_topics(void)
     return ret;
 }
 
-[[gnu::nonnull]] static int remove_delivery_state(
+[[gnu::nonnull]]
+static int remove_delivery_state(
         struct message_delivery_state ***state_array, unsigned *array_length,
         struct message_delivery_state *rem)
 {
@@ -1645,7 +1673,8 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int add_to_delivery_state(
+[[gnu::nonnull]]
+static int add_to_delivery_state(
         struct message_delivery_state ***state_array, unsigned *array_length,
         pthread_rwlock_t *lock, struct message_delivery_state *add)
 {
@@ -1674,8 +1703,8 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int enqueue_message(struct topic *topic,
-        struct message *msg)
+[[gnu::nonnull]]
+static int enqueue_message(struct topic *topic, struct message *msg)
 {
     struct message_delivery_state *mds;
 
@@ -1745,7 +1774,8 @@ fail:
     /* TODO fail: */
 }
 
-[[gnu::nonnull]] static int dequeue_message(struct message *msg)
+[[gnu::nonnull]]
+static int dequeue_message(struct message *msg)
 {
     errno = 0;
 
@@ -1783,7 +1813,8 @@ done:
     return 0;
 }
 
-[[gnu::nonnull,gnu::access(read_only,4,3)]] static struct message *register_message(const uint8_t *topic_name,
+[[gnu::nonnull,gnu::access(read_only,4,3)]]
+static struct message *register_message(const uint8_t *topic_name,
         int format, uint16_t len, const void *payload, unsigned qos, struct session *sender)
 {
     struct topic *topic;
@@ -1839,7 +1870,8 @@ fail:
     return NULL;
 }
 
-[[gnu::nonnull]] static int add_subscription_to_topic(struct subscription *new_sub)
+[[gnu::nonnull]]
+static int add_subscription_to_topic(struct subscription *new_sub)
 {
     struct subscription *(*tmp_subs)[] = NULL;
     struct topic *topic = new_sub->topic;
@@ -1862,7 +1894,8 @@ fail:
 }
 
 /* TODO locking */
-[[gnu::nonnull]] static int unsubscribe(struct subscription *sub)
+[[gnu::nonnull]]
+static int unsubscribe(struct subscription *sub)
 {
     struct subscription *(*tmp_topic)[] = NULL;
     struct subscription *(*tmp_client)[] = NULL;
@@ -2003,7 +2036,8 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int subscribe_to_topics(struct session *session,
+[[gnu::nonnull]]
+static int subscribe_to_topics(struct session *session,
         struct topic_sub_request *request)
 {
     struct subscription *(*tmp_subs)[] = NULL;
@@ -2114,7 +2148,8 @@ fail:
  * Payload
  */
 
-[[gnu::nonnull]] static int send_cp_publish(struct packet *pkt)
+[[gnu::nonnull]]
+static int send_cp_publish(struct packet *pkt)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2218,8 +2253,8 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int send_cp_disconnect(struct client *client,
-        mqtt_reason_code_t reason_code)
+[[gnu::nonnull]]
+static int send_cp_disconnect(struct client *client, mqtt_reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2260,7 +2295,8 @@ fail:
     return 0;
 }
 
-[[gnu::nonnull]] static int send_cp_pingresp(struct client *client)
+[[gnu::nonnull]]
+static int send_cp_pingresp(struct client *client)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2292,8 +2328,8 @@ fail:
     return 0;
 }
 
-[[gnu::nonnull]] static int send_cp_connack(struct client *client,
-        mqtt_reason_code_t reason_code)
+[[gnu::nonnull]]
+static int send_cp_connack(struct client *client, mqtt_reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2607,7 +2643,8 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
  *  Reason Codes[]
  */
 
-[[gnu::nonnull]] static int send_cp_suback(struct client *client,
+[[gnu::nonnull]]
+static int send_cp_suback(struct client *client,
         uint16_t packet_id, struct topic_sub_request *request)
 {
     ssize_t length, wr_len;
@@ -2673,7 +2710,8 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
  * control packet processing functions
  */
 
-[[gnu::nonnull]] static int handle_cp_pubrel(struct client *client,
+[[gnu::nonnull]]
+static int handle_cp_pubrel(struct client *client,
         struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
@@ -2762,7 +2800,8 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int mark_message(mqtt_control_packet_type type, uint16_t packet_identifier,
+[[gnu::nonnull]]
+static int mark_message(mqtt_control_packet_type type, uint16_t packet_identifier,
         mqtt_reason_code_t client_reason, struct session *session, role_t /* role */)
 {
     pthread_rwlock_wrlock(&session->delivery_states_lock);
@@ -2829,8 +2868,9 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int handle_cp_puback(struct client *client,
-        struct packet *packet, const void *remain)
+[[gnu::nonnull]]
+static int handle_cp_puback(struct client *client, struct packet *packet,
+        const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -2903,8 +2943,9 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int handle_cp_pubcomp(struct client *client,
-        struct packet *packet, const void *remain)
+[[gnu::nonnull]]
+static int handle_cp_pubcomp(struct client *client, struct packet *packet,
+        const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -2976,8 +3017,9 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int handle_cp_pubrec(struct client *client,
-        struct packet *packet, const void *remain)
+[[gnu::nonnull]]
+static int handle_cp_pubrec(struct client *client, struct packet *packet,
+        const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -3059,7 +3101,8 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int handle_cp_publish(struct client *client,
+[[gnu::nonnull]]
+static int handle_cp_publish(struct client *client,
         struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
@@ -3185,8 +3228,9 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int handle_cp_subscribe(struct client *client,
-        struct packet *packet, const void *remain)
+[[gnu::nonnull]]
+static int handle_cp_subscribe(struct client *client, struct packet *packet,
+        const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -3317,7 +3361,8 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int handle_cp_disconnect(struct client *client,
+[[gnu::nonnull]]
+static int handle_cp_disconnect(struct client *client,
         struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
@@ -3358,7 +3403,8 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]] static int handle_cp_pingreq(struct client *client,
+[[gnu::nonnull]]
+static int handle_cp_pingreq(struct client *client,
         struct packet *packet, const void * /*remain*/)
 {
     dbg_printf("[%2d] handle_cp_pingreq\n", client->session->id);
@@ -3372,7 +3418,8 @@ fail:
     return send_cp_pingresp(client);
 }
 
-[[gnu::nonnull]] static int handle_cp_connect(struct client *client,
+[[gnu::nonnull]]
+static int handle_cp_connect(struct client *client,
         struct packet *packet, const void *remain)
 {
     const uint8_t *ptr = remain;
@@ -3453,7 +3500,8 @@ fail:
         warn("read_utf8");
         goto fail;
     }
-    dbg_printf("[  ] handle_cp_connect: client_id=<%s> ", (char *)client->client_id);
+    dbg_printf("[  ] handle_cp_connect: client_id=<%s> ",
+            (char *)client->client_id);
 
     if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
         dbg_printf("clean_start ");
@@ -3574,13 +3622,15 @@ create_new_session:
         /* Existing Session */
         if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
             /* ... we don't want to re-use it */
-            dbg_printf("[  ] handle_cp_connect: clean existing session [%d]\n", client->session->id);
+            dbg_printf("[  ] handle_cp_connect: clean existing session [%d]\n",
+                    client->session->id);
             client->session->state = SESSION_DELETE;
             client->session = NULL;
             goto create_new_session;
         }
         client->connect_response_flags |= MQTT_CONNACK_FLAG_SESSION_PRESENT;
-        dbg_printf("[%2d] handle_cp_connect: connection re-established\n", client->session->id);
+        dbg_printf("[%2d] handle_cp_connect: connection re-established\n",
+                client->session->id);
     }
 
     send_cp_connack(client, MQTT_SUCCESS); /* TODO handle failure */
@@ -3624,7 +3674,8 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
  */
 
 
-[[gnu::nonnull]] static int parse_incoming(struct client *client)
+[[gnu::nonnull]]
+static int parse_incoming(struct client *client)
 {
     ssize_t rd_len;
     mqtt_reason_code_t reason_code;
