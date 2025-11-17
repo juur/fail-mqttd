@@ -3069,7 +3069,8 @@ skip_props:
     dbg_printf("[%2d] handle_cp_pubrec: packet_identifier=%u\n",
             client->session->id, packet_identifier);
 
-    if (mark_message(MQTT_CP_PUBREC, packet_identifier, pubrec_reason_code, client->session, ROLE_RECV) == -1) {
+    if (mark_message(MQTT_CP_PUBREC, packet_identifier, pubrec_reason_code,
+                client->session, ROLE_RECV) == -1) {
         if (errno == ENOENT)
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
         else
@@ -3080,7 +3081,8 @@ skip_props:
     if (send_cp_pubrel(client, packet_identifier, MQTT_SUCCESS) == -1)
         goto fail;
 
-    if (mark_message(MQTT_CP_PUBREL, packet_identifier, MQTT_SUCCESS, client->session, ROLE_RECV) == -1) {
+    if (mark_message(MQTT_CP_PUBREL, packet_identifier, MQTT_SUCCESS,
+                client->session, ROLE_RECV) == -1) {
         if (errno == ENOENT)
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
         else
@@ -3102,8 +3104,8 @@ fail:
 }
 
 [[gnu::nonnull]]
-static int handle_cp_publish(struct client *client,
-        struct packet *packet, const void *remain)
+static int handle_cp_publish(struct client *client, struct packet *packet, 
+        const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -3362,8 +3364,8 @@ fail:
 }
 
 [[gnu::nonnull]]
-static int handle_cp_disconnect(struct client *client,
-        struct packet *packet, const void *remain)
+static int handle_cp_disconnect(struct client *client, struct packet *packet,
+        const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
@@ -3419,8 +3421,8 @@ static int handle_cp_pingreq(struct client *client,
 }
 
 [[gnu::nonnull]]
-static int handle_cp_connect(struct client *client,
-        struct packet *packet, const void *remain)
+static int handle_cp_connect(struct client *client, struct packet *packet,
+        const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
