@@ -27,6 +27,19 @@
 # define dbg_printf(...) printf(__VA_ARGS__)
 #endif
 
+#define CRESET "\x1b[0m"
+#define BBLK "\x1b[1;30m"
+#define BRED "\x1b[1;31m"
+#define NRED "\x1b[0;31m"
+#define BGRN "\x1b[1;32m"
+#define NGRN "\x1b[0;32m"
+#define BYEL "\x1b[1;33m"
+#define BBLU "\x1b[1;34m"
+#define BMAG "\x1b[1;35m"
+#define BCYN "\x1b[1;36m"
+#define NCYN "\x1b[1;36m"
+#define BWHT "\x1b[1;37m"
+
 typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 
 /*
@@ -66,26 +79,26 @@ static constexpr unsigned MAX_SESSIONS          = 128;
  * global lists and associated locks & counts
  */
 
-static pthread_rwlock_t global_clients_lock                = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_sessions_lock               = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_messages_lock               = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_packets_lock                = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_topics_lock                 = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_message_delivery_states_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_clients_lock  = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_sessions_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_messages_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_packets_lock  = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_topics_lock   = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_mds_lock      = PTHREAD_RWLOCK_INITIALIZER;
 
-static struct client *global_client_list                                 = NULL;
-static struct message *global_message_list                               = NULL;
-static struct packet *global_packet_list                                 = NULL;
-static struct topic *global_topic_list                                   = NULL;
-static struct session *global_session_list                               = NULL;
-static struct message_delivery_state *global_message_delivery_state_list = NULL;
+static struct client *global_client_list              = NULL;
+static struct message *global_message_list            = NULL;
+static struct packet *global_packet_list              = NULL;
+static struct topic *global_topic_list                = NULL;
+static struct session *global_session_list            = NULL;
+static struct message_delivery_state *global_mds_list = NULL;
 
-static unsigned num_clients                 = 0;
-static unsigned num_messages                = 0;
-static unsigned num_packets                 = 0;
-static unsigned num_topics                  = 0;
-static unsigned num_sessions                = 0;
-static unsigned num_message_delivery_states = 0;
+static unsigned num_clients  = 0;
+static unsigned num_messages = 0;
+static unsigned num_packets  = 0;
+static unsigned num_topics   = 0;
+static unsigned num_sessions = 0;
+static unsigned num_mds      = 0;
 
 /*
  * command line options
@@ -327,14 +340,14 @@ static void free_topic(struct topic *topic)
 static void free_properties(
         struct property (*props)[], unsigned count)
 {
-    mqtt_types type;
+    type_t type;
 
     for (unsigned i = 0; i < count; i++)
     {
         if ((*props)[i].ident > MQTT_MAX_PROPERTY_IDENT) /* TODO handle error */
             continue;
 
-        type = mqtt_property_to_type[(*props)[i].ident];
+        type = property_to_type[(*props)[i].ident];
 
         switch (type)
         {
@@ -361,29 +374,29 @@ static void free_message_delivery_state(struct message_delivery_state *mds)
     dbg_printf("     free_message_delivery_state: id=%u\n",
             mds->id);
 
-    pthread_rwlock_wrlock(&global_message_delivery_states_lock); {
-        if (global_message_delivery_state_list == mds) {
-            global_message_delivery_state_list = mds->next;
-        } else for (struct message_delivery_state *tmp = global_message_delivery_state_list;
-                tmp; tmp = tmp->next)
-        {
-            if (tmp->next == mds) {
-                tmp->next = mds->next;
-                break;
-            }
+    pthread_rwlock_wrlock(&global_mds_lock);
+    if (global_mds_list == mds) {
+        global_mds_list = mds->next;
+    } else for (struct message_delivery_state *tmp = global_mds_list;
+            tmp; tmp = tmp->next)
+    {
+        if (tmp->next == mds) {
+            tmp->next = mds->next;
+            break;
         }
-    } pthread_rwlock_unlock(&global_message_delivery_states_lock);
+    }
+    pthread_rwlock_unlock(&global_mds_lock);
     mds->next = NULL;
 
     assert(mds->session == NULL);
     assert(mds->message == NULL);
 
     free(mds);
-    num_message_delivery_states--;
+    num_mds--;
 }
 
 [[gnu::nonnull]]
-static void free_packet(struct packet *pck)
+static void free_packet(struct packet *pck, bool need_lock)
 {
     struct packet *tmp;
     unsigned lck;
@@ -415,7 +428,8 @@ static void free_packet(struct packet *pck)
         pck->owner = NULL;
     }
 
-    pthread_rwlock_wrlock(&global_packets_lock);
+    if (need_lock)
+        pthread_rwlock_wrlock(&global_packets_lock);
     if (pck == global_packet_list) {
         global_packet_list = pck->next;
     } else for (tmp = global_packet_list; tmp; tmp = tmp->next)
@@ -425,7 +439,8 @@ static void free_packet(struct packet *pck)
             break;
         }
     }
-    pthread_rwlock_unlock(&global_packets_lock);
+    if (need_lock)
+        pthread_rwlock_unlock(&global_packets_lock);
     pck->next = NULL;
 
     if (pck->payload) {
@@ -463,7 +478,7 @@ static void free_message(struct message *msg, bool need_lock)
     unsigned lck;
 
     dbg_printf("     free_message: id=%u [%s] lock=%s topic=%u <%s>\n",
-            msg->id, message_state_strings[msg->state],
+            msg->id, message_state_str[msg->state],
             need_lock ? "yes" : "no",
             msg->topic ? msg->topic->id : 0,
             msg->topic ? (char *)msg->topic->name : "");
@@ -518,7 +533,7 @@ static void free_client(struct client *client, bool needs_lock)
     struct client *tmp;
 
     dbg_printf("     free_client: id=%u [%s] lock=%s client_id=%s session=%u %s\n",
-            client->id, client_state_strings[client->state],
+            client->id, client_state_str[client->state],
             needs_lock ? "yes" : "no",
             (char *)client->client_id,
             client->session ? client->session->id : 0,
@@ -550,14 +565,15 @@ static void free_client(struct client *client, bool needs_lock)
 
     client->next = NULL;
 
-    pthread_rwlock_wrlock(&client->active_packets_lock); {
-        for (struct packet *p = client->active_packets, *next; p; p = next)
-        {
-            next = p->next_client;
-            free_packet(p);
-        }
-        client->active_packets = NULL;
-    } pthread_rwlock_unlock(&client->active_packets_lock);
+    pthread_rwlock_wrlock(&client->active_packets_lock);
+    for (struct packet *p = client->active_packets, *next; p; p = next)
+    {
+        next = p->next_client;
+        atomic_fetch_sub_explicit(&p->refcnt, 1, memory_order_acq_rel);
+        free_packet(p, true);
+    }
+    client->active_packets = NULL;
+    pthread_rwlock_unlock(&client->active_packets_lock);
 
     pthread_rwlock_wrlock(&global_packets_lock); {
         for (struct packet *p = global_packet_list; p; p = p->next)
@@ -602,14 +618,14 @@ static void free_client(struct client *client, bool needs_lock)
     free(client);
 }
 
-[[gnu::nonnull]]
+    [[gnu::nonnull]]
 static void free_session(struct session *session, bool need_lock)
 {
     struct session *tmp;
 
     dbg_printf("     free_session: session=%u <%s> [%s] client=%u <%s>\n",
             session->id,
-            session->client_id, session_state_strings[session->state],
+            session->client_id, session_state_str[session->state],
             session->client ? session->client->id : 0,
             session->client ? (char *)session->client->client_id : "");
 
@@ -692,11 +708,11 @@ static struct message_delivery_state *alloc_message_delivery_state(
             session->id, session->refcnt,
             message->id, message->refcnt);
 
-    pthread_rwlock_wrlock(&global_message_delivery_states_lock);
-    ret->next = global_message_delivery_state_list;
-    global_message_delivery_state_list = ret;
-    num_message_delivery_states++;
-    pthread_rwlock_unlock(&global_message_delivery_states_lock);
+    pthread_rwlock_wrlock(&global_mds_lock);
+    ret->next = global_mds_list;
+    global_mds_list = ret;
+    num_mds++;
+    pthread_rwlock_unlock(&global_mds_lock);
     return ret;
 
 fail:
@@ -813,6 +829,7 @@ static struct packet *alloc_packet(struct client *owner)
 
     if (owner) {
         ret->owner = owner;
+        ret->refcnt++;
         pthread_rwlock_wrlock(&owner->active_packets_lock);
         ret->next_client = owner->active_packets;
         owner->active_packets = ret;
@@ -1137,7 +1154,7 @@ static ssize_t get_properties_size(const struct property (*props)[],
     ssize_t ret;
     const struct property *prop;
     uint8_t tmp_out[4];
-    mqtt_types type;
+    type_t type;
 
     if (num_props == 0)
         return 0;
@@ -1154,7 +1171,7 @@ static ssize_t get_properties_size(const struct property (*props)[],
             return -1;
         }
 
-        type = mqtt_property_to_type[prop->ident];
+        type = property_to_type[prop->ident];
 
         switch (type)
         {
@@ -1223,7 +1240,7 @@ static int build_properties(const struct property (*props)[],
     uint16_t tmp2byte;
     uint32_t tmp4byte;
     const struct property *prop;
-    mqtt_types type;
+    type_t type;
     int rc;
 
     if (num_props == 0)
@@ -1238,7 +1255,7 @@ static int build_properties(const struct property (*props)[],
             goto fail;
         }
 
-        type = mqtt_property_to_type[prop->ident];
+        type = property_to_type[prop->ident];
 
         *ptr = prop->ident;
         ptr++;
@@ -1308,7 +1325,7 @@ fail:
 static int parse_properties(
         const uint8_t **ptr, size_t *bytes_left,
         struct property (**store_props)[], unsigned *store_num_props,
-        mqtt_control_packet_type cp_type)
+        control_packet_t cp_type)
 {
     uint32_t properties_length;
     size_t rd = 0;
@@ -1317,7 +1334,7 @@ static int parse_properties(
     struct property *prop;
     unsigned num_props = 0, skip;
     void *tmp;
-    mqtt_types type;
+    type_t type;
 
     errno = 0;
 
@@ -1362,7 +1379,7 @@ static int parse_properties(
         }
         prop->ident = ident;
 
-        type = mqtt_property_to_type[prop->ident];
+        type = property_to_type[prop->ident];
 
         /* TODO perform "is this valid for this control type?" */
 
@@ -1505,8 +1522,8 @@ static void close_all_sockets(void)
 static void free_all_message_delivery_states(void)
 {
     dbg_printf("     free_all_message_delivery_states\n");
-    while (global_message_delivery_state_list)
-        free_message_delivery_state(global_message_delivery_state_list);
+    while (global_mds_list)
+        free_message_delivery_state(global_mds_list);
 }
 
 static void free_all_sessions(void)
@@ -1534,7 +1551,7 @@ static void free_all_packets(void)
 {
     dbg_printf("     free_all_packets\n");
     while (global_packet_list)
-        free_packet(global_packet_list);
+        free_packet(global_packet_list, false);
 }
 
 static void free_all_topics(void)
@@ -1814,8 +1831,8 @@ done:
 }
 
 [[gnu::nonnull,gnu::access(read_only,4,3)]]
-static struct message *register_message(const uint8_t *topic_name,
-        int format, uint16_t len, const void *payload, unsigned qos, struct session *sender)
+static struct message *register_message(const uint8_t *topic_name, int format,
+        uint16_t len, const void *payload, unsigned qos, struct session *sender)
 {
     struct topic *topic;
     const uint8_t *tmp_name;
@@ -2254,7 +2271,7 @@ fail:
 }
 
 [[gnu::nonnull]]
-static int send_cp_disconnect(struct client *client, mqtt_reason_code_t reason_code)
+static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2329,7 +2346,7 @@ static int send_cp_pingresp(struct client *client)
 }
 
 [[gnu::nonnull]]
-static int send_cp_connack(struct client *client, mqtt_reason_code_t reason_code)
+static int send_cp_connack(struct client *client, reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2417,7 +2434,7 @@ fail:
 }
 
 static int send_cp_pubrec(struct client *client, uint16_t packet_id,
-        mqtt_reason_code_t reason_code)
+        reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2466,7 +2483,7 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
 }
 
 static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
-        mqtt_reason_code_t reason_code)
+        reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2533,7 +2550,7 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
 }
 
 static int send_cp_pubrel(struct client *client, uint16_t packet_id,
-        mqtt_reason_code_t reason_code)
+        reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2585,7 +2602,7 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
 }
 
 static int send_cp_puback(struct client *client, uint16_t packet_id,
-        mqtt_reason_code_t reason_code)
+        reason_code_t reason_code)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2644,8 +2661,8 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
  */
 
 [[gnu::nonnull]]
-static int send_cp_suback(struct client *client,
-        uint16_t packet_id, struct topic_sub_request *request)
+static int send_cp_suback(struct client *client, uint16_t packet_id,
+        struct topic_sub_request *request)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
@@ -2706,18 +2723,134 @@ static int send_cp_suback(struct client *client,
     return 0;
 }
 
+static int mark_one_mds(struct message_delivery_state *mds,
+        control_packet_t type, reason_code_t client_reason)
+{
+    assert(mds->packet_identifier != 0);
+
+    time_t now = time(0);
+
+    switch (type)
+    {
+        case MQTT_CP_PUBACK: /* QoS=1 */
+            if (mds->acknowledged_at)
+                warnx("mark_message: duplicate acknowledgment");
+            mds->acknowledged_at = now;
+            mds->released_at = now;
+            mds->completed_at = now;
+            mds->client_reason = client_reason;
+            break;
+
+        case MQTT_CP_PUBREC: /* QoS=2 */
+            if (mds->acknowledged_at)
+                warnx("mark_message: duplicate acknowledgment");
+            mds->acknowledged_at = now;
+            mds->client_reason = client_reason;
+            break;
+
+        case MQTT_CP_PUBREL: /* QoS=2 */
+            if (mds->released_at)
+                warnx("mark_message: duplicate release");
+            mds->released_at = now;
+            break;
+
+        case MQTT_CP_PUBCOMP: /* QoS=2 */
+            if (mds->completed_at)
+                warnx("mark_message: duplicate completed");
+            mds->completed_at = now;
+            break;
+
+        default:
+            warnx("mark_message: called with illegal type %s",
+                    control_packet_str[type]);
+            errno = EINVAL;
+            goto fail;
+    }
+
+    return 1;
+
+fail:
+    return -1;
+}
+
+    [[gnu::nonnull]]
+static int mark_message(control_packet_t type, uint16_t packet_identifier,
+        reason_code_t client_reason, struct session *session, role_t role)
+{
+    int rc;
+    struct message_delivery_state *mds;
+
+    assert(packet_identifier != 0);
+
+    if (role == ROLE_RECV)
+        goto do_recv;
+
+    pthread_rwlock_wrlock(&global_messages_lock);
+    for (struct message *message = global_message_list; message; message = message->next)
+    {
+        if (message->sender != session)
+            continue;
+
+        if (message->sender_status.packet_identifier == packet_identifier) {
+            rc = mark_one_mds(&message->sender_status, type, client_reason);
+
+            if (rc == -1)
+                goto fail;
+
+            pthread_rwlock_unlock(&global_messages_lock);
+            return 0;
+
+        }
+    }
+    pthread_rwlock_unlock(&global_messages_lock);
+
+    errno = ENOENT;
+    goto fail;
+
+    /* else if (role == ROLE_RECV) ... */
+
+do_recv:
+    pthread_rwlock_wrlock(&session->delivery_states_lock);
+    for (unsigned idx = 0; idx < session->num_message_delivery_states; idx++)
+    {
+        mds = session->delivery_states[idx];
+
+        if (mds == NULL)
+            continue;
+
+        if (mds->packet_identifier != packet_identifier)
+            continue;
+
+        rc = mark_one_mds(mds, type, client_reason);
+
+        if (rc == -1)
+            goto fail;
+        else if (rc == 0)
+            continue;
+
+        pthread_rwlock_unlock(&session->delivery_states_lock);
+        return 0;
+    }
+
+    errno = ENOENT;
+fail:
+    pthread_rwlock_unlock(&session->delivery_states_lock);
+    return -1;
+}
+
+
 /*
  * control packet processing functions
  */
 
 [[gnu::nonnull]]
-static int handle_cp_pubrel(struct client *client,
-        struct packet *packet, const void *remain)
+static int handle_cp_pubrel(struct client *client, struct packet *packet,
+        const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
-    [[maybe_unused]] mqtt_reason_code_t pubrel_reason_code = 0;
+    reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    [[maybe_unused]] reason_code_t pubrel_reason_code = 0;
     uint16_t tmp;
 
     errno = 0;
@@ -2769,26 +2902,20 @@ skip_props:
             client->session->id,
             packet->packet_identifier, pubrel_reason_code);
 
-    /* TODO find the struct message and updated released_at */
+    if (mark_message(MQTT_CP_PUBREL, packet->packet_identifier,
+                pubrel_reason_code, client->session, ROLE_SEND) == -1) {
+        if (errno == ENOENT)
+            reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
+        else
+            reason_code = MQTT_UNSPECIFIED_ERROR;
+        goto fail;
+    } else
+        reason_code = MQTT_SUCCESS;
 
-    pthread_rwlock_wrlock(&global_messages_lock);
-    for (struct message *message = global_message_list; message; message = message->next)
-    {
-        if (message->sender != client->session)
-            continue;
-
-        if (message->sender_packet_identifier == packet->packet_identifier) {
-            message->sender_status.released_at = time(0);
-            pthread_rwlock_unlock(&global_messages_lock);
-            return send_cp_pubcomp(client, packet->packet_identifier, MQTT_SUCCESS);
-        }
-    }
-    pthread_rwlock_unlock(&global_messages_lock);
-
-    if (send_cp_pubcomp(client, packet->packet_identifier, MQTT_PACKET_IDENTIFIER_NOT_FOUND) == -1)
+    if (send_cp_pubcomp(client, packet->packet_identifier, MQTT_SUCCESS) == -1)
         goto fail;
 
-    errno = ENOENT;
+    return 0;
 
 fail:
     if (reason_code == MQTT_MALFORMED_PACKET ||
@@ -2800,81 +2927,13 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]]
-static int mark_message(mqtt_control_packet_type type, uint16_t packet_identifier,
-        mqtt_reason_code_t client_reason, struct session *session, role_t /* role */)
-{
-    pthread_rwlock_wrlock(&session->delivery_states_lock);
-    for (unsigned idx = 0; idx < session->num_message_delivery_states; idx++)
-    {
-        struct message_delivery_state *mds;
-
-        mds = session->delivery_states[idx];
-
-        if (mds == NULL)
-            continue;
-
-        printf("mark_message: %u == %u ?\n", mds->packet_identifier, packet_identifier);
-
-        if (mds->packet_identifier != packet_identifier)
-            continue;
-
-        time_t now = time(0);
-
-        switch (type)
-        {
-            case MQTT_CP_PUBACK: /* QoS=1 */
-                if (mds->acknowledged_at)
-                    warnx("mark_message: duplicate acknowledgment");
-                mds->acknowledged_at = now;
-                mds->released_at = now;
-                mds->completed_at = now;
-                mds->client_reason = client_reason;
-                break;
-
-            case MQTT_CP_PUBREC: /* QoS=2 */
-                if (mds->acknowledged_at)
-                    warnx("mark_message: duplicate acknowledgment");
-                mds->acknowledged_at = now;
-                mds->client_reason = client_reason;
-                break;
-
-            case MQTT_CP_PUBREL: /* QoS=2 */
-                if (mds->released_at)
-                    warnx("mark_message: duplicate release");
-                mds->released_at = now;
-                break;
-
-            case MQTT_CP_PUBCOMP: /* QoS=2 */
-                if (mds->completed_at)
-                    warnx("mark_message: duplicate completed");
-                mds->completed_at = now;
-                break;
-
-            default:
-                warnx("mark_message: called with illegal type %s",
-                        mqtt_packet_type_strings[type]);
-                errno = EINVAL;
-                goto fail;
-        }
-
-        pthread_rwlock_unlock(&session->delivery_states_lock);
-        return 0;
-    }
-
-    errno = ENOENT;
-fail:
-    pthread_rwlock_unlock(&session->delivery_states_lock);
-    return -1;
-}
-
-[[gnu::nonnull]]
+    [[gnu::nonnull]]
 static int handle_cp_puback(struct client *client, struct packet *packet,
         const void *remain)
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    mqtt_reason_code_t reason_code, puback_reason_code;
+    reason_code_t reason_code, puback_reason_code;
 
     errno = 0;
 
@@ -2949,8 +3008,8 @@ static int handle_cp_pubcomp(struct client *client, struct packet *packet,
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    mqtt_reason_code_t reason_code;
-    mqtt_reason_code_t pubcomp_reason_code;
+    reason_code_t reason_code;
+    reason_code_t pubcomp_reason_code;
 
     errno = 0;
 
@@ -3023,8 +3082,8 @@ static int handle_cp_pubrec(struct client *client, struct packet *packet,
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
-    mqtt_reason_code_t pubrec_reason_code;
+    reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    reason_code_t pubrec_reason_code;
     uint16_t packet_identifier;
 
     errno = 0;
@@ -3111,7 +3170,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     size_t bytes_left = packet->remaining_length;
     uint8_t *topic_name = NULL;
     uint16_t packet_identifier = 0;
-    mqtt_reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
     unsigned qos = 0;
     [[maybe_unused]] bool flag_retain;
     [[maybe_unused]] bool flag_dup;
@@ -3177,7 +3236,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         warn("handle_cp_publish: register_message");
         goto fail;
     }
-    msg->sender_packet_identifier = packet_identifier;
+    msg->sender_status.packet_identifier = packet_identifier;
 
     free(topic_name);
     topic_name = NULL;
@@ -3238,7 +3297,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
     size_t bytes_left = packet->remaining_length;
     struct topic_sub_request *request = NULL;
     void *tmp;
-    mqtt_reason_code_t reason_code = MQTT_MALFORMED_PACKET;
+    reason_code_t reason_code = MQTT_MALFORMED_PACKET;
 
     errno = EINVAL;
 
@@ -3426,7 +3485,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    mqtt_reason_code_t response_code = MQTT_UNSPECIFIED_ERROR;
+    reason_code_t response_code = MQTT_UNSPECIFIED_ERROR;
     uint8_t *will_topic = NULL;
     uint8_t will_qos = 0;
     void *will_payload = NULL;
@@ -3680,7 +3739,7 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
 static int parse_incoming(struct client *client)
 {
     ssize_t rd_len;
-    mqtt_reason_code_t reason_code;
+    reason_code_t reason_code;
     struct mqtt_fixed_header *hdr;
 
     hdr = NULL;
@@ -3703,8 +3762,10 @@ static int parse_incoming(struct client *client)
                 client->packet_buf = NULL;
             }
             if (client->new_packet &&
-                    client->new_packet->packet_identifier == 0)
-                free_packet(client->new_packet);
+                    client->new_packet->packet_identifier == 0) {
+                if (atomic_load_explicit(&client->new_packet->refcnt, memory_order_relaxed) == 0)
+                    free_packet(client->new_packet, true);
+            }
             client->new_packet = NULL;
 
             /* fall through */
@@ -3753,7 +3814,7 @@ eof:
                     goto fail;
                 }
 
-                if (hdr->flags & mqtt_packet_permitted_flags[hdr->type]) {
+                if (hdr->flags & packet_permitted_flags[hdr->type]) {
                     warnx("illegal flags");
                     goto fail;
                 }
@@ -3793,7 +3854,7 @@ lenread:
                 dbg_printf("[%2d] parse_incoming: client=%u type=%u <%s> flags=%u remaining_length=%u\n",
                         client->session ? client->session->id : (id_t)-1,
                         client->id,
-                        hdr->type, mqtt_packet_type_strings[hdr->type],
+                        hdr->type, control_packet_str[hdr->type],
                         hdr->flags, client->rl_value);
 
                 if ((client->new_packet = alloc_packet(client)) == NULL) {
@@ -3850,6 +3911,8 @@ exec_control:
                 warn("control_function");
                 goto fail;
             }
+            atomic_fetch_sub_explicit(&client->new_packet->refcnt, 1, memory_order_acq_rel);
+            client->new_packet = NULL;
 
             break;
     }
@@ -3861,7 +3924,7 @@ fail:
         client->packet_buf = NULL;
     }
     if (client->new_packet) {
-        free_packet(client->new_packet);
+        free_packet(client->new_packet, true);
         client->new_packet = NULL;
     }
 
@@ -3911,7 +3974,7 @@ static void client_tick(void)
 
 static void tick_msg(struct message *msg)
 {
-    unsigned num_sent = 0;
+    unsigned num_sent = 0, num_to_send = 0;
     struct packet *packet;
     struct message_delivery_state *mds;
 
@@ -3920,12 +3983,20 @@ static void tick_msg(struct message *msg)
 
     time_t now = time(0);
 
+    dbg_printf(NGRN "tick_msg: id=%u sender.id=%u #mds=%u"CRESET"\n",
+            msg->id,
+            msg->sender->id,
+            msg->num_message_delivery_states
+            );
+
     pthread_rwlock_wrlock(&msg->delivery_states_lock);
     for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++) {
         mds = msg->delivery_states[idx];
 
         if (mds == NULL)
             continue;
+
+        num_to_send++;
 
         if (mds->acknowledged_at) {
             num_sent++;
@@ -3944,7 +4015,7 @@ static void tick_msg(struct message *msg)
         if (mds->session->client == NULL)
             continue;
 
-        dbg_printf("     tick_msg: sending message: id=%u acknowledged_at=%lu last_sent=%lu\n",
+        dbg_printf(NGRN"tick_msg: sending message: id=%u acknowledged_at=%lu last_sent=%lu"CRESET"\n",
                 mds->id, mds->acknowledged_at, mds->last_sent);
 
         if ((packet = alloc_packet(mds->session->client)) == NULL) {
@@ -3953,7 +4024,10 @@ static void tick_msg(struct message *msg)
             continue;
         }
 
-        atomic_fetch_add_explicit(&msg->refcnt, 1, memory_order_relaxed);
+        /* this code might execute more than once, so avoid a double refcnt */
+        if (mds->last_sent == 0)
+            atomic_fetch_add_explicit(&msg->refcnt, 1, memory_order_relaxed);
+
         packet->message = msg;
         packet->type = MQTT_CP_PUBLISH;
         packet->flags |= MQTT_FLAG_PUBLISH_QOS(msg->qos);
@@ -3972,43 +4046,57 @@ static void tick_msg(struct message *msg)
 
         packet->reason_code = MQTT_SUCCESS;
 
-        if (msg->qos == 0) /* Fake? */
-            mds->acknowledged_at = time(0);
-
         /* TODO make this async START ?? */
         mds->last_sent = time(0);
         if (send_cp_publish(packet) == -1) {
             mds->last_sent = 0;
             warn("tick_msg: unable to send_cp_publish");
-            free_packet(packet); /* Anything else? */
+            atomic_fetch_sub_explicit(&packet->refcnt, 1, memory_order_acq_rel);
+            free_packet(packet, true); /* Anything else? */
             continue;
         }
+        
+        /* Unless we get a network error, just assume it works */
+        if (msg->qos == 0) {
+            mds->acknowledged_at = time(0);
+            mds->completed_at = mds->acknowledged_at;
+            mds->released_at = mds->acknowledged_at;
+        }
 
-        free_packet(packet);
+        atomic_fetch_sub_explicit(&packet->refcnt, 1, memory_order_acq_rel);
+        free_packet(packet, true);
         /* TODO async END */
     }
 
-    dbg_printf("     tick_msg: num_sent=%u num_message_delivery_states=%u\n",
+    dbg_printf(NGRN"tick_msg: num_sent=%u num_message_delivery_states=%u"CRESET"\n",
             num_sent, msg->num_message_delivery_states);
 
     /* We have now sent everything */
-    if (num_sent == msg->num_message_delivery_states) { /* TODO this doesn't handle holes? */
+    if (num_sent == num_to_send /*msg->num_message_delivery_states*/) { /* TODO this doesn't handle holes? */
         /* TODO replace with list of subscribers to message, removal thereof,
          * then dequeue when none left */
-        if (dequeue_message(msg) == -1) {
-            warn("tick_msg: dequeue_message failed");
-        } else {
-            msg->state = MSG_DEAD;
-        }
+        dbg_printf(BGRN"tick_msg: tidying up"CRESET"\n");
 
         while (msg->num_message_delivery_states && msg->delivery_states)
         {
-            struct message_delivery_state *mds = msg->delivery_states[0];
+            unsigned idx = 0;
+            struct message_delivery_state *mds;
+again:
+            dbg_printf(NCYN"tick_msg: idx=%u"CRESET"\n",idx);
+            if (idx >= msg->num_message_delivery_states)
+                break;
+
+            mds = msg->delivery_states[idx++];
 
             if (mds == NULL)
-                continue;
+                break;
 
-            dbg_printf("     tick_msg: unlink %u from session %u[%u] and message %u[%u]\n",
+            if (mds->completed_at == 0) {
+                dbg_printf(NCYN"tick_msg: not completed"CRESET"\n");
+                goto again;
+            }
+
+            dbg_printf(NCYN"tick_msg: unlink %u from session %u[%u] and message %u[%u]"CRESET"\n",
                     mds->id,
                     mds->session ? mds->session->id : 0,
                     mds->session ? mds->session->refcnt : 0,
@@ -4031,7 +4119,15 @@ static void tick_msg(struct message *msg)
 
             free_message_delivery_state(mds);
         }
-        /* TODO write something to clear up/free NULL mds's */
+
+        /* We can't just dequeue() and MSG_DEAD if any mds are not complated_at */
+        if (msg->topic && msg->num_message_delivery_states == 0) {
+            dbg_printf(BGRN"tick_msg: dequeue"CRESET"\n");
+            if (dequeue_message(msg) == -1) {
+                warn("tick_msg: dequeue_message failed");
+            }
+            msg->state = MSG_DEAD;
+        }
 
     }
     pthread_rwlock_unlock(&msg->delivery_states_lock);
@@ -4043,6 +4139,7 @@ static void topic_tick(void)
 {
     unsigned max_messages = MAX_MESSAGES_PER_TICK;
 
+    pthread_rwlock_rdlock(&global_messages_lock);
     pthread_rwlock_wrlock(&global_topics_lock);
     for (struct topic *topic = global_topic_list; topic; topic = topic->next)
     {
@@ -4063,6 +4160,7 @@ static void topic_tick(void)
         pthread_rwlock_unlock(&topic->pending_queue_lock);
     }
     pthread_rwlock_unlock(&global_topics_lock);
+    pthread_rwlock_unlock(&global_messages_lock);
 }
 
 /* Messages */
@@ -4097,12 +4195,28 @@ static void session_tick(void)
     pthread_rwlock_unlock(&global_sessions_lock);
 }
 
+static void packet_tick(void)
+{
+    pthread_rwlock_wrlock(&global_packets_lock);
+
+    for (struct packet *next, *pkt = global_packet_list; pkt; pkt = next)
+    {
+        next = pkt->next;
+
+        if (atomic_load_explicit(&pkt->refcnt, memory_order_relaxed) == 0)
+            free_packet(pkt, false);
+    }
+
+    pthread_rwlock_unlock(&global_packets_lock);
+}
+
 static void tick(void)
 {
     session_tick();
     client_tick();
     topic_tick();
     message_tick();
+    packet_tick();
 }
 
 static int main_loop(int mother_fd)

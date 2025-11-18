@@ -49,7 +49,7 @@ typedef enum {
     MQTT_CP_AUTH = 15,
 
     MQTT_CP_MAX = 16,
-} mqtt_control_packet_type;
+} control_packet_t;
 
 #define MQTT_FLAG_PUBREL (1<<1)
 #define MQTT_FLAG_SUBSCRIBE (1<<1)
@@ -108,7 +108,7 @@ typedef enum {
     MQTT_TYPE_UTF8_STRING_PAIR = 7,
 
     MQTT_TYPE_MAX = 8
-} mqtt_types;
+} type_t;
 
 /* Properties */
 typedef enum {
@@ -141,13 +141,13 @@ typedef enum {
     MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE = 42,
 
     MQTT_MAX_PROPERTY_IDENT = 43,
-} mqtt_property_ident;
+} property_ident_t;
 
 typedef enum {
     MQTT_PAYLOAD_NONE = 0,
     MQTT_PAYLOAD_REQUIRED = 1,
     MQTT_PAYLOAD_OPTIONAL = 2,
-} mqtt_payload_required;
+} payload_required_t;
 
 typedef enum {
     MQTT_SUCCESS = 0,
@@ -195,7 +195,7 @@ typedef enum {
     MQTT_MAXIMUM_CONNECT_TIME = 160,
     MQTT_SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED = 161,
     MQTT_WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED = 162,
-} mqtt_reason_code_t;
+} reason_code_t;
 
 typedef enum {
     CS_NEW = 0,
@@ -203,13 +203,13 @@ typedef enum {
     CS_CLOSING = 2,
     CS_CLOSED = 3,
     CS_DISCONNECTED = 4,
-} client_state;
+} client_state_t;
 
 typedef enum {
     MSG_NEW = 0,
     MSG_ACTIVE = 1,
     MSG_DEAD = 2,
-} message_state;
+} message_state_t;
 
 typedef enum {
     SESSION_NEW = 0,
@@ -223,7 +223,7 @@ typedef enum {
 } role_t;
 
 struct property {
-    mqtt_property_ident ident;
+    property_ident_t ident;
     union {
         uint8_t byte;
         uint16_t byte2;
@@ -246,7 +246,7 @@ struct packet {
     struct client *owner;
     struct packet *next_client;
 
-    mqtt_control_packet_type type;
+    control_packet_t type;
     ssize_t remaining_length;
     unsigned flags;
 
@@ -258,7 +258,7 @@ struct packet {
     uint32_t payload_len;
     unsigned property_count;
     unsigned num_will_props;
-    uint8_t reason_code;
+    reason_code_t reason_code;
 
     alignas(16) _Atomic unsigned refcnt;
 };
@@ -283,7 +283,7 @@ struct message_delivery_state {
     time_t released_at;         /* ->PUBACK    |   PUBREL->  */
     time_t completed_at;        /* ->PUBACK    | ->PUBCOMP   */
 
-    mqtt_reason_code_t client_reason;
+    reason_code_t client_reason;
 };
 
 struct message {
@@ -291,13 +291,13 @@ struct message {
     id_t id;
     struct message *next_queue;
     struct session *sender;
-    uint16_t sender_packet_identifier;
+    //uint16_t sender_packet_identifier;
     struct topic *topic;
     const void *payload;
     uint8_t format;
     size_t payload_len;
     unsigned qos;
-    message_state state;
+    message_state_t state;
 
     unsigned num_message_delivery_states;
     struct message_delivery_state **delivery_states;
@@ -371,7 +371,7 @@ struct client {
     const uint8_t *client_id;
     const uint8_t *username;
     const uint8_t *password;
-    client_state state;
+    client_state_t state;
     int fd;
 
     /* host byte order */
@@ -386,7 +386,7 @@ struct client {
     uint16_t keep_alive;
     time_t last_connected;
     time_t last_keep_alive;
-    mqtt_reason_code_t disconnect_reason;
+    reason_code_t disconnect_reason;
 
     /* used by parse_incoming() */
     uint8_t *packet_buf;
@@ -417,15 +417,15 @@ struct topic {
 };
 
 
-extern const mqtt_payload_required mqtt_packet_to_payload[MQTT_CP_MAX];
-extern const char *const mqtt_packet_type_strings[MQTT_CP_MAX];
-extern const uint8_t mqtt_packet_permitted_flags[MQTT_CP_MAX];
-extern const mqtt_types mqtt_property_to_type[MQTT_MAX_PROPERTY_IDENT];
+extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
+extern const char *const control_packet_str[MQTT_CP_MAX];
+extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
+extern const type_t property_to_type[MQTT_MAX_PROPERTY_IDENT];
 
-extern const char *const client_state_strings[];
-extern const char *const message_state_strings[];
-extern const char *const session_state_strings[];
-extern const char *const mqtt_property_strings[MQTT_MAX_PROPERTY_IDENT];
-extern const char *const mqtt_packet_type_strings[MQTT_CP_MAX];
+extern const char *const client_state_str[];
+extern const char *const message_state_str[];
+extern const char *const session_state_str[];
+extern const char *const property_str[MQTT_MAX_PROPERTY_IDENT];
+extern const char *const control_packet_str[MQTT_CP_MAX];
 
 #endif

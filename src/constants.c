@@ -1,7 +1,7 @@
 #include "mqtt.h"
 #include "config.h"
 
-const mqtt_payload_required mqtt_packet_to_payload[MQTT_CP_MAX] = {
+const payload_required_t packet_to_payload[MQTT_CP_MAX] = {
     [MQTT_CP_CONNECT]     = MQTT_PAYLOAD_REQUIRED,
     [MQTT_CP_CONNACK]     = MQTT_PAYLOAD_NONE,
     [MQTT_CP_PUBLISH]     = MQTT_PAYLOAD_OPTIONAL,
@@ -19,7 +19,7 @@ const mqtt_payload_required mqtt_packet_to_payload[MQTT_CP_MAX] = {
     [MQTT_CP_AUTH]        = MQTT_PAYLOAD_NONE,
 };
 
-const uint8_t mqtt_packet_permitted_flags[MQTT_CP_MAX] = {
+const uint8_t packet_permitted_flags[MQTT_CP_MAX] = {
     [MQTT_CP_CONNECT]     = ~0x0,
     [MQTT_CP_CONNACK]     = ~0x0,
     [MQTT_CP_PUBLISH]     = ~0xf,
@@ -37,7 +37,7 @@ const uint8_t mqtt_packet_permitted_flags[MQTT_CP_MAX] = {
     [MQTT_CP_AUTH]        = ~0x0,
 };
 
-const char *const mqtt_packet_type_strings[MQTT_CP_MAX] = {
+const char *const control_packet_str[MQTT_CP_MAX] = {
     [MQTT_CP_CONNECT]     = "CONNECT",
     [MQTT_CP_CONNACK]     = "CONNACK",
     [MQTT_CP_PUBLISH]     = "PUBLISH",
@@ -55,7 +55,7 @@ const char *const mqtt_packet_type_strings[MQTT_CP_MAX] = {
     [MQTT_CP_AUTH]        = "AUTH",
 };
 
-const mqtt_types mqtt_property_to_type[MQTT_MAX_PROPERTY_IDENT] = {
+const type_t property_to_type[MQTT_MAX_PROPERTY_IDENT] = {
     [MQTT_PROP_PAYLOAD_FORMAT_INDICATOR]          = MQTT_TYPE_BYTE,
     [MQTT_PROP_MESSAGE_EXPIRY_INTERVAL]           = MQTT_TYPE_4BYTE,
     [MQTT_PROP_CONTENT_TYPE]                      = MQTT_TYPE_UTF8_STRING,
@@ -85,7 +85,7 @@ const mqtt_types mqtt_property_to_type[MQTT_MAX_PROPERTY_IDENT] = {
     [MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE]     = MQTT_TYPE_BYTE,
 };
 
-const char *const mqtt_property_strings[MQTT_MAX_PROPERTY_IDENT] = {
+const char *const property_str[MQTT_MAX_PROPERTY_IDENT] = {
     [MQTT_PROP_PAYLOAD_FORMAT_INDICATOR]          = "PAYLOAD_FORMAT_INDICATOR",
     [MQTT_PROP_MESSAGE_EXPIRY_INTERVAL]           = "MESSAGE_EXPIRY_INTERVAL",
     [MQTT_PROP_CONTENT_TYPE]                      = "CONTENT_TYPE",
@@ -115,7 +115,7 @@ const char *const mqtt_property_strings[MQTT_MAX_PROPERTY_IDENT] = {
     [MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE]     = "SHARED_SUBSCRIPTION_AVAILABLE",
 };
 
-const char *const client_state_strings[] = {
+const char *const client_state_str[] = {
     [CS_NEW] = "NEW",
     [CS_ACTIVE] = "ACTIVE",
     [CS_CLOSING] = "CLOSING",
@@ -123,13 +123,13 @@ const char *const client_state_strings[] = {
     [CS_DISCONNECTED] = "DISCONNECTED"
 };
 
-const char *const message_state_strings[] = {
+const char *const message_state_str[] = {
     [MSG_NEW] = "NEW",
     [MSG_ACTIVE] = "ACTIVE",
     [MSG_DEAD] = "DEAD",
 };
 
-const char *const session_state_strings[] = {
+const char *const session_state_str[] = {
     [SESSION_NEW] = "NEW",
     [SESSION_ACTIVE] = "ACTIVE",
     [SESSION_DELETE] = "DELETE",
