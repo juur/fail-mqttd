@@ -298,6 +298,7 @@ struct message {
     size_t payload_len;
     unsigned qos;
     message_state_t state;
+    bool retain;
 
     unsigned num_message_delivery_states;
     struct message_delivery_state **delivery_states;
@@ -318,6 +319,7 @@ struct message {
 struct topic_sub_request {
     id_t id;
     const uint8_t **topics;
+    struct topic **topic_refs;
     uint8_t *options;
     uint8_t *response_codes;
     unsigned num_topics;
@@ -410,6 +412,7 @@ struct topic {
     id_t id;
     const uint8_t *name;
     struct subscription *(*subscribers)[];
+    struct message *retained_message;
     struct message *pending_queue;
     pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;

@@ -27,6 +27,10 @@
 # define dbg_printf(...) printf(__VA_ARGS__)
 #endif
 
+#define GET_REFCNT(x) atomic_load_explicit(x, memory_order_relaxed)
+#define DEC_REFCNT(x) atomic_fetch_sub_explicit(x, 1, memory_order_acq_rel)
+#define INC_REFCNT(x) atomic_fetch_add_explicit(x, 1, memory_order_relaxed)
+
 #define CRESET "\x1b[0m"
 #define BBLK "\x1b[1;30m"
 #define BRED "\x1b[1;31m"
@@ -115,6 +119,7 @@ static struct in_addr opt_listen = {
 
 static int unsubscribe(struct subscription *sub);
 static int dequeue_message(struct message *msg);
+static void free_message(struct message *msg, bool need_lock);
 
 /*
  * command line stuff
@@ -253,6 +258,11 @@ static void free_topic_subs(struct topic_sub_request *request)
         request->options = NULL;
     }
 
+    if (request->topic_refs) {
+        free(request->topic_refs);
+        request->topic_refs = NULL;
+    }
+
     if (request->response_codes) {
         free(request->response_codes);
         request->response_codes = NULL;
@@ -304,26 +314,33 @@ static void free_topic(struct topic *topic)
         }
 
         /* Not sure this locking is useful */
-        pthread_rwlock_wrlock(&topic->subscribers_lock); {
-            free(topic->subscribers);
-            topic->subscribers = NULL;
-        } pthread_rwlock_unlock(&topic->subscribers_lock);
+        pthread_rwlock_wrlock(&topic->subscribers_lock);
+        free(topic->subscribers);
+        topic->subscribers = NULL;
+        pthread_rwlock_unlock(&topic->subscribers_lock);
     }
 
-    pthread_rwlock_wrlock(&topic->pending_queue_lock); {
-        if (topic->pending_queue) {
-            /* TODO persist */
-            struct message *msg;
-            while ((msg = topic->pending_queue)) {
-                if (dequeue_message(msg) == -1) {
-                    topic->pending_queue = msg->next_queue;
-                    pthread_rwlock_unlock(&topic->pending_queue_lock);
-                    err(EXIT_FAILURE, "free_topic: dequeue_message"); /* TODO y/n ? */
-                }
-                msg->state = MSG_DEAD;
+    pthread_rwlock_wrlock(&topic->pending_queue_lock);
+    if (topic->pending_queue) {
+        /* TODO persist */
+        struct message *msg;
+        while ((msg = topic->pending_queue)) {
+            if (dequeue_message(msg) == -1) {
+                topic->pending_queue = msg->next_queue;
+                pthread_rwlock_unlock(&topic->pending_queue_lock);
+                err(EXIT_FAILURE, "free_topic: dequeue_message"); /* TODO y/n ? */
             }
+            msg->state = MSG_DEAD;
         }
-    } pthread_rwlock_unlock(&topic->pending_queue_lock);
+    }
+    pthread_rwlock_unlock(&topic->pending_queue_lock);
+
+    if (topic->retained_message) {
+        DEC_REFCNT(&topic->retained_message->refcnt);
+        topic->retained_message = NULL;
+        if (GET_REFCNT(&topic->retained_message->refcnt) == 0)
+            free_message(topic->retained_message, true);
+    }
 
     if (topic->name) {
         free((void *)topic->name);
@@ -406,7 +423,7 @@ static void free_packet(struct packet *pck, bool need_lock)
             pck->owner ? pck->owner->id : 0,
             pck->owner ? (char *)pck->owner->client_id : "");
 
-    if ((lck = atomic_load_explicit(&pck->refcnt, memory_order_relaxed)) > 0) {
+    if ((lck = GET_REFCNT(&pck->refcnt)) > 0) {
         warnx("free_packet: attempt to free with refcnt=%u", lck);
         abort();
         return;
@@ -463,8 +480,8 @@ static void free_packet(struct packet *pck, bool need_lock)
     }
 
     if (pck->message) {
-        atomic_fetch_sub_explicit(&pck->message->refcnt, 1, memory_order_acq_rel);
         pck->message = NULL;
+        DEC_REFCNT(&pck->message->refcnt);
     }
 
     num_packets--;
@@ -483,7 +500,7 @@ static void free_message(struct message *msg, bool need_lock)
             msg->topic ? msg->topic->id : 0,
             msg->topic ? (char *)msg->topic->name : "");
 
-    if ((lck = atomic_load_explicit(&msg->refcnt, memory_order_relaxed)) > 0) {
+    if ((lck = GET_REFCNT(&msg->refcnt)) > 0) {
         warn("free_message: attempt to free with refcnt=%u", lck);
         abort();
         return;
@@ -539,7 +556,7 @@ static void free_client(struct client *client, bool needs_lock)
             client->session ? client->session->id : 0,
             client->session ? (char *)client->session->client_id : "");
 
-    if (atomic_load_explicit(&client->refcnt, memory_order_relaxed) > 0) {
+    if (GET_REFCNT(&client->refcnt) > 0) {
         warn("free_client: attempt to free with refcnt");
         abort();
         return;
@@ -569,7 +586,7 @@ static void free_client(struct client *client, bool needs_lock)
     for (struct packet *p = client->active_packets, *next; p; p = next)
     {
         next = p->next_client;
-        atomic_fetch_sub_explicit(&p->refcnt, 1, memory_order_acq_rel);
+        DEC_REFCNT(&p->refcnt);
         free_packet(p, true);
     }
     client->active_packets = NULL;
@@ -629,7 +646,7 @@ static void free_session(struct session *session, bool need_lock)
             session->client ? session->client->id : 0,
             session->client ? (char *)session->client->client_id : "");
 
-    if (atomic_load_explicit(&session->refcnt, memory_order_relaxed) > 0) {
+    if (GET_REFCNT(&session->refcnt) > 0) {
         warn("free_session: attempt to free with refcnt");
         abort();
         return;
@@ -697,12 +714,12 @@ static struct message_delivery_state *alloc_message_delivery_state(
     if ((ret = calloc(1, sizeof(struct message_delivery_state))) == NULL)
         goto fail;
 
+    INC_REFCNT(&session->refcnt);
+    INC_REFCNT(&message->refcnt);
+
     ret->session = session;
     ret->message = message;
     ret->id = mds_id++;
-
-    atomic_fetch_add_explicit(&session->refcnt, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&message->refcnt, 1, memory_order_relaxed);
 
     dbg_printf("     alloc_message_delivery_state: session=%u[%u] message=%u[%u]\n",
             session->id, session->refcnt,
@@ -1830,9 +1847,11 @@ done:
     return 0;
 }
 
+/* TODO: refcnt of the message? or inside enqueue/dequeue? */
 [[gnu::nonnull,gnu::access(read_only,4,3)]]
 static struct message *register_message(const uint8_t *topic_name, int format,
-        uint16_t len, const void *payload, unsigned qos, struct session *sender)
+        uint16_t len, const void *payload, unsigned qos, struct session *sender,
+        bool retain)
 {
     struct topic *topic;
     const uint8_t *tmp_name;
@@ -1868,6 +1887,13 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     msg->qos = qos;
     msg->sender = sender;
     msg->state = MSG_NEW;
+    msg->retain = retain;
+
+    if (retain) {
+        if (topic->retained_message)
+            DEC_REFCNT(&topic->retained_message->refcnt);
+        topic->retained_message = msg;
+    }
 
     if (enqueue_message(topic, msg) == -1) {
         warn("register_message: enqueue_message");
@@ -2054,6 +2080,14 @@ fail:
 }
 
 [[gnu::nonnull]]
+static int unsubscribe_from_topics(struct session * /*session*/,
+        struct topic_sub_request * /*request*/)
+{
+    errno = ENOSYS;
+    return -1;
+}
+
+[[gnu::nonnull]]
 static int subscribe_to_topics(struct session *session,
         struct topic_sub_request *request)
 {
@@ -2133,6 +2167,7 @@ static int subscribe_to_topics(struct session *session,
         free((void *)request->topics[idx]);
         request->options[idx] = 0;
         request->topics[idx] = NULL;
+        request->topic_refs[idx] = tmp_topic;
         if (existing_idx == -1)
             session->num_subscriptions++;
     }
@@ -2649,6 +2684,19 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
     return 0;
 }
 
+[[gnu::nonnull]]
+static int send_cp_unsuback(struct client * /*client*/, uint16_t packet_id,
+        struct topic_sub_request * /*request*/)
+{
+    if (packet_id == 0) {
+        errno = EINVAL;
+        goto fail;
+    }
+
+    errno = ENOSYS;
+fail:
+    return -1;
+}
 
 /* Fixed Header:
  *  MQTT Control Packet type [4:7]
@@ -2712,8 +2760,8 @@ static int send_cp_suback(struct client *client, uint16_t packet_id,
     for (struct packet *tmp = client->active_packets; tmp; tmp = tmp->next_client)
     {
         if (tmp->packet_identifier == packet_id &&
-                atomic_load_explicit(&tmp->refcnt, memory_order_relaxed) > 0) {
-            atomic_fetch_sub_explicit(&tmp->refcnt, 1, memory_order_acq_rel);
+                GET_REFCNT(&tmp->refcnt) > 0) {
+            DEC_REFCNT(&tmp->refcnt);
             break;
         }
 
@@ -3163,7 +3211,7 @@ fail:
 }
 
 [[gnu::nonnull]]
-static int handle_cp_publish(struct client *client, struct packet *packet, 
+static int handle_cp_publish(struct client *client, struct packet *packet,
         const void *remain)
 {
     const uint8_t *ptr = remain;
@@ -3232,7 +3280,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
 
     struct message *msg;
     if ((msg = register_message(topic_name, payload_format, packet->payload_len,
-                    packet->payload, qos, client->session)) == NULL) {
+                    packet->payload, qos, client->session, flag_retain)) == NULL) {
         warn("handle_cp_publish: register_message");
         goto fail;
     }
@@ -3290,6 +3338,88 @@ fail:
 }
 
 [[gnu::nonnull]]
+static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
+        const void *remain)
+{
+    const uint8_t *ptr = remain;
+    size_t bytes_left = packet->remaining_length;
+    reason_code_t reason_code = MQTT_MALFORMED_PACKET;
+    struct topic_sub_request *request;
+    void *tmp;
+
+    return 0;
+
+    if (packet->flags != MQTT_FLAG_UNSUBSCRIBE)
+        goto fail;
+
+    if (bytes_left < 3) {
+        errno = ENOSPC;
+        goto fail;
+    }
+
+    memcpy(&packet->packet_identifier, ptr, 2);
+    packet->packet_identifier = ntohs(packet->packet_identifier);
+    ptr += 2;
+    bytes_left -= 2;
+
+    if (packet->packet_identifier == 0) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
+
+    if (parse_properties(&ptr, &bytes_left, &packet->properties,
+                &packet->property_count, MQTT_CP_UNSUBSCRIBE) == -1)
+        goto fail;
+
+    if (bytes_left < 3)
+        goto fail;
+
+    if ((request = calloc(1, sizeof(struct topic_sub_request))) == NULL)
+        goto fail;
+
+    while (bytes_left)
+    {
+        if (bytes_left < 3)
+            goto fail;
+
+        if ((tmp = realloc(request->topics,
+                        sizeof(uint8_t *) * (request->num_topics + 1))) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
+            goto fail;
+        }
+        request->topics = tmp;
+
+        if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
+            goto fail;
+
+        request->response_codes[request->num_topics] = MQTT_SUCCESS;
+
+        request->num_topics++;
+    }
+
+    if (unsubscribe_from_topics(client->session, request) == -1) {
+        warn("handle_cp_unsubscribe: unsubscribe_from_topics");
+        goto fail;
+    }
+
+    errno = 0;
+    int rc = send_cp_unsuback(client, packet->packet_identifier, request);
+    free_topic_subs(request);
+    return rc;
+
+fail:
+    if (request)
+        free_topic_subs(request);
+
+    if (reason_code == MQTT_PROTOCOL_ERROR || reason_code == MQTT_MALFORMED_PACKET)
+        client->state = CS_CLOSING;
+    else
+        send_cp_disconnect(client, reason_code);
+
+    return -1;
+}
+
+[[gnu::nonnull]]
 static int handle_cp_subscribe(struct client *client, struct packet *packet,
         const void *remain)
 {
@@ -3320,9 +3450,8 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
     }
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
-                &packet->property_count, MQTT_CP_SUBSCRIBE) == -1) {
+                &packet->property_count, MQTT_CP_SUBSCRIBE) == -1)
         goto fail;
-    }
 
     /* Check for 0 topic filters */
     if (bytes_left < 3)
@@ -3359,6 +3488,14 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
             goto fail;
         }
         request->response_codes = tmp;
+
+        if ((tmp = realloc(request->topic_refs,
+                        sizeof(struct topic *) * (request->num_topics + 1))) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
+            goto fail;
+        }
+        request->topic_refs = tmp;
+        request->topic_refs[request->num_topics] = NULL;
 
         if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
@@ -3401,7 +3538,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
         request->num_topics++;
     }
 
-    atomic_fetch_add_explicit(&packet->refcnt, 1, memory_order_relaxed);
+    INC_REFCNT(&packet->refcnt);
 
     if (subscribe_to_topics(client->session, request) == -1) {
         warn("handle_cp_subscribe: subscribe_to_topics");
@@ -3410,8 +3547,40 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
 
     errno = 0;
     int rc = send_cp_suback(client, packet->packet_identifier, request);
-    /* TODO senda an error back? */
+    /* TODO send an error back? */
+
+    if (rc == 0) {
+        for (unsigned idx = 0; idx < request->num_topics; idx++)
+        {
+            if (request->topic_refs[idx] == NULL)
+                continue;
+
+            if (request->topic_refs[idx]->retained_message == NULL)
+                continue;
+
+            struct message_delivery_state *mds;
+
+            if ((mds = alloc_message_delivery_state(request->topic_refs[idx]->retained_message,
+                            client->session)) == NULL) {
+                /* TODO ??? */
+                continue;
+            }
+
+            if (add_to_delivery_state(&client->session->delivery_states,
+                        &client->session->num_message_delivery_states,
+                        &client->session->delivery_states_lock,
+                        mds) == -1) {
+                free_message_delivery_state(mds);
+                /* TODO ??? */
+                continue;
+            }
+
+            /* TODO */
+        }
+    }
+
     free_topic_subs(request);
+
     return rc;
 
 fail:
@@ -3489,6 +3658,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     uint8_t *will_topic = NULL;
     uint8_t will_qos = 0;
     void *will_payload = NULL;
+    bool will_retain = false;
     uint16_t will_payload_len;
     uint8_t payload_format = 0;
     struct property (*will_props)[] = NULL;
@@ -3601,6 +3771,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
         packet->payload_len = will_payload_len;
         packet->will_props = will_props;
         packet->num_will_props = num_will_props;
+        will_retain = (connect_flags & MQTT_CONNECT_FLAG_WILL_RETAIN);
     }
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_RETAIN) {
@@ -3654,9 +3825,8 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
         //dbg_printf("handle_cp_connect: creating a message\n");
-        struct message *msg;
-        if ((msg = register_message(will_topic, payload_format, will_payload_len,
-                        will_payload, will_qos, client->session)) == NULL) {
+        if ((register_message(will_topic, payload_format, will_payload_len,
+                        will_payload, will_qos, client->session, will_retain)) == NULL) {
             warn("handle_cp_connect: register_message");
             free(will_topic);
             will_topic = NULL;
@@ -3719,15 +3889,16 @@ fail:
  */
 
 static const control_func_t control_functions[MQTT_CP_MAX] = {
-    [MQTT_CP_PUBLISH]    = handle_cp_publish,
-    [MQTT_CP_PUBACK]     = handle_cp_puback,
-    [MQTT_CP_PUBREC]     = handle_cp_pubrec,
-    [MQTT_CP_PUBREL]     = handle_cp_pubrel,
-    [MQTT_CP_PUBCOMP]    = handle_cp_pubcomp,
-    [MQTT_CP_SUBSCRIBE]  = handle_cp_subscribe,
-    [MQTT_CP_CONNECT]    = handle_cp_connect,
-    [MQTT_CP_PINGREQ]    = handle_cp_pingreq,
-    [MQTT_CP_DISCONNECT] = handle_cp_disconnect,
+    [MQTT_CP_PUBLISH]     = handle_cp_publish,
+    [MQTT_CP_PUBACK]      = handle_cp_puback,
+    [MQTT_CP_PUBREC]      = handle_cp_pubrec,
+    [MQTT_CP_PUBREL]      = handle_cp_pubrel,
+    [MQTT_CP_PUBCOMP]     = handle_cp_pubcomp,
+    [MQTT_CP_SUBSCRIBE]   = handle_cp_subscribe,
+    [MQTT_CP_UNSUBSCRIBE] = handle_cp_unsubscribe,
+    [MQTT_CP_CONNECT]     = handle_cp_connect,
+    [MQTT_CP_PINGREQ]     = handle_cp_pingreq,
+    [MQTT_CP_DISCONNECT]  = handle_cp_disconnect,
 };
 
 /*
@@ -3763,7 +3934,7 @@ static int parse_incoming(struct client *client)
             }
             if (client->new_packet &&
                     client->new_packet->packet_identifier == 0) {
-                if (atomic_load_explicit(&client->new_packet->refcnt, memory_order_relaxed) == 0)
+                if (GET_REFCNT(&client->new_packet->refcnt) == 0)
                     free_packet(client->new_packet, true);
             }
             client->new_packet = NULL;
@@ -3911,7 +4082,7 @@ exec_control:
                 warn("control_function");
                 goto fail;
             }
-            atomic_fetch_sub_explicit(&client->new_packet->refcnt, 1, memory_order_acq_rel);
+            DEC_REFCNT(&client->new_packet->refcnt);
             client->new_packet = NULL;
 
             break;
@@ -4026,7 +4197,7 @@ static void tick_msg(struct message *msg)
 
         /* this code might execute more than once, so avoid a double refcnt */
         if (mds->last_sent == 0)
-            atomic_fetch_add_explicit(&msg->refcnt, 1, memory_order_relaxed);
+            INC_REFCNT(&msg->refcnt);
 
         packet->message = msg;
         packet->type = MQTT_CP_PUBLISH;
@@ -4051,11 +4222,11 @@ static void tick_msg(struct message *msg)
         if (send_cp_publish(packet) == -1) {
             mds->last_sent = 0;
             warn("tick_msg: unable to send_cp_publish");
-            atomic_fetch_sub_explicit(&packet->refcnt, 1, memory_order_acq_rel);
+            DEC_REFCNT(&packet->refcnt);
             free_packet(packet, true); /* Anything else? */
             continue;
         }
-        
+
         /* Unless we get a network error, just assume it works */
         if (msg->qos == 0) {
             mds->acknowledged_at = time(0);
@@ -4063,7 +4234,7 @@ static void tick_msg(struct message *msg)
             mds->released_at = mds->acknowledged_at;
         }
 
-        atomic_fetch_sub_explicit(&packet->refcnt, 1, memory_order_acq_rel);
+        DEC_REFCNT(&packet->refcnt);
         free_packet(packet, true);
         /* TODO async END */
     }
@@ -4105,16 +4276,18 @@ again:
 
             remove_delivery_state(&msg->delivery_states,
                     &msg->num_message_delivery_states, mds);
-            atomic_fetch_sub_explicit(&mds->message->refcnt, 1, memory_order_acq_rel);
+            
             mds->message = NULL;
+            DEC_REFCNT(&mds->message->refcnt);
 
             if (mds->session) {
                 pthread_rwlock_wrlock(&mds->session->delivery_states_lock);
                 remove_delivery_state(&mds->session->delivery_states,
                         &mds->session->num_message_delivery_states, mds);
                 pthread_rwlock_unlock(&mds->session->delivery_states_lock);
-                atomic_fetch_sub_explicit(&mds->session->refcnt, 1, memory_order_acq_rel);
+                
                 mds->session = NULL;
+                DEC_REFCNT(&mds->session->refcnt);
             }
 
             free_message_delivery_state(mds);
@@ -4203,7 +4376,7 @@ static void packet_tick(void)
     {
         next = pkt->next;
 
-        if (atomic_load_explicit(&pkt->refcnt, memory_order_relaxed) == 0)
+        if (GET_REFCNT(&pkt->refcnt) == 0)
             free_packet(pkt, false);
     }
 
