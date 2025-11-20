@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE 700
+#define _XOPEN_SOURCE 800
 #include "config.h"
 
 #include <stdlib.h>
@@ -337,9 +337,9 @@ static void free_topic(struct topic *topic)
 
     if (topic->retained_message) {
         DEC_REFCNT(&topic->retained_message->refcnt);
-        topic->retained_message = NULL;
         if (GET_REFCNT(&topic->retained_message->refcnt) == 0)
             free_message(topic->retained_message, true);
+        topic->retained_message = NULL;
     }
 
     if (topic->name) {
@@ -361,13 +361,20 @@ static void free_properties(
 
     for (unsigned i = 0; i < count; i++)
     {
-        if ((*props)[i].ident > MQTT_MAX_PROPERTY_IDENT) /* TODO handle error */
+        if ((*props)[i].ident >= MQTT_MAX_PROPERTY_IDENT) /* TODO handle error */
             continue;
 
         type = property_to_type[(*props)[i].ident];
 
         switch (type)
         {
+            case MQTT_TYPE_UTF8_STRING_PAIR:
+                if ((*props)[i].utf8_pair[0])
+                    free((*props)[i].utf8_pair[0]);
+                if ((*props)[i].utf8_pair[1])
+                    free((*props)[i].utf8_pair[1]);
+                break;
+
             case MQTT_TYPE_UTF8_STRING:
                 if ((*props)[i].utf8_string)
                     free((*props)[i].utf8_string);
@@ -442,6 +449,7 @@ static void free_packet(struct packet *pck, bool need_lock)
         }
         pck->next_client = NULL;
         pthread_rwlock_unlock(&pck->owner->active_packets_lock);
+        DEC_REFCNT(&pck->owner->refcnt);
         pck->owner = NULL;
     }
 
@@ -480,8 +488,8 @@ static void free_packet(struct packet *pck, bool need_lock)
     }
 
     if (pck->message) {
-        pck->message = NULL;
         DEC_REFCNT(&pck->message->refcnt);
+        pck->message = NULL;
     }
 
     num_packets--;
@@ -592,13 +600,13 @@ static void free_client(struct client *client, bool needs_lock)
     client->active_packets = NULL;
     pthread_rwlock_unlock(&client->active_packets_lock);
 
-    pthread_rwlock_wrlock(&global_packets_lock); {
-        for (struct packet *p = global_packet_list; p; p = p->next)
-        {
-            if (p->owner == client)
-                p->owner = NULL; /* TODO locking? */
-        }
-    } pthread_rwlock_unlock(&global_packets_lock);
+    pthread_rwlock_wrlock(&global_packets_lock);
+    for (struct packet *p = global_packet_list; p; p = p->next)
+    {
+        if (p->owner == client)
+            p->owner = NULL; /* TODO locking? */
+    }
+    pthread_rwlock_unlock(&global_packets_lock);
 
 
     if (client->fd != -1)
@@ -619,13 +627,12 @@ static void free_client(struct client *client, bool needs_lock)
         client->password = NULL;
     }
 
-
-
     if (client->packet_buf)
         free(client->packet_buf);
 
     if (client->session) {
         client->session->client = NULL;
+        DEC_REFCNT(&client->session->refcnt);
         client->session = NULL;
     }
 
@@ -635,7 +642,7 @@ static void free_client(struct client *client, bool needs_lock)
     free(client);
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static void free_session(struct session *session, bool need_lock)
 {
     struct session *tmp;
@@ -668,6 +675,7 @@ static void free_session(struct session *session, bool need_lock)
             session->client->state = CS_CLOSED;
             close_socket(&session->client->fd);
             session->client->session = NULL;
+            DEC_REFCNT(&session->client->refcnt);
             session->client = NULL;
         }
     }
@@ -715,10 +723,11 @@ static struct message_delivery_state *alloc_message_delivery_state(
         goto fail;
 
     INC_REFCNT(&session->refcnt);
-    INC_REFCNT(&message->refcnt);
-
     ret->session = session;
+    
+    INC_REFCNT(&message->refcnt);
     ret->message = message;
+    
     ret->id = mds_id++;
 
     dbg_printf("     alloc_message_delivery_state: session=%u[%u] message=%u[%u]\n",
@@ -748,7 +757,11 @@ static struct subscription *alloc_subscription(struct session *session,
         return NULL;
 
     ret->id = subscription_id++;
+    
+    INC_REFCNT(&topic->refcnt);
     ret->topic = topic;
+    
+    INC_REFCNT(&session->refcnt);
     ret->session = session;
 
     dbg_printf("     alloc_subscription: id=%u session=%u <%s> topic=%u <%s>\n",
@@ -778,6 +791,7 @@ static struct session *alloc_session(struct client *client)
         goto fail;
 
     if (client) {
+        INC_REFCNT(&client->refcnt);
         ret->client = client;
         client->session = ret;
         ret->client_id = (void *)strdup((const char *)client->client_id);
@@ -845,8 +859,11 @@ static struct packet *alloc_packet(struct client *owner)
         return NULL;
 
     if (owner) {
+        INC_REFCNT(&owner->refcnt);
+        INC_REFCNT(&ret->refcnt);
+
         ret->owner = owner;
-        ret->refcnt++;
+        
         pthread_rwlock_wrlock(&owner->active_packets_lock);
         ret->next_client = owner->active_packets;
         owner->active_packets = ret;
@@ -1183,7 +1200,7 @@ static ssize_t get_properties_size(const struct property (*props)[],
         prop = &(*props)[idx];
         ret++; /* Property Type */
 
-        if (prop->ident > MQTT_MAX_PROPERTY_IDENT) {
+        if (prop->ident >= MQTT_MAX_PROPERTY_IDENT) {
             errno = ERANGE;
             return -1;
         }
@@ -1267,7 +1284,7 @@ static int build_properties(const struct property (*props)[],
     {
         prop = &(*props)[idx];
 
-        if (prop->ident > MQTT_MAX_PROPERTY_IDENT) {
+        if (prop->ident >= MQTT_MAX_PROPERTY_IDENT) {
             errno = ERANGE;
             goto fail;
         }
@@ -1390,7 +1407,7 @@ static int parse_properties(
 
         prop = &(*props)[num_props];
 
-        if (ident > MQTT_MAX_PROPERTY_IDENT) {
+        if (ident >= MQTT_MAX_PROPERTY_IDENT) {
             errno = EINVAL;
             goto fail;
         }
@@ -1796,6 +1813,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
     if (found == false)
         warnx("enqueue_message: failed to add to subscribers!");
 
+    INC_REFCNT(&topic->refcnt);
     msg->topic = topic;
 
     pthread_rwlock_wrlock(&topic->pending_queue_lock);
@@ -1843,6 +1861,7 @@ static int dequeue_message(struct message *msg)
 
 done:
     msg->next_queue = NULL;
+    DEC_REFCNT(&msg->topic->refcnt);
     msg->topic = NULL;
     return 0;
 }
@@ -1901,6 +1920,7 @@ static struct message *register_message(const uint8_t *topic_name, int format,
         goto fail;
     }
 
+    INC_REFCNT(&topic->refcnt);
     msg->state = MSG_ACTIVE;
 
     /* TODO register the message for delivery and commit */
@@ -2062,8 +2082,12 @@ skip_client:
 
     dbg_printf("     unsubscribe_from_topic: client_sub_cnt now %lu\n", client_sub_cnt);
 
+    DEC_REFCNT(&sub->topic->refcnt);
     sub->topic = NULL;
+
+    DEC_REFCNT(&sub->session->refcnt);
     sub->session = NULL;
+    
     free_subscription(sub);
 
     pthread_rwlock_unlock(&session->subscriptions_lock);
@@ -3823,22 +3847,6 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 
     dbg_printf("QoS [%u]\n", will_qos);
 
-    if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
-        //dbg_printf("handle_cp_connect: creating a message\n");
-        if ((register_message(will_topic, payload_format, will_payload_len,
-                        will_payload, will_qos, client->session, will_retain)) == NULL) {
-            warn("handle_cp_connect: register_message");
-            free(will_topic);
-            will_topic = NULL;
-            will_payload = NULL; /* register_message frees in error */
-            goto fail;
-        }
-        free(will_topic);
-        will_topic = NULL;
-        packet->payload = NULL;
-        packet->payload_len = 0;
-    }
-
     client->connect_flags = connect_flags;
     client->protocol_version = protocol_version;
     client->keep_alive = keep_alive;
@@ -3862,6 +3870,24 @@ create_new_session:
         client->connect_response_flags |= MQTT_CONNACK_FLAG_SESSION_PRESENT;
         dbg_printf("[%2d] handle_cp_connect: connection re-established\n",
                 client->session->id);
+    }
+    INC_REFCNT(&client->session->refcnt);
+
+    if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
+        /* FIXME this is supposed to trigger on disconnect/timeout or something ?? */
+        //dbg_printf("handle_cp_connect: creating a message\n");
+        if ((register_message(will_topic, payload_format, will_payload_len,
+                        will_payload, will_qos, client->session, will_retain)) == NULL) {
+            warn("handle_cp_connect: register_message");
+            free(will_topic);
+            will_topic = NULL;
+            will_payload = NULL; /* register_message frees in error */
+            goto fail;
+        }
+        free(will_topic);
+        will_topic = NULL;
+        packet->payload = NULL;
+        packet->payload_len = 0;
     }
 
     send_cp_connack(client, MQTT_SUCCESS); /* TODO handle failure */
@@ -4123,6 +4149,7 @@ static void client_tick(void)
 
             case CS_DISCONNECTED:
                 if (clnt->session) {
+                    DEC_REFCNT(&clnt->refcnt);
                     clnt->session->client = NULL;
                     clnt->session = NULL;
                 }
@@ -4154,7 +4181,7 @@ static void tick_msg(struct message *msg)
 
     time_t now = time(0);
 
-    dbg_printf(NGRN "tick_msg: id=%u sender.id=%u #mds=%u"CRESET"\n",
+    dbg_printf(NGRN "     tick_msg: id=%u sender.id=%u #mds=%u"CRESET"\n",
             msg->id,
             msg->sender->id,
             msg->num_message_delivery_states
@@ -4178,7 +4205,7 @@ static void tick_msg(struct message *msg)
             continue;
 
         if (mds->session == NULL || mds->message != msg) {
-            warnx("tick_msg: message_delivery_state is corrupt");
+            warnx("     tick_msg: message_delivery_state is corrupt");
             continue;
         }
 
@@ -4186,7 +4213,7 @@ static void tick_msg(struct message *msg)
         if (mds->session->client == NULL)
             continue;
 
-        dbg_printf(NGRN"tick_msg: sending message: id=%u acknowledged_at=%lu last_sent=%lu"CRESET"\n",
+        dbg_printf(NGRN"     tick_msg: sending message: id=%u acknowledged_at=%lu last_sent=%lu"CRESET"\n",
                 mds->id, mds->acknowledged_at, mds->last_sent);
 
         if ((packet = alloc_packet(mds->session->client)) == NULL) {
@@ -4198,8 +4225,8 @@ static void tick_msg(struct message *msg)
         /* this code might execute more than once, so avoid a double refcnt */
         if (mds->last_sent == 0)
             INC_REFCNT(&msg->refcnt);
-
         packet->message = msg;
+
         packet->type = MQTT_CP_PUBLISH;
         packet->flags |= MQTT_FLAG_PUBLISH_QOS(msg->qos);
 
@@ -4239,21 +4266,21 @@ static void tick_msg(struct message *msg)
         /* TODO async END */
     }
 
-    dbg_printf(NGRN"tick_msg: num_sent=%u num_message_delivery_states=%u"CRESET"\n",
+    dbg_printf(NGRN"     tick_msg: num_sent=%u num_message_delivery_states=%u"CRESET"\n",
             num_sent, msg->num_message_delivery_states);
 
     /* We have now sent everything */
     if (num_sent == num_to_send /*msg->num_message_delivery_states*/) { /* TODO this doesn't handle holes? */
         /* TODO replace with list of subscribers to message, removal thereof,
          * then dequeue when none left */
-        dbg_printf(BGRN"tick_msg: tidying up"CRESET"\n");
+        dbg_printf(BGRN"     tick_msg: tidying up"CRESET"\n");
 
         while (msg->num_message_delivery_states && msg->delivery_states)
         {
             unsigned idx = 0;
             struct message_delivery_state *mds;
 again:
-            dbg_printf(NCYN"tick_msg: idx=%u"CRESET"\n",idx);
+            dbg_printf(NCYN"     tick_msg: idx=%u"CRESET"\n",idx);
             if (idx >= msg->num_message_delivery_states)
                 break;
 
@@ -4263,11 +4290,11 @@ again:
                 break;
 
             if (mds->completed_at == 0) {
-                dbg_printf(NCYN"tick_msg: not completed"CRESET"\n");
+                dbg_printf(NCYN"     tick_msg: not completed"CRESET"\n");
                 goto again;
             }
 
-            dbg_printf(NCYN"tick_msg: unlink %u from session %u[%u] and message %u[%u]"CRESET"\n",
+            dbg_printf(NCYN"     tick_msg: unlink %u from session %u[%u] and message %u[%u]"CRESET"\n",
                     mds->id,
                     mds->session ? mds->session->id : 0,
                     mds->session ? mds->session->refcnt : 0,
@@ -4277,8 +4304,8 @@ again:
             remove_delivery_state(&msg->delivery_states,
                     &msg->num_message_delivery_states, mds);
             
-            mds->message = NULL;
             DEC_REFCNT(&mds->message->refcnt);
+            mds->message = NULL;
 
             if (mds->session) {
                 pthread_rwlock_wrlock(&mds->session->delivery_states_lock);
@@ -4286,8 +4313,8 @@ again:
                         &mds->session->num_message_delivery_states, mds);
                 pthread_rwlock_unlock(&mds->session->delivery_states_lock);
                 
-                mds->session = NULL;
                 DEC_REFCNT(&mds->session->refcnt);
+                mds->session = NULL;
             }
 
             free_message_delivery_state(mds);
@@ -4295,7 +4322,7 @@ again:
 
         /* We can't just dequeue() and MSG_DEAD if any mds are not complated_at */
         if (msg->topic && msg->num_message_delivery_states == 0) {
-            dbg_printf(BGRN"tick_msg: dequeue"CRESET"\n");
+            dbg_printf(BGRN"     tick_msg: dequeue"CRESET"\n");
             if (dequeue_message(msg) == -1) {
                 warn("tick_msg: dequeue_message failed");
             }

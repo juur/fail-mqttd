@@ -1,5 +1,6 @@
 #ifndef _FAIL_MQTT_H
 #define _FAIL_MQTT_H
+#define _XOPEN_SOURCE 800
 
 #include <sys/types.h>
 #include <stdint.h>
@@ -95,7 +96,7 @@ typedef enum {
 #define GET_WILL_QOS(x) (((x) & MQTT_CONNECT_FLAG_WILL_QOS_MASK) >> 3U)
 
 #define GET_QOS(x) ( ((x) & MQTT_FLAG_PUBLISH_QOS_MASK) >> 1U)
-#define SET_QOS(x,y) ( (x) | (((y) & MQTT_FLAG_PUBLISH_QOS_MASK) <<1U) )
+#define SET_QOS(x,y) ( (x) | (((y) & 0x3) <<1U) )
 
 typedef enum {
     MQTT_TYPE_UNDEFINED = 0,
@@ -417,6 +418,7 @@ struct topic {
     pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;
     unsigned num_subscribers;
+    alignas(16) _Atomic unsigned refcnt;
 };
 
 

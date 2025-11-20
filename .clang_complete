@@ -1,6 +1,5 @@
 -Iinclude
 -std=c2x
--D_XOPEN_SOURCE=700
 -Wall
 -Wextra
 -Wpedantic
