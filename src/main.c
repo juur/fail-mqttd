@@ -2198,7 +2198,7 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int unsubscribe_from_topics(struct session *session,
         struct topic_sub_request *request)
 {
@@ -2207,13 +2207,14 @@ static int unsubscribe_from_topics(struct session *session,
     errno = 0;
 
     if (request->topic_refs == NULL) {
+        warnx("unsubscribe_from_topics: topic_refs is NULL");
         errno = EINVAL;
         return -1;
     }
 
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
-        if (request->topic_refs[idx] == NULL) {
+        if ((request->topic_refs[idx] = find_topic(request->topics[idx])) == NULL) {
             request->response_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
             continue;
         }
@@ -2237,7 +2238,7 @@ static int unsubscribe_from_topics(struct session *session,
     return 0;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int subscribe_to_topics(struct session *session,
         struct topic_sub_request *request)
 {
@@ -3594,10 +3595,20 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
         if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
 
+        if ((tmp = realloc(request->topic_refs,
+                        sizeof(struct topic *) * (request->num_topics + 1))) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
+            goto fail;
+        }
+        request->topic_refs = tmp;
+        request->topic_refs[request->num_topics] = NULL;
+
         request->response_codes[request->num_topics] = MQTT_SUCCESS;
 
         request->num_topics++;
     }
+
+    INC_REFCNT(&packet->refcnt);
 
     if (unsubscribe_from_topics(client->session, request) == -1) {
         warn("handle_cp_unsubscribe: unsubscribe_from_topics");
