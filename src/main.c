@@ -278,17 +278,17 @@ static void free_topic(struct topic *topic)
             (topic->name == NULL) ? "" : (char *)topic->name
             );
 
-    pthread_rwlock_wrlock(&global_topics_lock); {
-        if (global_topic_list == topic) {
-            global_topic_list = topic->next;
-        } else for (struct topic *tmp = global_topic_list; tmp; tmp = tmp->next)
-        {
-            if (tmp->next == topic) {
-                tmp->next = topic->next;
-                break;
-            }
+    pthread_rwlock_wrlock(&global_topics_lock);
+    if (global_topic_list == topic) {
+        global_topic_list = topic->next;
+    } else for (struct topic *tmp = global_topic_list; tmp; tmp = tmp->next)
+    {
+        if (tmp->next == topic) {
+            tmp->next = topic->next;
+            break;
         }
-    } pthread_rwlock_unlock(&global_topics_lock);
+    }
+    pthread_rwlock_unlock(&global_topics_lock);
     topic->next = NULL;
 
     /* TODO check if we should have a wrlock here,
@@ -338,6 +338,9 @@ static void free_topic(struct topic *topic)
         DEC_REFCNT(&topic->retained_message->refcnt);
         if (GET_REFCNT(&topic->retained_message->refcnt) == 0)
             free_message(topic->retained_message, true);
+        else
+            warn("free_topic: can't free retained_message, refcnt is %u\n",
+                    GET_REFCNT(&topic->retained_message->refcnt));
         topic->retained_message = NULL;
     }
 
@@ -544,8 +547,13 @@ static void free_message(struct message *msg, bool need_lock)
     }
 
     /* TODO do this properly */
-    if (msg->delivery_states)
+    while (msg->delivery_states && msg->delivery_states[0])
+        free_message_delivery_state(msg->delivery_states[0]);
+
+    if (msg->delivery_states) {
         free(msg->delivery_states);
+        msg->delivery_states = NULL;
+    }
 
     pthread_rwlock_destroy(&msg->delivery_states_lock);
 
@@ -717,11 +725,11 @@ static void free_session(struct session *session, bool need_lock)
     pthread_rwlock_unlock(&session->subscriptions_lock);
 
     /* TODO do this properly */
-    pthread_rwlock_wrlock(&session->delivery_states_lock); {
-        /* TODO iterate and free_message_delivery_state() */
-        if (session->delivery_states)
-            free (session->delivery_states);
-    } pthread_rwlock_unlock(&session->delivery_states_lock);
+    pthread_rwlock_wrlock(&session->delivery_states_lock);
+    /* TODO iterate and free_message_delivery_state() */
+    while (session->delivery_states && session->delivery_states[0])
+        free_message_delivery_state(session->delivery_states[0]);
+    pthread_rwlock_unlock(&session->delivery_states_lock);
 
     if (session->client_id) {
         free((void *)session->client_id);
@@ -2006,9 +2014,15 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     msg->retain = retain;
 
     if (retain) {
-        if (topic->retained_message)
+        INC_REFCNT(&topic->refcnt);
+
+        if (topic->retained_message) {
             DEC_REFCNT(&topic->retained_message->refcnt);
+            DEC_REFCNT(&topic->refcnt);
+            topic->retained_message->state = MSG_DEAD;
+        }
         topic->retained_message = msg;
+        goto skip_enqueue;
     }
 
     if (enqueue_message(topic, msg) == -1) {
@@ -2018,6 +2032,8 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     }
 
     INC_REFCNT(&topic->refcnt);
+
+skip_enqueue:
     msg->state = MSG_ACTIVE;
 
     /* TODO register the message for delivery and commit */
@@ -3768,6 +3784,9 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
             if (request->topic_refs[idx]->retained_message == NULL)
                 continue;
 
+            if (request->topic_refs[idx]->retained_message->state != MSG_ACTIVE)
+                continue;
+
             struct message_delivery_state *mds;
 
             if ((mds = alloc_message_delivery_state(request->topic_refs[idx]->retained_message,
@@ -3784,6 +3803,8 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                 /* TODO ??? */
                 continue;
             }
+
+            dbg_printf("[%2d] handle_cp_subscribe: added retained message\n", client->session->id);
 
             /* TODO */
         }
@@ -4355,7 +4376,8 @@ fail:
         client->packet_buf = NULL;
     }
     if (client->new_packet) {
-        free_packet(client->new_packet, true, true);
+        if (DEC_REFCNT(&client->new_packet->refcnt) == 0)
+            free_packet(client->new_packet, true, true);
         client->new_packet = NULL;
     }
 
@@ -4672,6 +4694,9 @@ static void message_tick(void)
         if (msg->state != MSG_DEAD)
             continue;
 
+        if (msg->retain)
+            continue;
+
         free_message(msg, false);
     }
     pthread_rwlock_unlock(&global_messages_lock);
@@ -4686,7 +4711,8 @@ static void session_tick(void)
     {
         next = session->next;
 
-        if (session->state == SESSION_DELETE) {
+        if (session->state == SESSION_DELETE &&
+                GET_REFCNT(&session->refcnt) == 0) {
             free_session(session, false);
         } else if (session->client == NULL) {
             /* TODO check Session Expiry Interval */
@@ -4922,8 +4948,8 @@ int main(int argc, char *argv[])
         err(EXIT_FAILURE, "sigaction(SIGHUP)");
 
     atexit(close_all_sockets);
-    atexit(free_all_message_delivery_states);
     atexit(free_all_messages);
+    atexit(free_all_message_delivery_states);
     atexit(free_all_packets);
     atexit(free_all_sessions);
     atexit(free_all_clients);
