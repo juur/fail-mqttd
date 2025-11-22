@@ -136,3 +136,10 @@ const char *const session_state_str[] = {
     [SESSION_ACTIVE] = "ACTIVE",
     [SESSION_DELETE] = "DELETE",
 };
+
+const char *const read_state_str[] = {
+    [READ_STATE_NEW]         = "NEW",
+    [READ_STATE_HEADER]      = "HEADER",
+    [READ_STATE_MORE_HEADER] = "MORE_HEADER",
+    [READ_STATE_BODY]        = "BODY",
+};

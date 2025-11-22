@@ -252,13 +252,13 @@ struct packet {
     unsigned flags;
 
     struct property (*properties)[];
-    struct property (*will_props)[];
+    //struct property (*will_props)[];
     void *payload;
     struct message *message;
     uint16_t packet_identifier;
     uint32_t payload_len;
     unsigned property_count;
-    unsigned num_will_props;
+    //unsigned num_will_props;
     reason_code_t reason_code;
 
     alignas(16) _Atomic unsigned refcnt;
@@ -387,6 +387,7 @@ struct client {
     uint8_t connect_response_flags;
     uint8_t protocol_version;
     uint16_t keep_alive;
+    time_t tcp_accepted_at;
     time_t last_connected;
     time_t last_keep_alive;
     reason_code_t disconnect_reason;
@@ -402,6 +403,18 @@ struct client {
     unsigned rl_multi;
     unsigned rl_offset;
     uint8_t header_buffer[sizeof(struct mqtt_fixed_header) + 4];
+
+    /* Will Flag handling */
+    struct topic *will_topic;
+    struct property (*will_props)[];
+    unsigned num_will_props;
+    void *will_payload;
+    size_t will_payload_len;
+    unsigned will_payload_format;
+    unsigned will_qos;
+    bool will_retain;
+    time_t will_at;
+
 
     alignas(16) _Atomic unsigned refcnt;
 
@@ -432,5 +445,6 @@ extern const char *const message_state_str[];
 extern const char *const session_state_str[];
 extern const char *const property_str[MQTT_MAX_PROPERTY_IDENT];
 extern const char *const control_packet_str[MQTT_CP_MAX];
+extern const char *const read_state_str[];
 
 #endif

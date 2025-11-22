@@ -109,9 +109,7 @@ static unsigned num_mds      = 0;
  */
 
 static in_port_t opt_port = 1883;
-static struct in_addr opt_listen = {
-    .s_addr = INADDR_LOOPBACK
-};
+static struct in_addr opt_listen;
 
 /*
  * forward declarations
@@ -120,6 +118,7 @@ static struct in_addr opt_listen = {
 static int unsubscribe(struct subscription *sub);
 static int dequeue_message(struct message *msg);
 static void free_message(struct message *msg, bool need_lock);
+static struct topic *register_topic( const uint8_t *name);
 
 /*
  * command line stuff
@@ -420,7 +419,7 @@ static void free_message_delivery_state(struct message_delivery_state *mds)
 }
 
 [[gnu::nonnull]]
-static void free_packet(struct packet *pck, bool need_lock)
+static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock)
 {
     struct packet *tmp;
     unsigned lck;
@@ -437,7 +436,8 @@ static void free_packet(struct packet *pck, bool need_lock)
     }
 
     if (pck->owner) {
-        pthread_rwlock_wrlock(&pck->owner->active_packets_lock);
+        if (need_owner_lock)
+            pthread_rwlock_wrlock(&pck->owner->active_packets_lock);
         if (pck->owner->active_packets == pck) {
             pck->owner->active_packets = pck->next_client;
         } else for (tmp = pck->owner->active_packets; tmp; tmp = tmp->next_client)
@@ -448,7 +448,8 @@ static void free_packet(struct packet *pck, bool need_lock)
             }
         }
         pck->next_client = NULL;
-        pthread_rwlock_unlock(&pck->owner->active_packets_lock);
+        if (need_owner_lock)
+            pthread_rwlock_unlock(&pck->owner->active_packets_lock);
         DEC_REFCNT(&pck->owner->refcnt);
         pck->owner = NULL;
     }
@@ -473,12 +474,12 @@ static void free_packet(struct packet *pck, bool need_lock)
         pck->payload = NULL;
     }
 
-    if (pck->will_props) {
+    /*if (pck->will_props) {
         free_properties(pck->will_props, pck->num_will_props);
 
         pck->num_will_props = 0;
         pck->will_props = NULL;
-    }
+    }*/
 
     if (pck->properties) {
         free_properties(pck->properties, pck->property_count);
@@ -595,7 +596,7 @@ static void free_client(struct client *client, bool needs_lock)
     {
         next = p->next_client;
         DEC_REFCNT(&p->refcnt);
-        free_packet(p, true);
+        free_packet(p, true, false);
     }
     client->active_packets = NULL;
     pthread_rwlock_unlock(&client->active_packets_lock);
@@ -611,6 +612,24 @@ static void free_client(struct client *client, bool needs_lock)
 
     if (client->fd != -1)
         close_socket(&client->fd);
+
+    if (client->will_payload) {
+        free(client->will_payload);
+        client->will_payload = NULL;
+    }
+
+    client->will_payload_len = 0;
+
+    if (client->will_topic) {
+        DEC_REFCNT(&client->will_topic->refcnt);
+        client->will_topic = NULL;
+    }
+
+    if (client->will_props) {
+        free_properties(client->will_props, client->num_will_props);
+        client->will_props = NULL;
+        client->num_will_props = 0;
+    }
 
     if (client->client_id) {
         free ((void *)client->client_id);
@@ -704,8 +723,10 @@ static void free_session(struct session *session, bool need_lock)
             free (session->delivery_states);
     } pthread_rwlock_unlock(&session->delivery_states_lock);
 
-    if (session->client_id)
+    if (session->client_id) {
         free((void *)session->client_id);
+        session->client_id = NULL;
+    }
 
     pthread_rwlock_destroy(&session->subscriptions_lock);
     pthread_rwlock_destroy(&session->delivery_states_lock);
@@ -713,7 +734,7 @@ static void free_session(struct session *session, bool need_lock)
     free(session);
 }
 
-[[gnu::malloc, gnu::nonnull]]
+[[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
 static struct message_delivery_state *alloc_message_delivery_state(
         struct message *message, struct session *session)
 {
@@ -724,10 +745,10 @@ static struct message_delivery_state *alloc_message_delivery_state(
 
     INC_REFCNT(&session->refcnt);
     ret->session = session;
-    
+
     INC_REFCNT(&message->refcnt);
     ret->message = message;
-    
+
     ret->id = mds_id++;
 
     dbg_printf("     alloc_message_delivery_state: session=%u[%u] message=%u[%u]\n",
@@ -747,7 +768,7 @@ fail:
     return NULL;
 }
 
-[[gnu::malloc]]
+[[gnu::malloc, gnu::warn_unused_result, gnu::nonnull]]
 static struct subscription *alloc_subscription(struct session *session,
         struct topic *topic)
 {
@@ -757,10 +778,10 @@ static struct subscription *alloc_subscription(struct session *session,
         return NULL;
 
     ret->id = subscription_id++;
-    
+
     INC_REFCNT(&topic->refcnt);
     ret->topic = topic;
-    
+
     INC_REFCNT(&session->refcnt);
     ret->session = session;
 
@@ -770,7 +791,7 @@ static struct subscription *alloc_subscription(struct session *session,
     return ret;
 }
 
-[[gnu::malloc]]
+[[gnu::malloc, gnu::warn_unused_result]]
 static struct session *alloc_session(struct client *client)
 {
     struct session *ret;
@@ -791,7 +812,6 @@ static struct session *alloc_session(struct client *client)
         goto fail;
 
     if (client) {
-        INC_REFCNT(&client->refcnt);
         ret->client = client;
         client->session = ret;
         ret->client_id = (void *)strdup((const char *)client->client_id);
@@ -810,13 +830,15 @@ static struct session *alloc_session(struct client *client)
     return ret;
 
 fail:
+    if (ret->client_id)
+        free((void *)ret->client_id);
     if (ret)
         free(ret);
 
     return NULL;
 }
 
-[[gnu::malloc, gnu::nonnull]]
+[[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
 static struct topic *alloc_topic(const uint8_t *name)
 {
     struct topic *ret;
@@ -863,7 +885,7 @@ static struct packet *alloc_packet(struct client *owner)
         INC_REFCNT(&ret->refcnt);
 
         ret->owner = owner;
-        
+
         pthread_rwlock_wrlock(&owner->active_packets_lock);
         ret->next_client = owner->active_packets;
         owner->active_packets = ret;
@@ -885,7 +907,7 @@ static struct packet *alloc_packet(struct client *owner)
     return ret;
 }
 
-[[gnu::malloc]]
+[[gnu::malloc, gnu::warn_unused_result]]
 static struct message *alloc_message(void)
 {
     struct message *msg;
@@ -912,7 +934,7 @@ static struct message *alloc_message(void)
     return msg;
 }
 
-[[gnu::malloc]]
+[[gnu::malloc, gnu::warn_unused_result]]
 static struct client *alloc_client(void)
 {
     struct client *client;
@@ -953,6 +975,7 @@ fail:
     return NULL;
 }
 
+[[gnu::nonnull, gnu::warn_unused_result]]
 static struct session *find_session(struct client *client)
 {
     pthread_rwlock_rdlock(&global_sessions_lock);
@@ -980,7 +1003,44 @@ static struct session *find_session(struct client *client)
  * packet parsing helpers
  */
 
-[[gnu::nonnull]]
+[[gnu::warn_unused_result]]
+static bool is_malformed(reason_code_t code)
+{
+    if (code < MQTT_MALFORMED_PACKET)
+        return false;
+
+    switch (code)
+    {
+        case MQTT_MALFORMED_PACKET:
+        case MQTT_PROTOCOL_ERROR:
+        case MQTT_RECEIVE_MAXIMUM_EXCEEDED:
+        case MQTT_PACKET_TOO_LARGE:
+        case MQTT_RETAIN_NOT_SUPPORTED:
+        case MQTT_QOS_NOT_SUPPORTED:
+        case MQTT_SHARED_SUBSCRIPTIONS_NOT_SUPPORTED:
+        case MQTT_SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED:
+        case MQTT_WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int send_disconnect_if_malformed(struct client *client, reason_code_t code)
+{
+    errno = 0;
+
+    if (!is_malformed(code))
+        return 0;
+
+    client->disconnect_reason = code;
+    client->state = CS_CLOSED;
+
+    errno = EINVAL;
+    return -1;
+}
+
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int is_valid_topic_name(const uint8_t *name)
 {
     const uint8_t *ptr;
@@ -1003,7 +1063,7 @@ static int is_valid_topic_name(const uint8_t *name)
     return 0;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int is_valid_topic_filter(const uint8_t *name)
 {
     const uint8_t *ptr;
@@ -1046,7 +1106,7 @@ static int is_valid_topic_filter(const uint8_t *name)
     return 0;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int encode_var_byte(uint32_t value, uint8_t out[4])
 {
     uint8_t byte;
@@ -1063,7 +1123,7 @@ static int encode_var_byte(uint32_t value, uint8_t out[4])
     return out_len;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static uint32_t read_var_byte(const uint8_t **const ptr, size_t *bytes_left)
 {
     uint32_t value = 0;
@@ -1090,7 +1150,7 @@ static uint32_t read_var_byte(const uint8_t **const ptr, size_t *bytes_left)
     return value;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static void *read_binary(const uint8_t **const ptr, size_t *bytes_left,
         uint16_t *length)
 {
@@ -1130,7 +1190,7 @@ static void *read_binary(const uint8_t **const ptr, size_t *bytes_left,
     return blob;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static uint8_t *read_utf8(const uint8_t **const ptr, size_t *bytes_left)
 {
     uint16_t str_len;
@@ -1181,7 +1241,26 @@ fail:
     return NULL;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, maybe_unused]]
+static int get_property_value(const struct property (*props)[],
+        unsigned num_props, property_ident_t id, const struct property **out)
+{
+    errno = 0;
+
+    for (unsigned idx = 0; idx < num_props; idx++)
+    {
+        if ((*props)[idx].ident != id)
+            continue;
+
+        *out = &((*props)[idx]);
+        return 0;
+    }
+
+    errno = ESRCH;
+    return -1;
+}
+
+[[gnu::nonnull, gnu::warn_unused_result]]
 static ssize_t get_properties_size(const struct property (*props)[],
         unsigned num_props)
 {
@@ -1585,7 +1664,7 @@ static void free_all_packets(void)
 {
     dbg_printf("     free_all_packets\n");
     while (global_packet_list)
-        free_packet(global_packet_list, false);
+        free_packet(global_packet_list, false, false);
 }
 
 static void free_all_topics(void)
@@ -1617,8 +1696,33 @@ static struct topic *find_topic(const uint8_t *name)
     return NULL;
 }
 
+[[gnu::nonnull, gnu::warn_unused_result]]
+static struct topic *find_or_register_topic(const uint8_t *name)
+{
+    struct topic *topic;
+    const uint8_t *tmp_name;
 
-[[gnu::nonnull]]
+    if ((topic = find_topic(name)) == NULL) {
+        if ((tmp_name = (void *)strdup((const char *)name)) == NULL)
+            goto fail;
+
+        if ((topic = register_topic(tmp_name)) == NULL) {
+            warn("find_or_register_topic: register_topic <%s>", tmp_name);
+            goto fail;
+        }
+    }
+
+    return topic;
+
+fail:
+
+    if (tmp_name)
+        free((void *)tmp_name);
+
+    return NULL;
+}
+
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int find_subscription(struct session *session, struct topic *topic)
 {
     pthread_rwlock_rdlock(&topic->subscribers_lock);
@@ -1638,8 +1742,7 @@ static int find_subscription(struct session *session, struct topic *topic)
 }
 
 [[gnu::nonnull, gnu::warn_unused_result]]
-static struct topic *register_topic(
-        const uint8_t *name)
+static struct topic *register_topic( const uint8_t *name)
 {
     struct topic *ret;
 
@@ -1656,7 +1759,7 @@ static struct topic *register_topic(
     return ret;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int remove_delivery_state(
         struct message_delivery_state ***state_array, unsigned *array_length,
         struct message_delivery_state *rem)
@@ -1724,7 +1827,7 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int add_to_delivery_state(
         struct message_delivery_state ***state_array, unsigned *array_length,
         pthread_rwlock_t *lock, struct message_delivery_state *add)
@@ -1733,7 +1836,7 @@ static int add_to_delivery_state(
 
     const unsigned new_length = *array_length + 1;
     const size_t new_size = sizeof(struct message_delivery_state *) * new_length;
-    struct message_delivery_state **tmp;
+    struct message_delivery_state **tmp = NULL;
 
     if ((tmp = realloc(*state_array, new_size)) == NULL)
         goto fail;
@@ -1754,7 +1857,7 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int enqueue_message(struct topic *topic, struct message *msg)
 {
     struct message_delivery_state *mds;
@@ -1771,12 +1874,18 @@ static int enqueue_message(struct topic *topic, struct message *msg)
     {
         if ((*topic->subscribers)[src_idx] == NULL)
             continue;
-        found = true;
-
         struct session *session = (*topic->subscribers)[src_idx]->session;
 
         assert(session);
         assert(session->id);
+
+        /* TODO confirm we don't echo per standard? If we do, need to
+         * somehow exclude WILL messages */
+        if (session == msg->sender)
+            continue;
+
+        found = true;
+
 
         /* TODO lock the subscriber? */
 
@@ -1826,7 +1935,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
     /* TODO fail: */
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int dequeue_message(struct message *msg)
 {
     errno = 0;
@@ -1873,27 +1982,15 @@ static struct message *register_message(const uint8_t *topic_name, int format,
         bool retain)
 {
     struct topic *topic;
-    const uint8_t *tmp_name;
 
-    tmp_name = NULL;
     topic = NULL;
     errno = 0;
 
     dbg_printf("[%2d] register_message: topic=<%s> format=%u len=%u qos=%u payload=%p\n",
             sender->id, topic_name, format, len, qos, payload);
 
-    if ((topic = find_topic(topic_name)) == NULL) {
-
-        if ((tmp_name = (void *)strdup((const char *)topic_name)) == NULL)
+    if ((topic = find_or_register_topic(topic_name)) == NULL)
             goto fail;
-
-        if ((topic = register_topic(tmp_name)) == NULL) {
-            warn("register_message: register_topic <%s>", tmp_name);
-            goto fail;
-        }
-
-        tmp_name = NULL;
-    }
 
     struct message *msg;
 
@@ -1928,8 +2025,6 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     return msg;
 
 fail:
-    if (tmp_name)
-        free((void *)tmp_name);
     return NULL;
 }
 
@@ -1957,7 +2052,7 @@ fail:
 }
 
 /* TODO locking */
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int unsubscribe(struct subscription *sub)
 {
     struct subscription *(*tmp_topic)[] = NULL;
@@ -2087,7 +2182,7 @@ skip_client:
 
     DEC_REFCNT(&sub->session->refcnt);
     sub->session = NULL;
-    
+
     free_subscription(sub);
 
     pthread_rwlock_unlock(&session->subscriptions_lock);
@@ -2224,7 +2319,7 @@ fail:
  * Payload
  */
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_publish(struct packet *pkt)
 {
     ssize_t length, wr_len;
@@ -2367,11 +2462,12 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
 
     free(packet);
     client->state = CS_CLOSING;
+    client->disconnect_reason = 0;
 
     return 0;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_pingresp(struct client *client)
 {
     ssize_t length, wr_len;
@@ -2404,7 +2500,7 @@ static int send_cp_pingresp(struct client *client)
     return 0;
 }
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_connack(struct client *client, reason_code_t reason_code)
 {
     ssize_t length, wr_len;
@@ -2477,8 +2573,10 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
 
     free(packet);
 
-    if (reason_code >= MQTT_UNSPECIFIED_ERROR)
+    if (is_malformed(reason_code)) {
+        client->disconnect_reason = reason_code;
         client->state = CS_CLOSING;
+    }
 
     return 0;
 
@@ -2486,12 +2584,13 @@ fail:
     if (packet)
         free(packet);
 
-    if (reason_code >= MQTT_UNSPECIFIED_ERROR)
+    if (is_malformed(reason_code))
         client->state = CS_CLOSING;
 
     return -1;
 }
 
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_pubrec(struct client *client, uint16_t packet_id,
         reason_code_t reason_code)
 {
@@ -2500,13 +2599,6 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
     uint16_t tmp;
 
     errno = 0;
-
-    if (reason_code == MQTT_MALFORMED_PACKET ||
-            reason_code == MQTT_PROTOCOL_ERROR) {
-        /* Is this an illegal state? Should it always be DISCONNECT */
-        client->state = CS_CLOSING;
-        return 0;
-    }
 
     length = sizeof(struct mqtt_fixed_header);
     length += 1; /* Remaining Length */
@@ -2541,6 +2633,7 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
     return 0;
 }
 
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
         reason_code_t reason_code)
 {
@@ -2608,6 +2701,7 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     return 0;
 }
 
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_pubrel(struct client *client, uint16_t packet_id,
         reason_code_t reason_code)
 {
@@ -2616,12 +2710,6 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     uint16_t tmp;
 
     errno = 0;
-
-    if (reason_code == MQTT_MALFORMED_PACKET ||
-            reason_code == MQTT_PROTOCOL_ERROR) {
-        client->state = CS_CLOSING;
-        return 0;
-    }
 
     length = sizeof(struct mqtt_fixed_header);
     length += 1; /* Remaining Length */
@@ -2660,6 +2748,7 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     return 0;
 }
 
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_puback(struct client *client, uint16_t packet_id,
         reason_code_t reason_code)
 {
@@ -2668,12 +2757,6 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
     uint16_t tmp;
 
     errno = 0;
-
-    if (reason_code == MQTT_MALFORMED_PACKET ||
-            reason_code == MQTT_PROTOCOL_ERROR) {
-        client->state = CS_CLOSING;
-        return 0;
-    }
 
     length = sizeof(struct mqtt_fixed_header);
     length += 1; /* Remaining Length */
@@ -2732,7 +2815,7 @@ fail:
  *  Reason Codes[]
  */
 
-[[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_suback(struct client *client, uint16_t packet_id,
         struct topic_sub_request *request)
 {
@@ -2751,7 +2834,7 @@ static int send_cp_suback(struct client *client, uint16_t packet_id,
     length += 1 * request->num_topics; /* [5+] */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
-        return -1;
+        goto fail;
 
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_SUBACK;
     ptr++;
@@ -2768,8 +2851,8 @@ static int send_cp_suback(struct client *client, uint16_t packet_id,
 
     for (unsigned i = 0; i < request->num_topics; i++) {
         *ptr = request->response_codes[i]; /* TODO which QoS? */
-        if (*ptr == MQTT_MALFORMED_PACKET || *ptr == MQTT_PROTOCOL_ERROR)
-            client->state = CS_CLOSING;
+        if (send_disconnect_if_malformed(client, (reason_code_t)*ptr))
+            goto fail;
         ptr++;
     }
 
@@ -2793,6 +2876,11 @@ static int send_cp_suback(struct client *client, uint16_t packet_id,
     pthread_rwlock_unlock(&client->active_packets_lock);
 
     return 0;
+
+fail:
+    if (packet)
+        free(packet);
+    return -1;
 }
 
 static int mark_one_mds(struct message_delivery_state *mds,
@@ -2845,7 +2933,7 @@ fail:
     return -1;
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull, gnu::warn_unused_result]]
 static int mark_message(control_packet_t type, uint16_t packet_identifier,
         reason_code_t client_reason, struct session *session, role_t role)
 {
@@ -2990,16 +3078,11 @@ skip_props:
     return 0;
 
 fail:
-    if (reason_code == MQTT_MALFORMED_PACKET ||
-            reason_code == MQTT_PROTOCOL_ERROR) {
-        errno = EINVAL;
-        client->state = CS_CLOSING;
-    }
-
+    send_disconnect_if_malformed(client, reason_code);
     return -1;
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static int handle_cp_puback(struct client *client, struct packet *packet,
         const void *remain)
 {
@@ -3064,13 +3147,8 @@ skip_property_length:
     return 0;
 
 fail:
-    if (reason_code == MQTT_PROTOCOL_ERROR ||
-            reason_code == MQTT_MALFORMED_PACKET) {
-        errno = EINVAL;
-        client->state = CS_CLOSING;
-        client->disconnect_reason = reason_code;
-    }
-
+    send_disconnect_if_malformed(client, reason_code);
+    /* TODO what if the reason_code is >0x80 but not malformed? */
     return -1;
 }
 
@@ -3138,13 +3216,8 @@ skip_props:
     return 0;
 
 fail:
-    if (reason_code == MQTT_MALFORMED_PACKET ||
-            reason_code == MQTT_PROTOCOL_ERROR) {
-        errno = EINVAL;
-        client->state = CS_CLOSING;
-        client->disconnect_reason = reason_code;
-    }
-
+    send_disconnect_if_malformed(client, reason_code);
+    /* TODO what if reason_code is not malformed ? */
     return -1;
 }
 
@@ -3202,35 +3275,36 @@ skip_props:
 
     if (mark_message(MQTT_CP_PUBREC, packet_identifier, pubrec_reason_code,
                 client->session, ROLE_RECV) == -1) {
-        if (errno == ENOENT)
+        if (errno == ENOENT) {
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
-        else
+            goto normal;
+        } else
             reason_code = MQTT_UNSPECIFIED_ERROR;
         goto fail;
     }
 
-    if (send_cp_pubrel(client, packet_identifier, MQTT_SUCCESS) == -1)
-        goto fail;
+    /* TODO what if the above succeeds, but the below fails? */
 
     if (mark_message(MQTT_CP_PUBREL, packet_identifier, MQTT_SUCCESS,
                 client->session, ROLE_RECV) == -1) {
-        if (errno == ENOENT)
+        if (errno == ENOENT) {
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
-        else
+            goto normal; /* PUBREL only supports this error */
+        } else
             reason_code = MQTT_UNSPECIFIED_ERROR;
         goto fail;
     }
+
+    reason_code = MQTT_SUCCESS;
+
+normal:
+    if (send_cp_pubrel(client, packet_identifier, reason_code) == -1)
+        goto fail;
 
     return 0;
 
 fail:
-    if (reason_code == MQTT_MALFORMED_PACKET ||
-            reason_code == MQTT_PROTOCOL_ERROR) {
-        errno = EINVAL;
-        client->state = CS_CLOSING;
-        client->disconnect_reason = reason_code;
-    }
-
+    send_disconnect_if_malformed(client, reason_code);
     return -1;
 }
 
@@ -3325,14 +3399,18 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         msg->sender_status.released_at = now;
         msg->sender_status.completed_at = now;
     } if (qos == 1) {
-        if (send_cp_puback(client, packet_identifier, MQTT_SUCCESS) == -1)
+        if (send_cp_puback(client, packet_identifier, MQTT_SUCCESS) == -1) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
+        }
         msg->sender_status.acknowledged_at = now;
         msg->sender_status.released_at = now;
         msg->sender_status.completed_at = now;
     } else if (qos == 2) {
-        if (send_cp_pubrec(client, packet_identifier, MQTT_SUCCESS) == -1)
+        if (send_cp_pubrec(client, packet_identifier, MQTT_SUCCESS) == -1) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
+        }
         msg->sender_status.acknowledged_at = now;
     }
 
@@ -3349,14 +3427,15 @@ fail:
         packet->payload_len = 0;
     }
 
-    if (qos == 0 || reason_code == MQTT_MALFORMED_PACKET ||
-            reason_code == MQTT_PROTOCOL_ERROR) {
-        client->state = CS_CLOSING;
-        client->disconnect_reason = reason_code;
-    } else if (qos == 1)
-        send_cp_puback(client, packet_identifier, reason_code);
-    else if (qos == 2)
-        send_cp_pubrec(client, packet_identifier, reason_code);
+    if (send_disconnect_if_malformed(client, reason_code)) {
+        return -1;
+    } else if (qos == 1) {
+        if (send_cp_puback(client, packet_identifier, reason_code) == -1)
+            return -1;
+    } else if (qos == 2) {
+        if (send_cp_pubrec(client, packet_identifier, reason_code) == -1)
+            return -1;
+    }
 
     return -1;
 }
@@ -3368,10 +3447,8 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
     reason_code_t reason_code = MQTT_MALFORMED_PACKET;
-    struct topic_sub_request *request;
+    struct topic_sub_request *request = NULL;
     void *tmp;
-
-    return 0;
 
     if (packet->flags != MQTT_FLAG_UNSUBSCRIBE)
         goto fail;
@@ -3401,6 +3478,8 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
     if ((request = calloc(1, sizeof(struct topic_sub_request))) == NULL)
         goto fail;
 
+    /* TODO: this kinda overlaps with handle_cp_subscribe,
+     * is there anyway to merge whole/part? */
     while (bytes_left)
     {
         if (bytes_left < 3)
@@ -3412,6 +3491,13 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
             goto fail;
         }
         request->topics = tmp;
+
+        const size_t u8_size = sizeof(uint8_t) * (request->num_topics + 1);
+        if ((tmp = realloc(request->response_codes, u8_size)) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
+            goto fail;
+        }
+        request->response_codes = tmp;
 
         if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
@@ -3435,10 +3521,7 @@ fail:
     if (request)
         free_topic_subs(request);
 
-    if (reason_code == MQTT_PROTOCOL_ERROR || reason_code == MQTT_MALFORMED_PACKET)
-        client->state = CS_CLOSING;
-    else
-        send_cp_disconnect(client, reason_code);
+    send_disconnect_if_malformed(client, reason_code);
 
     return -1;
 }
@@ -3648,6 +3731,25 @@ skip:
     if (bytes_left)
         goto fail;
 
+    if (disconnect_reason == 0) {
+        if (client->will_retain) {
+            client->will_retain = false;
+            if (client->will_payload) {
+                free(client->will_payload);
+                client->will_payload = NULL;
+            }
+            if (client->will_topic) {
+                DEC_REFCNT(&client->will_topic->refcnt);
+                client->will_topic = NULL;
+            }
+            if (client->will_props) {
+                free_properties(client->will_props, client->num_will_props);
+                client->num_will_props = 0;
+                client->will_props = NULL;
+            }
+        }
+    }
+
     client->state = CS_CLOSING;
     return 0;
 
@@ -3665,7 +3767,7 @@ static int handle_cp_pingreq(struct client *client,
 
     if (packet->remaining_length > 0) {
         errno = EINVAL;
-        send_cp_disconnect(client, MQTT_MALFORMED_PACKET);
+        send_disconnect_if_malformed(client, MQTT_MALFORMED_PACKET);
         return -1;
     }
 
@@ -3678,7 +3780,11 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    reason_code_t response_code = MQTT_UNSPECIFIED_ERROR;
+    reason_code_t reason_code = MQTT_MALFORMED_PACKET;
+    uint16_t connect_header_length, keep_alive;
+    uint8_t protocol_version, connect_flags;
+    uint8_t protocol_name[4];
+
     uint8_t *will_topic = NULL;
     uint8_t will_qos = 0;
     void *will_payload = NULL;
@@ -3687,14 +3793,9 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     uint8_t payload_format = 0;
     struct property (*will_props)[] = NULL;
     unsigned num_will_props = 0;
-    uint16_t connect_header_length, keep_alive;
-    uint8_t protocol_version, connect_flags;
-    uint8_t protocol_name[4];
 
-    if (bytes_left < 6+1+1+2) {
-        response_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left < 2+4+1+1+2) /* Connect Header, Protocol Name, Protocol Version, Connect Flags, Keep Alive */
         goto fail;
-    }
 
     memcpy(&connect_header_length, ptr, 2);
     connect_header_length = ntohs(connect_header_length);
@@ -3716,92 +3817,65 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     ptr += 2;
     bytes_left -= 2;
 
-    if (memcmp(protocol_name, "MQTT", 4)) {
-        response_code = MQTT_UNSUPPORTED_PROTOCOL_VERSION;
+    if (memcmp(protocol_name, "MQTT", 4))
         goto fail;
-    }
 
-    if (connect_flags & MQTT_CONNECT_FLAG_RESERVED) {
-        response_code = MQTT_MALFORMED_PACKET;
+    if (connect_flags & MQTT_CONNECT_FLAG_RESERVED)
         goto fail;
-    }
 
     if (protocol_version != 5) {
-        response_code = MQTT_UNSUPPORTED_PROTOCOL_VERSION;
+        reason_code = MQTT_UNSUPPORTED_PROTOCOL_VERSION;
         goto fail;
     }
 
-    /* Properties Length (0) + ClientID (1+1) */
-    if (bytes_left < (1 + 2)) {
-        response_code = MQTT_MALFORMED_PACKET;
+    /* Properties Length (1) + ClientID (2) */
+    if (bytes_left < 1+2)
         goto fail;
-    }
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
-                &packet->property_count, MQTT_CP_CONNECT) == -1) {
-        response_code = MQTT_MALFORMED_PACKET;
+                &packet->property_count, MQTT_CP_CONNECT) == -1)
         goto fail;
-    }
 
     if (client->client_id != NULL) {
         errno = EEXIST;
-        response_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
+        reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
         warnx("client_id already set");
         goto fail;
     }
 
-    if ((client->client_id = read_utf8(&ptr, &bytes_left)) == NULL) {
-        response_code = MQTT_MALFORMED_PACKET;
-        warn("read_utf8");
+    if ((client->client_id = read_utf8(&ptr, &bytes_left)) == NULL)
         goto fail;
-    }
     dbg_printf("[  ] handle_cp_connect: client_id=<%s> ",
             (char *)client->client_id);
 
-    if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
+    if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START)
         dbg_printf("clean_start ");
-    }
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
         dbg_printf("will_properties ");
         if (parse_properties(&ptr, &bytes_left, &will_props,
-                    &num_will_props, -1) == -1) {
-            response_code = MQTT_MALFORMED_PACKET;
-            warn("handle_cp_connect: parse_properties(will_props)");
+                    &num_will_props, -1) == -1)
             goto fail;
-        }
-        dbg_printf("[%d props] ", num_will_props);
 
-        dbg_printf("will_topic ");
-
+        dbg_printf("[%d props] will_topic ", num_will_props);
+        
         will_topic = read_utf8(&ptr, &bytes_left);
-        if (will_topic == NULL) {
-            response_code = MQTT_MALFORMED_PACKET;
-            warn("handle_cp_connect: will_topic");
+        if (will_topic == NULL)
             goto fail;
-        }
-        dbg_printf("<%s> ", (char *)will_topic);
 
-        dbg_printf("will_payload ");
 
         if ((will_payload = read_binary(&ptr, &bytes_left,
-                        &will_payload_len)) == NULL) {
-            response_code = MQTT_MALFORMED_PACKET;
-            warn("handle_cp_connect: read_binary(will_payload)");
+                        &will_payload_len)) == NULL)
             goto fail;
-        }
+        
         dbg_printf("[%ub] ", will_payload_len);
-        packet->payload = will_payload;
-        packet->payload_len = will_payload_len;
-        packet->will_props = will_props;
-        packet->num_will_props = num_will_props;
         will_retain = (connect_flags & MQTT_CONNECT_FLAG_WILL_RETAIN);
     }
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_RETAIN) {
         dbg_printf("will_retain ");
         if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) == 0) {
-            response_code = MQTT_PROTOCOL_ERROR;
+            reason_code = MQTT_PROTOCOL_ERROR;
             warn("handle_cp_connect: Will Retain set without Will Flag");
             goto fail;
         }
@@ -3809,51 +3883,45 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 
     if (connect_flags & MQTT_CONNECT_FLAG_USERNAME) {
         dbg_printf("username ");
-        if ((client->username = read_utf8(&ptr, &bytes_left)) == NULL) {
-            response_code = MQTT_MALFORMED_PACKET;
-            warn("read_utf8(username)");
+        if ((client->username = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
-        }
+
         dbg_printf("<%s> ", (char *)client->username);
     }
 
     if (connect_flags & MQTT_CONNECT_FLAG_PASSWORD) {
         dbg_printf("password ");
         if ((client->password = read_binary(&ptr, &bytes_left,
-                        &client->password_len)) == NULL) {
-            response_code = MQTT_MALFORMED_PACKET;
-            warn("read_utf8(password)");
+                        &client->password_len)) == NULL)
             goto fail;
-        }
+
         dbg_printf("[%ub] ", client->password_len);
     }
 
-    if (bytes_left) {
-        response_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left)
         goto fail;
-    }
 
     will_qos = GET_WILL_QOS(connect_flags);
 
     if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) == 0 && will_qos != 0) {
-        response_code = MQTT_PROTOCOL_ERROR;
+        reason_code = MQTT_PROTOCOL_ERROR;
         goto fail;
     }
 
-    if (will_qos > 2) {
-        response_code = MQTT_MALFORMED_PACKET;
+    if (will_qos > 2)
         goto fail;
-    }
 
-    dbg_printf("QoS [%u]\n", will_qos);
+    dbg_printf("will_qos [%u]\n", will_qos);
 
     client->connect_flags = connect_flags;
     client->protocol_version = protocol_version;
     client->keep_alive = keep_alive;
 
     if ((client->session = find_session(client)) == NULL) {
+        /* New Session */
 create_new_session:
         if ((client->session = alloc_session(client)) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
         }
         dbg_printf("[%2d] handle_cp_connect: new_session\n", client->session->id);
@@ -3872,34 +3940,38 @@ create_new_session:
                 client->session->id);
     }
     INC_REFCNT(&client->session->refcnt);
+    client->session->last_connected = time(0);
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
-        /* FIXME this is supposed to trigger on disconnect/timeout or something ?? */
-        //dbg_printf("handle_cp_connect: creating a message\n");
-        if ((register_message(will_topic, payload_format, will_payload_len,
-                        will_payload, will_qos, client->session, will_retain)) == NULL) {
-            warn("handle_cp_connect: register_message");
-            free(will_topic);
-            will_topic = NULL;
-            will_payload = NULL; /* register_message frees in error */
+        if ((client->will_topic = find_or_register_topic(will_topic)) == NULL) {
+            errno = EINVAL;
+            reason_code = MQTT_TOPIC_NAME_INVALID;
             goto fail;
         }
-        free(will_topic);
-        will_topic = NULL;
-        packet->payload = NULL;
-        packet->payload_len = 0;
+        free(will_topic); /* find_or_register_topic duplicates */
+        INC_REFCNT(&client->will_topic->refcnt);
+
+        client->will_retain = will_retain;
+        client->will_payload = will_payload;
+        client->will_payload_len = will_payload_len;
+        client->will_qos = will_qos;
+        client->will_payload_format = payload_format;
+        client->will_props = will_props;
+        client->num_will_props = num_will_props;
     }
 
-    send_cp_connack(client, MQTT_SUCCESS); /* TODO handle failure */
+    if (send_cp_connack(client, MQTT_SUCCESS) == -1) {
+        reason_code = MQTT_UNSPECIFIED_ERROR;
+        goto fail;
+    }
     return 0;
 
 fail:
-    if (response_code == MQTT_MALFORMED_PACKET ||
-            response_code == MQTT_PROTOCOL_ERROR) {
+    if (send_cp_connack(client, reason_code) == -1) {
         client->state = CS_CLOSING;
-        client->disconnect_reason = response_code;
-    } else
-        send_cp_connack(client, response_code);
+        if (client->disconnect_reason == 0)
+            client->disconnect_reason = MQTT_UNSPECIFIED_ERROR;
+    }
 
     if (will_topic)
         free(will_topic);
@@ -3907,6 +3979,56 @@ fail:
         free_properties(will_props, num_will_props);
     if (will_payload)
         free(will_payload);
+    return -1;
+}
+
+[[gnu::nonnull]]
+static int handle_cp_auth(struct client *client, struct packet *packet,
+        const void *remain)
+{
+    const uint8_t *ptr = remain;
+    size_t bytes_left = packet->remaining_length;
+    reason_code_t reason_code = MQTT_SUCCESS;
+    reason_code_t auth_reason_code = MQTT_SUCCESS;
+
+    if (bytes_left == 0)
+        goto skip_props;
+
+    if (bytes_left < 2) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+
+    auth_reason_code = *ptr++;
+    bytes_left--;
+
+    dbg_printf("[%2d] handle_cp_auth: auth_reason_code=%u\n",
+            client->session ? client->session->id : (id_t)-1,
+            auth_reason_code);
+
+    if (parse_properties(&ptr, &bytes_left, &packet->properties,
+                &packet->property_count, MQTT_CP_AUTH) == -1) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+skip_props:
+
+    if (bytes_left) {
+        reason_code = MQTT_MALFORMED_PACKET;
+        goto fail;
+    }
+
+    reason_code = MQTT_PROTOCOL_ERROR;
+    goto fail;
+
+    /* TODO */
+
+    return 0;
+
+fail:
+    if (send_disconnect_if_malformed(client, reason_code))
+        return -1;
+
     return -1;
 }
 
@@ -3925,6 +4047,7 @@ static const control_func_t control_functions[MQTT_CP_MAX] = {
     [MQTT_CP_CONNECT]     = handle_cp_connect,
     [MQTT_CP_PINGREQ]     = handle_cp_pingreq,
     [MQTT_CP_DISCONNECT]  = handle_cp_disconnect,
+    [MQTT_CP_AUTH]        = handle_cp_auth,
 };
 
 /*
@@ -3961,7 +4084,7 @@ static int parse_incoming(struct client *client)
             if (client->new_packet &&
                     client->new_packet->packet_identifier == 0) {
                 if (GET_REFCNT(&client->new_packet->refcnt) == 0)
-                    free_packet(client->new_packet, true);
+                    free_packet(client->new_packet, true, true);
             }
             client->new_packet = NULL;
 
@@ -3982,11 +4105,13 @@ more:
                 goto fail;
             } else if (rd_len == 0) {
 eof:
+                dbg_printf("[%2d] parse_incoming: %s EOF on client=%u <%s>\n",
+                        client->session ? client->session->id : (id_t)-1,
+                        read_state_str[client->parse_state],
+                        client->id, (char *)client->client_id);
                 /* EOF - shared between states */
                 client->state = CS_DISCONNECTED;
                 close_socket(&client->fd);
-                if (client->session)
-                    client->session->last_connected = time(0);
                 client->parse_state = READ_STATE_NEW;
                 return 0;
             } else if (rd_len < client->read_need) {
@@ -4100,6 +4225,11 @@ readbody:
 exec_control:
             client->parse_state = READ_STATE_NEW;
 
+            if (client->session == NULL && client->new_packet->type != MQTT_CP_CONNECT) {
+                warnx("parse_incoming: first packet is not CONNECT");
+                goto fail;
+            }
+
             dbg_printf("[%2d] parse_incoming: client=%u control_function\n",
                     client->session ? client->session->id : (id_t)-1,
                     client->id);
@@ -4121,7 +4251,7 @@ fail:
         client->packet_buf = NULL;
     }
     if (client->new_packet) {
-        free_packet(client->new_packet, true);
+        free_packet(client->new_packet, true, true);
         client->new_packet = NULL;
     }
 
@@ -4136,6 +4266,9 @@ fail:
 
 static void client_tick(void)
 {
+    const struct property *prop;
+    uint32_t will_delay = 0;
+
     pthread_rwlock_wrlock(&global_clients_lock);
     for (struct client *clnt = global_client_list, *next; clnt; clnt = next)
     {
@@ -4144,22 +4277,80 @@ static void client_tick(void)
         switch (clnt->state)
         {
             case CS_ACTIVE:
+                if (clnt->session == NULL && clnt->tcp_accepted_at != 0
+                        && (time(0) - clnt->tcp_accepted_at) > 5) {
+                    warnx("client_tick: closing idle link without CONNECTION");
+                    goto force_close;
+                }
+                break;
+
             case CS_NEW:
-                continue;
+                break;
 
             case CS_DISCONNECTED:
                 if (clnt->session) {
-                    DEC_REFCNT(&clnt->refcnt);
+                    if (clnt->will_topic) {
+                        struct message *msg;
+                        time_t now = time(0);
+
+                        dbg_printf("[%2d] client_tick: handling WILL\n",
+                                clnt->session->id);
+
+                        if (clnt->will_props)
+                            if (get_property_value(clnt->will_props,
+                                        clnt->num_will_props,
+                                        MQTT_PROP_WILL_DELAY_INTERVAL,
+                                        &prop) != -1)
+                                will_delay = prop->byte4;
+                        clnt->will_at = now + will_delay;
+
+                        /* TODO handle a) Will Delay Interval or b) Session end is the trigger */
+                        if ((msg = register_message(clnt->will_topic->name,
+                                    clnt->will_payload_format,
+                                    clnt->will_payload_len,
+                                    clnt->will_payload,
+                                    clnt->will_qos,
+                                    clnt->session, clnt->will_retain)) == NULL) {
+                            warn("client_tick: register_message(will)");
+                            if (clnt->will_payload)
+                                free(clnt->will_payload);
+                        }
+                        msg->sender_status.completed_at = now;
+                        msg->sender_status.last_sent = now;
+                        msg->sender_status.accepted_at = now;
+                        msg->sender_status.released_at = now;
+
+                        clnt->will_payload = NULL;
+                        clnt->will_retain = false;
+
+                        DEC_REFCNT(&clnt->will_topic->refcnt);
+                        clnt->will_topic = NULL;
+                    }
+
+                    clnt->session->last_connected = time(0);
                     clnt->session->client = NULL;
+                    DEC_REFCNT(&clnt->session->refcnt);
                     clnt->session = NULL;
                 }
-                clnt->state = CS_CLOSED;
-                continue;
+                goto skip_send_disconnect;
 
             case CS_CLOSING:
-                if (clnt->disconnect_reason)
+                if (clnt->disconnect_reason) {
                     send_cp_disconnect(clnt, clnt->disconnect_reason);
+                    clnt->disconnect_reason = 0;
+                }
+
+skip_send_disconnect:
+                /* Common for CS_DISCONNECTED */
+                if (clnt->session && clnt->session->last_connected == 0)
+                    clnt->session->last_connected = time(0);
+
+force_close:
+                /* Common for CS_ACTIVE with zero MQTT_CP_CONNECT */
+                if (clnt->fd != -1)
+                    close_socket(&clnt->fd);
                 clnt->state = CS_CLOSED;
+
                 break;
 
             case CS_CLOSED:
@@ -4169,6 +4360,8 @@ static void client_tick(void)
     }
     pthread_rwlock_unlock(&global_clients_lock);
 }
+
+/* Topics */
 
 static void tick_msg(struct message *msg)
 {
@@ -4182,13 +4375,12 @@ static void tick_msg(struct message *msg)
     time_t now = time(0);
 
     dbg_printf(NGRN "     tick_msg: id=%u sender.id=%u #mds=%u"CRESET"\n",
-            msg->id,
-            msg->sender->id,
-            msg->num_message_delivery_states
-            );
+            msg->id, msg->sender->id,
+            msg->num_message_delivery_states);
 
     pthread_rwlock_wrlock(&msg->delivery_states_lock);
-    for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++) {
+    for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
+    {
         mds = msg->delivery_states[idx];
 
         if (mds == NULL)
@@ -4231,9 +4423,10 @@ static void tick_msg(struct message *msg)
         packet->flags |= MQTT_FLAG_PUBLISH_QOS(msg->qos);
 
         if (msg->qos) {
-            if (mds->packet_identifier == 0) {
-                mds->packet_identifier = ++packet->owner->last_packet_id;
-            }
+            /* Allocate a packet_identifier if this is the first time */
+            if (mds->packet_identifier == 0)
+                while (mds->packet_identifier == 0) /* wrap around handling */
+                    mds->packet_identifier = ++packet->owner->last_packet_id;
             packet->packet_identifier = mds->packet_identifier;
 
             /* acknowledged_at is 0, so this must be a retry? */
@@ -4250,7 +4443,7 @@ static void tick_msg(struct message *msg)
             mds->last_sent = 0;
             warn("tick_msg: unable to send_cp_publish");
             DEC_REFCNT(&packet->refcnt);
-            free_packet(packet, true); /* Anything else? */
+            free_packet(packet, true, true); /* Anything else? */
             continue;
         }
 
@@ -4262,7 +4455,7 @@ static void tick_msg(struct message *msg)
         }
 
         DEC_REFCNT(&packet->refcnt);
-        free_packet(packet, true);
+        free_packet(packet, true, true);
         /* TODO async END */
     }
 
@@ -4301,18 +4494,20 @@ again:
                     mds->message ? mds->message->id : 0,
                     mds->message ? mds->message->refcnt : 0);
 
-            remove_delivery_state(&msg->delivery_states,
-                    &msg->num_message_delivery_states, mds);
-            
+            if (remove_delivery_state(&msg->delivery_states,
+                    &msg->num_message_delivery_states, mds) == -1)
+                warn("tick_msg: remove_delivery_state(message)");
+
             DEC_REFCNT(&mds->message->refcnt);
             mds->message = NULL;
 
             if (mds->session) {
                 pthread_rwlock_wrlock(&mds->session->delivery_states_lock);
-                remove_delivery_state(&mds->session->delivery_states,
-                        &mds->session->num_message_delivery_states, mds);
+                if (remove_delivery_state(&mds->session->delivery_states,
+                        &mds->session->num_message_delivery_states, mds) == -1)
+                    warn("tick_msg: remove_delivery_state(session)");
                 pthread_rwlock_unlock(&mds->session->delivery_states_lock);
-                
+
                 DEC_REFCNT(&mds->session->refcnt);
                 mds->session = NULL;
             }
@@ -4332,8 +4527,6 @@ again:
     }
     pthread_rwlock_unlock(&msg->delivery_states_lock);
 }
-
-/* Topics */
 
 static void topic_tick(void)
 {
@@ -4389,8 +4582,11 @@ static void session_tick(void)
     {
         next = session->next;
 
-        if (session->state == SESSION_DELETE)
+        if (session->state == SESSION_DELETE) {
             free_session(session, false);
+        } else if (session->client == NULL) {
+            /* TODO check Session Expiry Interval */
+        }
     }
     pthread_rwlock_unlock(&global_sessions_lock);
 }
@@ -4404,7 +4600,7 @@ static void packet_tick(void)
         next = pkt->next;
 
         if (GET_REFCNT(&pkt->refcnt) == 0)
-            free_packet(pkt, false);
+            free_packet(pkt, false, true);
     }
 
     pthread_rwlock_unlock(&global_packets_lock);
@@ -4520,6 +4716,7 @@ shit_fd:
 
             new_client->fd = child_fd;
             new_client->state = CS_ACTIVE;
+            new_client->tcp_accepted_at = time(0);
             new_client->remote_port = ntohs(sin_client.sin_port);
             new_client->remote_addr = ntohl(sin_client.sin_addr.s_addr);
 
@@ -4531,29 +4728,29 @@ shit_fd:
         if (FD_ISSET(mother_fd, &fds_exc))
             warnx("main_loop: mother_fd is in fds_exc??");
 
-        pthread_rwlock_rdlock(&global_clients_lock); {
-            for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
-            {
-                if (clnt->state != CS_ACTIVE)
-                    continue;
+        pthread_rwlock_rdlock(&global_clients_lock);
+        for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
+        {
+            if (clnt->state != CS_ACTIVE)
+                continue;
 
-                if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_in)) {
-                    if (parse_incoming(clnt) == -1) {
-                        /* TODO do something? */ ;
-                    }
-                }
-
-                if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_out)) {
-                    /* socket is writable without blocking [ish] */
-                }
-
-                if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_exc)) {
-                    dbg_printf("     main_loop exception event on %p[%d]\n",
-                            (void *)clnt, clnt->fd);
-                    /* TODO close? */
+            if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_in)) {
+                if (parse_incoming(clnt) == -1) {
+                    /* TODO do something? */ ;
                 }
             }
-        } pthread_rwlock_unlock(&global_clients_lock);
+
+            if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_out)) {
+                /* socket is writable without blocking [ish] */
+            }
+
+            if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_exc)) {
+                dbg_printf("     main_loop exception event on %p[%d]\n",
+                        (void *)clnt, clnt->fd);
+                /* TODO close? */
+            }
+        }
+        pthread_rwlock_unlock(&global_clients_lock);
 
         tick();
     }
@@ -4567,6 +4764,8 @@ shit_fd:
 
 int main(int argc, char *argv[])
 {
+    opt_listen.s_addr = htonl(INADDR_LOOPBACK);
+
     {
         int opt;
         while ((opt = getopt(argc, argv, "hVp:H:")) != -1)
@@ -4664,7 +4863,7 @@ int main(int argc, char *argv[])
 
     sin.sin_family = AF_INET;
     sin.sin_port = htons(opt_port);
-    sin.sin_addr.s_addr = htonl(opt_listen.s_addr);
+    sin.sin_addr.s_addr = opt_listen.s_addr;
 
     char bind_addr[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &sin.sin_addr, bind_addr, sizeof(bind_addr));
