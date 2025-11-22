@@ -119,6 +119,10 @@ static int unsubscribe(struct subscription *sub);
 static int dequeue_message(struct message *msg);
 static void free_message(struct message *msg, bool need_lock);
 static struct topic *register_topic( const uint8_t *name);
+static int remove_delivery_state(
+        struct message_delivery_state ***state_array, unsigned *array_length,
+        struct message_delivery_state *rem);
+static void free_message_delivery_state(struct message_delivery_state *mds);
 
 /*
  * command line stuff
@@ -335,12 +339,41 @@ static void free_topic(struct topic *topic)
     pthread_rwlock_unlock(&topic->pending_queue_lock);
 
     if (topic->retained_message) {
-        DEC_REFCNT(&topic->retained_message->refcnt);
-        if (GET_REFCNT(&topic->retained_message->refcnt) == 0)
-            free_message(topic->retained_message, true);
+        dbg_printf("     free_topic: freeing retained_message\n");
+        struct message *msg = topic->retained_message;
+        struct message_delivery_state *mds;
+
+        pthread_rwlock_wrlock(&msg->delivery_states_lock);
+        while (msg->num_message_delivery_states && msg->delivery_states)
+        {
+            mds = msg->delivery_states[0];
+            if (remove_delivery_state(&msg->delivery_states,
+                    &msg->num_message_delivery_states, mds) == -1)
+                warn("free_topic: remove_delivery_state(message)");
+
+            DEC_REFCNT(&msg->refcnt);
+            mds->message = NULL;
+
+            if (mds->session) {
+                pthread_rwlock_wrlock(&mds->session->delivery_states_lock);
+                if (remove_delivery_state(&mds->session->delivery_states,
+                            &mds->session->num_message_delivery_states, mds) == -1)
+                    warn("free_topic: remove_delivery_state(session)");
+                pthread_rwlock_unlock(&mds->session->delivery_states_lock);
+                DEC_REFCNT(&mds->session->refcnt);
+                mds->session = NULL;
+            }
+
+            free_message_delivery_state(mds);
+        }
+        pthread_rwlock_unlock(&msg->delivery_states_lock);
+
+        DEC_REFCNT(&msg->refcnt);
+        if (GET_REFCNT(&msg->refcnt) == 0)
+            free_message(msg, true);
         else
             warn("free_topic: can't free retained_message, refcnt is %u\n",
-                    GET_REFCNT(&topic->retained_message->refcnt));
+                    GET_REFCNT(&msg->refcnt));
         topic->retained_message = NULL;
     }
 
@@ -1994,8 +2027,10 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     topic = NULL;
     errno = 0;
 
-    dbg_printf("[%2d] register_message: topic=<%s> format=%u len=%u qos=%u payload=%p\n",
-            sender->id, topic_name, format, len, qos, payload);
+    dbg_printf("[%2d] register_message: topic=<%s> format=%u len=%u qos=%u %spayload=%p\n",
+            sender->id, topic_name, format, len, qos, 
+            retain ? BWHT "retain" CRESET " " : "",
+            payload);
 
     if ((topic = find_or_register_topic(topic_name)) == NULL)
             goto fail;
@@ -2014,14 +2049,24 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     msg->retain = retain;
 
     if (retain) {
-        INC_REFCNT(&topic->refcnt);
-
         if (topic->retained_message) {
             DEC_REFCNT(&topic->retained_message->refcnt);
             DEC_REFCNT(&topic->refcnt);
             topic->retained_message->state = MSG_DEAD;
         }
+
+        /* [MQTT-3.3.1-6] and [MQTT-3.3.1-7] */
+        if (msg->payload_len == 0) {
+            msg->state = MSG_DEAD;
+            return msg;
+        }
+
+        INC_REFCNT(&topic->refcnt);
         topic->retained_message = msg;
+        msg->topic = topic;
+        dbg_printf("     register_message: set retained_message on topic <%s>\n",
+                (char *)topic->name);
+        INC_REFCNT(&msg->refcnt);
         goto skip_enqueue;
     }
 
@@ -2564,7 +2609,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     const struct property props[] = {
         { .ident = MQTT_PROP_MAXIMUM_PACKET_SIZE               , .byte4 = MAX_PACKET_LENGTH } ,
         { .ident = MQTT_PROP_RECEIVE_MAXIMUM                   , .byte2 = MAX_RECEIVE_PUBS  } ,
-        { .ident = MQTT_PROP_RETAIN_AVAILABLE                  , .byte  = 0                 } ,
+        { .ident = MQTT_PROP_RETAIN_AVAILABLE                  , .byte  = 1                 } ,
         { .ident = MQTT_PROP_WILDCARD_SUBSCRIPTION_AVAILABLE   , .byte  = 0                 } ,
         { .ident = MQTT_PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE , .byte  = 0                 } ,
         { .ident = MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE     , .byte  = 0                 } ,
@@ -3781,17 +3826,27 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
             if (request->topic_refs[idx] == NULL)
                 continue;
 
-            if (request->topic_refs[idx]->retained_message == NULL)
+            struct message *msg;
+
+            if ((msg = request->topic_refs[idx]->retained_message) == NULL)
                 continue;
 
-            if (request->topic_refs[idx]->retained_message->state != MSG_ACTIVE)
+            if (msg->state != MSG_ACTIVE)
                 continue;
 
             struct message_delivery_state *mds;
 
-            if ((mds = alloc_message_delivery_state(request->topic_refs[idx]->retained_message,
-                            client->session)) == NULL) {
+            if ((mds = alloc_message_delivery_state(msg, client->session)) == NULL) {
                 /* TODO ??? */
+                continue;
+            }
+
+            if (add_to_delivery_state(&msg->delivery_states,
+                        &msg->num_message_delivery_states,
+                        &msg->delivery_states_lock,
+                        mds) == -1) {
+                warn("handle_cp_subscribe: retain: add_to_delivery_state(msg)");
+                free_message_delivery_state(mds);
                 continue;
             }
 
@@ -3799,13 +3854,16 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                         &client->session->num_message_delivery_states,
                         &client->session->delivery_states_lock,
                         mds) == -1) {
+                warn("handle_cp_subscribe: retain: add_to_delivery_state(session)");
                 free_message_delivery_state(mds);
                 /* TODO ??? */
                 continue;
             }
 
             dbg_printf("[%2d] handle_cp_subscribe: added retained message\n", client->session->id);
-
+            msg->next_queue = msg->topic->pending_queue;
+            msg->topic->pending_queue = msg;
+            
             /* TODO */
         }
     }
@@ -4298,7 +4356,7 @@ lenread:
                     goto fail;
                 }
 
-                dbg_printf("[%2d] parse_incoming: client=%u type=%u <%s> flags=%u remaining_length=%u\n",
+                dbg_printf("[%2d] parse_incoming: client=%u type=%u <"BRED"%s"CRESET"> flags=%u remaining_length=%u\n",
                         client->session ? client->session->id : (id_t)-1,
                         client->id,
                         hdr->type, control_packet_str[hdr->type],
@@ -4560,6 +4618,9 @@ static void tick_msg(struct message *msg)
                 packet->flags |= MQTT_FLAG_PUBLISH_DUP;
             }
         }
+
+        if (msg->retain)
+            packet->flags |= MQTT_FLAG_PUBLISH_RETAIN;
 
         packet->reason_code = MQTT_SUCCESS;
 
@@ -4948,12 +5009,12 @@ int main(int argc, char *argv[])
         err(EXIT_FAILURE, "sigaction(SIGHUP)");
 
     atexit(close_all_sockets);
-    atexit(free_all_messages);
     atexit(free_all_message_delivery_states);
-    atexit(free_all_packets);
+    atexit(free_all_messages);
     atexit(free_all_sessions);
-    atexit(free_all_clients);
     atexit(free_all_topics);
+    atexit(free_all_packets);
+    atexit(free_all_clients);
 
     const char *topic_name;
     while (optind < argc)
