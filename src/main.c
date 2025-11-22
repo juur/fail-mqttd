@@ -2199,11 +2199,42 @@ fail:
 }
 
 [[gnu::nonnull]]
-static int unsubscribe_from_topics(struct session * /*session*/,
-        struct topic_sub_request * /*request*/)
+static int unsubscribe_from_topics(struct session *session,
+        struct topic_sub_request *request)
 {
-    errno = ENOSYS;
-    return -1;
+    struct subscription *sub;
+    int sub_idx;
+    errno = 0;
+
+    if (request->topic_refs == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    for (unsigned idx = 0; idx < request->num_topics; idx++)
+    {
+        if (request->topic_refs[idx] == NULL) {
+            request->response_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
+            continue;
+        }
+
+        if ((sub_idx = find_subscription(session, request->topic_refs[idx])) == -1) {
+            if (errno == ENOENT)
+                request->response_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
+            else
+                request->response_codes[idx] = MQTT_UNSPECIFIED_ERROR;
+            continue;
+        }
+
+        sub = (*request->topic_refs[idx]->subscribers)[sub_idx];
+        if (unsubscribe(sub) == -1) {
+            request->response_codes[idx] = MQTT_UNSPECIFIED_ERROR;
+            continue;
+        }
+
+        request->response_codes[idx] = MQTT_SUCCESS;
+    }
+    return 0;
 }
 
 [[gnu::nonnull]]
@@ -2791,17 +2822,93 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
     return 0;
 }
 
+/* Fixed Header:
+ *  MQTT Control Packet Type [4:7]
+ *  Reserved [0-3]
+ *  Remaining Length (VAR)
+ * Variable Header:
+ *  Packet Identifier
+ *  Properties[]
+ * Payload:
+ *  Reason Code[]
+ */
+
 [[gnu::nonnull]]
-static int send_cp_unsuback(struct client * /*client*/, uint16_t packet_id,
-        struct topic_sub_request * /*request*/)
+static int send_cp_unsuback(struct client *client, uint16_t packet_id,
+        struct topic_sub_request *request)
 {
+    ssize_t length, wr_len;
+    uint8_t *packet, *ptr;
+    uint16_t tmp;
+    uint8_t remlen[4];
+    int remlen_len;
+
+    packet = NULL;
+
     if (packet_id == 0) {
         errno = EINVAL;
         goto fail;
     }
 
-    errno = ENOSYS;
+    errno = 0;
+
+    length = sizeof(packet_id);
+    length += 1; /* Property Length */
+
+    length += request->num_topics;
+
+    if ((remlen_len = encode_var_byte(length, remlen)) == -1)
+        goto fail;
+
+    length += sizeof(struct mqtt_fixed_header);
+    length += remlen_len;
+
+    if ((ptr = packet = calloc(1, length)) == NULL)
+        goto fail;
+
+    ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_UNSUBACK;
+    ptr++;
+
+    memcpy(ptr, remlen, remlen_len);
+    ptr += remlen_len;
+
+    tmp = htons(packet_id);
+    memcpy(ptr, &tmp, 2);
+    ptr += 2;
+
+    *ptr = 0;
+    ptr++;
+
+    for (unsigned idx = 0; idx < request->num_topics; idx++) {
+        *ptr = request->response_codes[idx];
+        if (send_disconnect_if_malformed(client, (reason_code_t)*ptr))
+            goto fail;
+        ptr++;
+    }
+
+    if ((wr_len = write(client->fd, packet, length)) != length) {
+        free(packet);
+        return log_io_error(NULL, wr_len, length, false);
+    }
+
+    free(packet);
+    pthread_rwlock_wrlock(&client->active_packets_lock);
+    for (struct packet *tmp = client->active_packets; tmp; tmp = tmp->next_client)
+    {
+        if (tmp->packet_identifier == packet_id &&
+                GET_REFCNT(&tmp->refcnt) > 0) {
+            DEC_REFCNT(&tmp->refcnt);
+            break;
+        }
+
+    }
+    pthread_rwlock_unlock(&client->active_packets_lock);
+
+    return 0;
+
 fail:
+    if (packet)
+        free(packet);
     return -1;
 }
 
@@ -2812,7 +2919,7 @@ fail:
  *  Packet Identifier
  *  Properties[]
  * Payload:
- *  Reason Codes[]
+ *  Reason Code[]
  */
 
 [[gnu::nonnull, gnu::warn_unused_result]]
@@ -2822,16 +2929,27 @@ static int send_cp_suback(struct client *client, uint16_t packet_id,
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
     uint16_t tmp;
+    uint8_t remlen[4];
+    int remlen_len;
+
+    packet = NULL;
+
+    if (packet_id == 0) {
+        errno = EINVAL;
+        goto fail;
+    }
 
     errno = 0;
 
-    length = sizeof(struct mqtt_fixed_header); /* [0] MQTT Control Packet type */
-    length += 1; /* [1]   Remaining Length 1byte */
-
-    length += sizeof(packet_id); /* [2-3] Packet Identifier */
+    length = sizeof(packet_id); /* [2-3] Packet Identifier */
     length += 1; /* [4]   properties length (0) */
-    length += 0; /*       properties TODO */
-    length += 1 * request->num_topics; /* [5+] */
+    length += request->num_topics; /* [5+] */
+
+    if ((remlen_len = encode_var_byte(length, remlen)) == -1)
+        goto fail;
+
+    length += sizeof(struct mqtt_fixed_header); /* [0] MQTT Control Packet type */
+    length += remlen_len; /* [1]   Remaining Length 1byte */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         goto fail;
@@ -3009,21 +3127,17 @@ static int handle_cp_pubrel(struct client *client, struct packet *packet,
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    reason_code_t reason_code = MQTT_MALFORMED_PACKET;
     [[maybe_unused]] reason_code_t pubrel_reason_code = 0;
     uint16_t tmp;
 
     errno = 0;
 
-    if (packet->flags != MQTT_FLAG_PUBREL) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (packet->flags != MQTT_FLAG_PUBREL)
         goto fail;
-    }
 
-    if (bytes_left < 2) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left < 2)
         goto fail;
-    }
 
     memcpy(&tmp, ptr, 2);
     packet->packet_identifier = ntohs(tmp);
@@ -3049,14 +3163,11 @@ static int handle_cp_pubrel(struct client *client, struct packet *packet,
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
                 &packet->property_count, MQTT_CP_PUBREL) == -1) {
-        reason_code = MQTT_MALFORMED_PACKET;
         goto fail;
     }
 skip_props:
-    if (bytes_left) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left)
         goto fail;
-    }
 
     dbg_printf("[%2d] handle_cp_pubrel: packet_identifier=%u reason_code=%u\n",
             client->session->id,
@@ -3088,14 +3199,12 @@ static int handle_cp_puback(struct client *client, struct packet *packet,
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    reason_code_t reason_code, puback_reason_code;
+    reason_code_t reason_code = MQTT_MALFORMED_PACKET, puback_reason_code;
 
     errno = 0;
 
-    if (bytes_left < 2) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left < 2)
         goto fail;
-    }
 
     memcpy(&packet->packet_identifier, ptr, 2);
     bytes_left -= 2;
@@ -3122,10 +3231,8 @@ skip_reason:
         goto skip_property_length;
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
-                &packet->property_count, MQTT_CP_PUBACK)) {
-        reason_code = MQTT_MALFORMED_PACKET;
+                &packet->property_count, MQTT_CP_PUBACK))
         goto fail;
-    }
 
 skip_property_length:
     /* TODO record acknowledgment */
@@ -3158,15 +3265,13 @@ static int handle_cp_pubcomp(struct client *client, struct packet *packet,
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    reason_code_t reason_code;
+    reason_code_t reason_code = MQTT_MALFORMED_PACKET;
     reason_code_t pubcomp_reason_code;
 
     errno = 0;
 
-    if (bytes_left < 2) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left < 2)
         goto fail;
-    }
 
     memcpy(&packet->packet_identifier, ptr, 2);
     bytes_left -= 2;
@@ -3188,15 +3293,11 @@ static int handle_cp_pubcomp(struct client *client, struct packet *packet,
     bytes_left--;
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
-                &packet->property_count, MQTT_CP_PUBCOMP) == -1) {
-        reason_code = MQTT_MALFORMED_PACKET;
+                &packet->property_count, MQTT_CP_PUBCOMP) == -1)
         goto fail;
-    }
 
-    if (bytes_left) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left)
         goto fail;
-    }
 
 skip_props:
     dbg_printf("[%2d] handle_cp_pubcomp: packet_identifier=%u reason_code=%u\n",
@@ -3227,16 +3328,14 @@ static int handle_cp_pubrec(struct client *client, struct packet *packet,
 {
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
-    reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    reason_code_t reason_code = MQTT_MALFORMED_PACKET;
     reason_code_t pubrec_reason_code;
     uint16_t packet_identifier;
 
     errno = 0;
 
-    if (bytes_left < 2) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left < 2)
         goto fail;
-    }
 
     memcpy(&packet_identifier, ptr, 2);
     bytes_left -= 2;
@@ -3260,15 +3359,12 @@ static int handle_cp_pubrec(struct client *client, struct packet *packet,
     bytes_left--;
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
-                &packet->property_count, MQTT_CP_PUBREC) == -1) {
-        reason_code = MQTT_MALFORMED_PACKET;
+                &packet->property_count, MQTT_CP_PUBREC) == -1)
         goto fail;
-    }
+
 skip_props:
-    if (bytes_left) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if (bytes_left)
         goto fail;
-    }
 
     dbg_printf("[%2d] handle_cp_pubrec: packet_identifier=%u\n",
             client->session->id, packet_identifier);
@@ -3316,17 +3412,15 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     size_t bytes_left = packet->remaining_length;
     uint8_t *topic_name = NULL;
     uint16_t packet_identifier = 0;
-    reason_code_t reason_code = MQTT_UNSPECIFIED_ERROR;
+    reason_code_t reason_code = MQTT_MALFORMED_PACKET;
     unsigned qos = 0;
     [[maybe_unused]] bool flag_retain;
     [[maybe_unused]] bool flag_dup;
 
     errno = 0;
 
-    if ((topic_name = read_utf8(&ptr, &bytes_left)) == NULL) {
-        reason_code = MQTT_MALFORMED_PACKET;
+    if ((topic_name = read_utf8(&ptr, &bytes_left)) == NULL)
         goto fail;
-    }
 
     if (is_valid_topic_name(topic_name) == -1) {
         reason_code = MQTT_TOPIC_NAME_INVALID;
@@ -3363,10 +3457,8 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     uint8_t payload_format = 0; /* TODO extract from properties */
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
-                &packet->property_count, MQTT_CP_PUBLISH) == -1) {
-        reason_code = MQTT_MALFORMED_PACKET;
+                &packet->property_count, MQTT_CP_PUBLISH) == -1)
         goto fail;
-    }
     dbg_printf("payload_format=%u [%lub]", payload_format, bytes_left);
 
     packet->payload_len = bytes_left;
@@ -3687,13 +3779,11 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
     }
 
     free_topic_subs(request);
-
     return rc;
 
 fail:
     if (request)
         free_topic_subs(request);
-    /* TODO we should send suback ? */
     send_cp_disconnect(client, reason_code);
     return -1;
 }
@@ -3802,6 +3892,9 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     ptr += 2;
     bytes_left -= 2;
 
+    if (connect_header_length != 4)
+        goto fail;
+
     memcpy(protocol_name, ptr, 4);
     ptr += 4;
     bytes_left -= 4;
@@ -3858,7 +3951,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
             goto fail;
 
         dbg_printf("[%d props] will_topic ", num_will_props);
-        
+
         will_topic = read_utf8(&ptr, &bytes_left);
         if (will_topic == NULL)
             goto fail;
@@ -3867,7 +3960,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
         if ((will_payload = read_binary(&ptr, &bytes_left,
                         &will_payload_len)) == NULL)
             goto fail;
-        
+
         dbg_printf("[%ub] ", will_payload_len);
         will_retain = (connect_flags & MQTT_CONNECT_FLAG_WILL_RETAIN);
     }
