@@ -1573,7 +1573,7 @@ static int parse_properties(
             {
                 default:
                     /* TODO MQTT requires skipping not failing */
-                    warn("parse_properties: unsupported property identifier %u\n",
+                    warnx("parse_properties: unsupported property identifier %u",
                             prop->ident);
             }
 
@@ -1709,7 +1709,7 @@ static void free_all_message_delivery_states(void)
     dbg_printf("     free_all_message_delivery_states\n");
     /* don't bother locking this late in tear down */
     while (global_mds_list)
-        mds_detach_and_free(global_mds_list, false, false); 
+        mds_detach_and_free(global_mds_list, false, false);
 }
 
 static void free_all_sessions(void)
@@ -2081,6 +2081,7 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     msg->retain = retain;
 
     if (retain) {
+        /* TODO retained_message locking ? */
         if (topic->retained_message) {
             DEC_REFCNT(&topic->retained_message->refcnt);
             DEC_REFCNT(&topic->refcnt);
@@ -2095,8 +2096,10 @@ static struct message *register_message(const uint8_t *topic_name, int format,
         }
 
         INC_REFCNT(&topic->refcnt);
-        topic->retained_message = msg;
         msg->topic = topic;
+        /* if the sender disconnects, boom TODO check this is correct */
+        msg->sender = NULL;
+        topic->retained_message = msg;
         dbg_printf("     register_message: set retained_message on topic <%s>\n",
                 (char *)topic->name);
         INC_REFCNT(&msg->refcnt);
@@ -3708,7 +3711,7 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
     errno = 0;
     int rc = send_cp_unsuback(client, packet->packet_identifier, request);
     free_topic_subs(request);
-    
+
     INC_REFCNT(&packet->refcnt);
     return rc;
 
@@ -4180,7 +4183,7 @@ create_new_session:
     if (get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_REQUEST_RESPONSE_INFORMATION, &prop) == 0)
         client->session->request_response_information = prop->byte;
-    
+
     if (get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_REQUEST_PROBLEM_INFORMATION, &prop) == 0)
         client->session->request_problem_information = prop->byte;
@@ -4533,9 +4536,9 @@ static void client_tick(void)
 
             case CS_DISCONNECTED:
                 if (clnt->session) {
+                    time_t now = time(0);
                     if (clnt->will_topic) {
                         struct message *msg;
-                        time_t now = time(0);
 
                         dbg_printf("[%2d] client_tick: handling WILL\n",
                                 clnt->session->id);
@@ -4571,11 +4574,14 @@ static void client_tick(void)
                         clnt->will_topic = NULL;
                     }
 
-                    clnt->session->last_connected = time(0);
+                    clnt->session->last_connected = now;
                     clnt->session->client = NULL;
 
+                    /* TODO set a sensible maximum */
                     if (clnt->session->expiry_interval == 0)
                         clnt->session->state = SESSION_DELETE;
+                    else
+                        clnt->session->expires_at = now + clnt->session->expiry_interval;
 
                     DEC_REFCNT(&clnt->session->refcnt);
                     clnt->session = NULL;
@@ -4626,7 +4632,7 @@ static void tick_msg(struct message *msg)
     time_t now = time(0);
 
     dbg_printf(NGRN "     tick_msg: id=%u sender.id=%u #mds=%u"CRESET"\n",
-            msg->id, msg->sender->id,
+            msg->id, msg->sender ? msg->sender->id : (id_t)-1,
             msg->num_message_delivery_states);
 
     pthread_rwlock_wrlock(&msg->delivery_states_lock);
@@ -4816,16 +4822,27 @@ static void message_tick(void)
 
 static void session_tick(void)
 {
+    const time_t now = time(0);
+
     pthread_rwlock_wrlock(&global_sessions_lock);
     for (struct session *session = global_session_list, *next; session; session = next)
     {
         next = session->next;
 
         if (session->state == SESSION_DELETE &&
+                GET_REFCNT(&session->refcnt) > 0) {
+            while(session->subscriptions)
+                if (unsubscribe((*session->subscriptions)[0]) == -1)
+                    warn("session_tick: unsubscribe");
+        } else if (session->state == SESSION_DELETE &&
                 GET_REFCNT(&session->refcnt) == 0) {
             free_session(session, false);
         } else if (session->client == NULL) {
-            /* TODO check Session Expiry Interval */
+            if (session->expires_at == 0 || now > session->expires_at) {
+                dbg_printf("[%2d] setting SESSION_DELETE refcnt is %u\n",
+                        session->id, GET_REFCNT(&session->refcnt));
+                session->state = SESSION_DELETE;
+            }
         }
     }
     pthread_rwlock_unlock(&global_sessions_lock);
@@ -4899,8 +4916,9 @@ static int main_loop(int mother_fd)
         tv.tv_usec = 10000;
 
         if (has_clients == false) {
-            dbg_printf("\n     main_loop: no connections, going to sleep\n");
-            rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, NULL);
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv);
         } else {
             rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv);
         }

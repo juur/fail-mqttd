@@ -357,6 +357,7 @@ struct session {
     const uint8_t *client_id;
 
     time_t last_connected;
+    time_t expires_at;
 
     uint32_t expiry_interval;
     bool request_response_information;
