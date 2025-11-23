@@ -2262,8 +2262,6 @@ skip_topic:
         client_sub_cnt++;
     }
 
-
-
     client_sub_size = client_sub_cnt * sizeof(struct subscription *);
 
     if (client_sub_cnt == 0) {
@@ -2317,7 +2315,6 @@ skip_client:
     sub = NULL;
 
     pthread_rwlock_unlock(&session->subscriptions_lock);
-
     return 0;
 
 fail:
@@ -4904,15 +4901,17 @@ static void session_tick(void)
     {
         next = session->next;
 
-        if (session->state == SESSION_DELETE &&
-                GET_REFCNT(&session->refcnt) > 0) {
-            while(session->subscriptions && (*session->subscriptions)[0])
-                if (unsubscribe((*session->subscriptions)[0]) == -1)
-                    warn("session_tick: unsubscribe");
-        } else if (session->state == SESSION_DELETE &&
-                GET_REFCNT(&session->refcnt) == 0) {
-            free_session(session, false);
-            session = NULL;
+        if (session->state == SESSION_DELETE) {
+            if (GET_REFCNT(&session->refcnt) > 0) {
+                /* as the session is SESSION_DELETE, check we're unsubscribed
+                 * which should resolve the refcnt to be 0 */
+                while(session->subscriptions && (*session->subscriptions)[0])
+                    if (unsubscribe((*session->subscriptions)[0]) == -1)
+                        warn("session_tick: unsubscribe");
+            } else { 
+                free_session(session, false);
+                session = NULL;
+            }
         } else if (session->client == NULL) {
             if (session->expires_at == 0 || now > session->expires_at) {
                 dbg_printf("[%2d] setting SESSION_DELETE refcnt is %u\n",
