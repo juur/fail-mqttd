@@ -386,19 +386,23 @@ static void free_topic(struct topic *topic)
         struct message *msg = topic->retained_message;
 
         pthread_rwlock_wrlock(&msg->delivery_states_lock);
-        while (msg->num_message_delivery_states && msg->delivery_states)
+        for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
         {
-            assert(msg->delivery_states[0] != NULL);
-            mds_detach_and_free(msg->delivery_states[0], true, false);
+            if (msg->delivery_states[idx] == NULL)
+                continue;
+
+            mds_detach_and_free(msg->delivery_states[idx], true, false);
+            msg->delivery_states[idx] = NULL;
         }
         pthread_rwlock_unlock(&msg->delivery_states_lock);
 
         DEC_REFCNT(&msg->refcnt);
         msg->topic = NULL;
 
-        if (GET_REFCNT(&msg->refcnt) == 0)
+        if (GET_REFCNT(&msg->refcnt) == 0) {
             free_message(msg, true);
-        else
+            msg = NULL;
+        } else
             warn("free_topic: can't free retained_message, refcnt is %u\n",
                     GET_REFCNT(&msg->refcnt));
         topic->retained_message = NULL;
@@ -431,20 +435,28 @@ static void free_properties(
         switch (type)
         {
             case MQTT_TYPE_UTF8_STRING_PAIR:
-                if ((*props)[i].utf8_pair[0])
+                if ((*props)[i].utf8_pair[0]) {
                     free((*props)[i].utf8_pair[0]);
-                if ((*props)[i].utf8_pair[1])
+                    (*props)[i].utf8_pair[0] = NULL;
+                }
+                if ((*props)[i].utf8_pair[1]) {
                     free((*props)[i].utf8_pair[1]);
+                    (*props)[i].utf8_pair[1] = NULL;
+                }
                 break;
 
             case MQTT_TYPE_UTF8_STRING:
-                if ((*props)[i].utf8_string)
+                if ((*props)[i].utf8_string) {
                     free((*props)[i].utf8_string);
+                    (*props)[i].utf8_string = NULL;
+                }
                 break;
 
             case MQTT_TYPE_BINARY:
-                if ((*props)[i].binary.data)
+                if ((*props)[i].binary.data) {
                     free((*props)[i].binary.data);
+                    (*props)[i].binary.data = NULL;
+                }
                 break;
 
             default:
@@ -489,6 +501,7 @@ static void free_delivery_states(pthread_rwlock_t *lock, unsigned num, struct me
         if (*msgs[idx] == NULL)
             continue;
         mds_detach_and_free(*msgs[idx], false, false);
+        *msgs[idx] = NULL;
     }
     pthread_rwlock_unlock(lock);
 
@@ -622,9 +635,11 @@ static void free_message(struct message *msg, bool need_lock)
         msg->payload = NULL;
     }
 
-    if (msg->delivery_states)
+    if (msg->delivery_states) {
         free_delivery_states(&msg->delivery_states_lock,
                 msg->num_message_delivery_states, &msg->delivery_states);
+        msg->delivery_states = NULL;
+    }
 
     pthread_rwlock_destroy(&msg->delivery_states_lock);
 
@@ -800,9 +815,11 @@ static void free_session(struct session *session, bool need_lock)
     pthread_rwlock_unlock(&session->subscriptions_lock);
 
     /* TODO do this properly */
-    if (session->delivery_states)
+    if (session->delivery_states) {
         free_delivery_states(&session->delivery_states_lock,
                 session->num_message_delivery_states, &session->delivery_states);
+        session->delivery_states = NULL;
+    }
 
     if (session->client_id) {
         free((void *)session->client_id);
@@ -1984,6 +2001,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
                     mds) == -1) {
             warn("enqueue_message: add_to_delivery_state(msg)");
             mds_detach_and_free(mds, true, true);
+            mds = NULL;
             continue;
         }
 
@@ -1994,6 +2012,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
                     mds) == -1) {
             warn("enqueue_message: add_to_delivery_state(session)");
             mds_detach_and_free(mds, true, true);
+            mds = NULL;
             continue;
         }
     }
@@ -2120,6 +2139,7 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     if (enqueue_message(topic, msg) == -1) {
         warn("register_message: enqueue_message");
         free_message(msg, true);
+        msg = NULL;
         goto fail;
     }
 
@@ -2270,10 +2290,14 @@ skip_topic:
 
 skip_client:
 
-    if (session->subscriptions)
+    if (session->subscriptions) {
         free(session->subscriptions);
-    if (topic->subscribers)
+        session->subscriptions = NULL;
+    }
+    if (topic->subscribers) {
         free(topic->subscribers);
+        topic->subscribers = NULL;
+    }
 
     topic->subscribers = tmp_topic;
     session->subscriptions = tmp_client;
@@ -2290,6 +2314,7 @@ skip_client:
     sub->session = NULL;
 
     free_subscription(sub);
+    sub = NULL;
 
     pthread_rwlock_unlock(&session->subscriptions_lock);
 
@@ -2404,6 +2429,7 @@ static int subscribe_to_topics(struct session *session,
                         tmp_topic->name);
                 request->response_codes[idx] = MQTT_UNSPECIFIED_ERROR;
                 free_subscription(new_sub);
+                new_sub = NULL;
                 continue;
             }
 
@@ -2421,9 +2447,11 @@ static int subscribe_to_topics(struct session *session,
         }
 
         free((void *)request->topics[idx]);
-        request->options[idx] = 0;
         request->topics[idx] = NULL;
+
+        request->options[idx] = 0;
         request->topic_refs[idx] = tmp_topic;
+        
         if (existing_idx == -1)
             session->num_subscriptions++;
     }
@@ -3746,6 +3774,7 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
     errno = 0;
     int rc = send_cp_unsuback(client, packet->packet_identifier, request);
     free_topic_subs(request);
+    request = NULL;
 
     INC_REFCNT(&packet->refcnt);
     return rc;
@@ -3914,6 +3943,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                         mds) == -1) {
                 warn("handle_cp_subscribe: retain: add_to_delivery_state(msg)");
                 mds_detach_and_free(mds, true, true);
+                mds = NULL;
                 continue;
             }
 
@@ -3923,6 +3953,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                         mds) == -1) {
                 warn("handle_cp_subscribe: retain: add_to_delivery_state(session)");
                 mds_detach_and_free(mds, true, true);
+                mds = NULL;
                 continue;
             }
 
@@ -3935,6 +3966,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
     }
 
     free_topic_subs(request);
+    request = NULL;
     INC_REFCNT(&packet->refcnt);
     return rc;
 
@@ -4200,6 +4232,7 @@ create_new_session:
             goto fail;
         }
         free(will_topic); /* find_or_register_topic duplicates */
+        will_topic = NULL;
         INC_REFCNT(&client->will_topic->refcnt);
 
         client->will_retain = will_retain;
@@ -4594,8 +4627,10 @@ static void client_tick(void)
                                     clnt->will_qos,
                                     clnt->session, clnt->will_retain)) == NULL) {
                             warn("client_tick: register_message(will)");
-                            if (clnt->will_payload)
+                            if (clnt->will_payload) {
                                 free(clnt->will_payload);
+                                clnt->will_payload = NULL;
+                            }
                         }
                         msg->sender_status.completed_at = now;
                         msg->sender_status.last_sent = now;
@@ -4647,6 +4682,7 @@ force_close:
 
             case CS_CLOSED:
                 free_client(clnt, false);
+                clnt = NULL;
                 break;
         }
     }
@@ -4739,6 +4775,7 @@ static void tick_msg(struct message *msg)
             warn("tick_msg: unable to send_cp_publish");
             DEC_REFCNT(&packet->refcnt);
             free_packet(packet, true, true); /* Anything else? */
+            packet = NULL;
             continue;
         }
 
@@ -4751,6 +4788,7 @@ static void tick_msg(struct message *msg)
 
         DEC_REFCNT(&packet->refcnt);
         free_packet(packet, true, true);
+        packet = NULL;
         /* TODO async END */
     }
 
@@ -4790,6 +4828,7 @@ again:
                     mds->message ? mds->message->refcnt : 0);
 
             mds_detach_and_free(mds, true, false);
+            mds = NULL;
         }
 
         /* We can't just dequeue() and MSG_DEAD if any mds are not complated_at */
@@ -4849,6 +4888,7 @@ static void message_tick(void)
             continue;
 
         free_message(msg, false);
+        msg = NULL;
     }
     pthread_rwlock_unlock(&global_messages_lock);
 }
@@ -4872,6 +4912,7 @@ static void session_tick(void)
         } else if (session->state == SESSION_DELETE &&
                 GET_REFCNT(&session->refcnt) == 0) {
             free_session(session, false);
+            session = NULL;
         } else if (session->client == NULL) {
             if (session->expires_at == 0 || now > session->expires_at) {
                 dbg_printf("[%2d] setting SESSION_DELETE refcnt is %u\n",
@@ -5127,9 +5168,11 @@ int main(int argc, char *argv[])
             free((void *)topic_name);
             warn("main: <%s> is not a valid topic filter, skipping",
                     (char *)argv[optind]);
+            topic_name = NULL;
         } else if (register_topic((const uint8_t *)topic_name) == NULL) {
             warn("main: register_topic(<%s>)", topic_name);
             free((void *)topic_name);
+            topic_name = NULL;
         }
         optind++;
     }
