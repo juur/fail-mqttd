@@ -345,10 +345,15 @@ static void free_topic(struct topic *topic)
         {
             for(unsigned idx = 0; idx < topic->num_subscribers; idx++)
             {
-                dbg_printf("     free_topic: subscriber[%u]\n", idx);
                 if ((*topic->subscribers)[idx] == NULL)
                     continue;
 
+                dbg_printf("     free_topic: subscriber[%u] <%s> in <%s>\n",
+                        idx,
+                        (*topic->subscribers)[idx]->session->client_id,
+                        (*topic->subscribers)[idx]->topic->name
+                        );
+                
                 /* TODO should we handle the return code ? */
                 (void)unsubscribe((*topic->subscribers)[idx]);
             }
@@ -622,6 +627,10 @@ static void free_message(struct message *msg, bool need_lock)
                 msg->num_message_delivery_states, &msg->delivery_states);
 
     pthread_rwlock_destroy(&msg->delivery_states_lock);
+
+    /* INC in register_message(), doesn't happen to RETAIN */
+    if (msg->sender && GET_REFCNT(&msg->sender->refcnt))
+        DEC_REFCNT(&msg->sender->refcnt);
 
     num_messages--;
     free(msg);
@@ -1706,7 +1715,7 @@ static void close_all_sockets(void)
 
 static void free_all_message_delivery_states(void)
 {
-    dbg_printf("     free_all_message_delivery_states\n");
+    dbg_printf("     "BYEL"free_all_message_delivery_states"CRESET"\n");
     /* don't bother locking this late in tear down */
     while (global_mds_list)
         mds_detach_and_free(global_mds_list, false, false);
@@ -1714,35 +1723,35 @@ static void free_all_message_delivery_states(void)
 
 static void free_all_sessions(void)
 {
-    dbg_printf("     free_all_sessions\n");
+    dbg_printf("     "BYEL"free_all_sessions"CRESET"\n");
     while (global_session_list)
         free_session(global_session_list, true);
 }
 
 static void free_all_messages(void)
 {
-    dbg_printf("     free_all_messages\n");
+    dbg_printf("     "BYEL"free_all_messages"CRESET"\n");
     while (global_message_list)
         free_message(global_message_list, true);
 }
 
 static void free_all_clients(void)
 {
-    dbg_printf("     free_all_clients\n");
+    dbg_printf("     "BYEL"free_all_clients"CRESET"\n");
     while (global_client_list)
         free_client(global_client_list, true);
 }
 
 static void free_all_packets(void)
 {
-    dbg_printf("     free_all_packets\n");
+    dbg_printf("     "BYEL"free_all_packets"CRESET"\n");
     while (global_packet_list)
         free_packet(global_packet_list, false, false);
 }
 
 static void free_all_topics(void)
 {
-    dbg_printf("     free_all_topics\n");
+    dbg_printf("     "BYEL"free_all_topics"CRESET"\n");
     while (global_topic_list)
         free_topic(global_topic_list);
 }
@@ -2080,6 +2089,7 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     msg->state = MSG_NEW;
     msg->retain = retain;
 
+
     if (retain) {
         /* TODO retained_message locking ? */
         if (topic->retained_message) {
@@ -2104,7 +2114,8 @@ static struct message *register_message(const uint8_t *topic_name, int format,
                 (char *)topic->name);
         INC_REFCNT(&msg->refcnt);
         goto skip_enqueue;
-    }
+    } else
+        INC_REFCNT(&sender->refcnt); /* DEC in free_message() */
 
     if (enqueue_message(topic, msg) == -1) {
         warn("register_message: enqueue_message");
@@ -2270,7 +2281,7 @@ skip_client:
     topic->num_subscribers = topic_sub_cnt;
     session->num_subscriptions = client_sub_cnt;
 
-    dbg_printf("     unsubscribe_from_topic: client_sub_cnt now %lu\n", client_sub_cnt);
+    //dbg_printf("     unsubscribe_from_topic: client_sub_cnt now %lu\n", client_sub_cnt);
 
     DEC_REFCNT(&sub->topic->refcnt);
     sub->topic = NULL;
@@ -2370,13 +2381,12 @@ static int subscribe_to_topics(struct session *session,
                 session->id,
                 (char *)request->topics[idx]);
 
-        if ((tmp_topic = find_topic(request->topics[idx])) == NULL) {
+        if ((tmp_topic = find_or_register_topic(request->topics[idx])) == NULL) {
             /* TODO somehow ensure reply does a fail for this one? */
-            dbg_printf("[%2d] subscribe_to_topics: failed to find_topic(<%s>)\n",
+            dbg_printf("[%2d] subscribe_to_topics: failed to find_or_register_topic(<%s>)\n",
                     session->id,
                     (char *)request->topics[idx]);
-            request->response_codes[idx] = MQTT_NOT_AUTHORIZED;
-            /* TODO what's the correct approach? */
+            request->response_codes[idx] = MQTT_TOPIC_NAME_INVALID;
             continue;
         }
 
@@ -2585,7 +2595,7 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
     }
 
     dbg_printf("[%2d] send_cp_disconnect: sent code was %u\n",
-            client->session->id, reason_code);
+            client->session ? client->session->id : (id_t)-1, reason_code);
 
     free(packet);
     client->state = CS_CLOSING;
@@ -4631,7 +4641,7 @@ static void tick_msg(struct message *msg)
 
     time_t now = time(0);
 
-    dbg_printf(NGRN "     tick_msg: id=%u sender.id=%u #mds=%u"CRESET"\n",
+    dbg_printf(NGRN "     tick_msg: id=%u sender.id=%d #mds=%u"CRESET"\n",
             msg->id, msg->sender ? msg->sender->id : (id_t)-1,
             msg->num_message_delivery_states);
 
@@ -4831,7 +4841,7 @@ static void session_tick(void)
 
         if (session->state == SESSION_DELETE &&
                 GET_REFCNT(&session->refcnt) > 0) {
-            while(session->subscriptions)
+            while(session->subscriptions && (*session->subscriptions)[0])
                 if (unsubscribe((*session->subscriptions)[0]) == -1)
                     warn("session_tick: unsubscribe");
         } else if (session->state == SESSION_DELETE &&
