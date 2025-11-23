@@ -353,7 +353,7 @@ static void free_topic(struct topic *topic)
                         (*topic->subscribers)[idx]->session->client_id,
                         (*topic->subscribers)[idx]->topic->name
                         );
-                
+
                 /* TODO should we handle the return code ? */
                 (void)unsubscribe((*topic->subscribers)[idx]);
             }
@@ -1322,7 +1322,7 @@ fail:
     return NULL;
 }
 
-[[gnu::nonnull, maybe_unused]]
+[[gnu::nonnull]]
 static int get_property_value(const struct property (*props)[],
         unsigned num_props, property_ident_t id, const struct property **out)
 {
@@ -2439,6 +2439,123 @@ fail:
     return -1;
 }
 
+[[gnu::nonnull]]
+static int mark_one_mds(struct message_delivery_state *mds,
+        control_packet_t type, reason_code_t client_reason)
+{
+    assert(mds->packet_identifier != 0);
+
+    time_t now = time(0);
+
+    switch (type)
+    {
+        case MQTT_CP_PUBACK: /* QoS=1 */
+            if (mds->acknowledged_at)
+                warnx("mark_message: duplicate acknowledgment");
+            mds->acknowledged_at = now;
+            mds->released_at = now;
+            mds->completed_at = now;
+            mds->client_reason = client_reason;
+            break;
+
+        case MQTT_CP_PUBREC: /* QoS=2 */
+            if (mds->acknowledged_at)
+                warnx("mark_message: duplicate acknowledgment");
+            mds->acknowledged_at = now;
+            mds->client_reason = client_reason;
+            break;
+
+        case MQTT_CP_PUBREL: /* QoS=2 */
+            if (mds->released_at)
+                warnx("mark_message: duplicate release");
+            mds->released_at = now;
+            break;
+
+        case MQTT_CP_PUBCOMP: /* QoS=2 */
+            if (mds->completed_at)
+                warnx("mark_message: duplicate completed");
+            mds->completed_at = now;
+            break;
+
+        default:
+            warnx("mark_message: called with illegal type %s",
+                    control_packet_str[type]);
+            errno = EINVAL;
+            goto fail;
+    }
+
+    return 1;
+
+fail:
+    return -1;
+}
+
+[[gnu::nonnull, gnu::warn_unused_result]]
+static int mark_message(control_packet_t type, uint16_t packet_identifier,
+        reason_code_t client_reason, struct session *session, role_t role)
+{
+    int rc;
+    struct message_delivery_state *mds;
+
+    assert(packet_identifier != 0);
+
+    if (role == ROLE_RECV)
+        goto do_recv;
+
+    pthread_rwlock_wrlock(&global_messages_lock);
+    for (struct message *message = global_message_list; message; message = message->next)
+    {
+        if (message->sender != session)
+            continue;
+
+        if (message->sender_status.packet_identifier == packet_identifier) {
+            rc = mark_one_mds(&message->sender_status, type, client_reason);
+
+            if (rc == -1)
+                goto fail;
+
+            pthread_rwlock_unlock(&global_messages_lock);
+            return 0;
+
+        }
+    }
+    pthread_rwlock_unlock(&global_messages_lock);
+
+    errno = ENOENT;
+    goto fail;
+
+    /* else if (role == ROLE_RECV) ... */
+
+do_recv:
+    pthread_rwlock_wrlock(&session->delivery_states_lock);
+    for (unsigned idx = 0; idx < session->num_message_delivery_states; idx++)
+    {
+        mds = session->delivery_states[idx];
+
+        if (mds == NULL)
+            continue;
+
+        if (mds->packet_identifier != packet_identifier)
+            continue;
+
+        rc = mark_one_mds(mds, type, client_reason);
+
+        if (rc == -1)
+            goto fail;
+        else if (rc == 0)
+            continue;
+
+        pthread_rwlock_unlock(&session->delivery_states_lock);
+        return 0;
+    }
+
+    errno = ENOENT;
+fail:
+    pthread_rwlock_unlock(&session->delivery_states_lock);
+    return -1;
+}
+
+
 /*
  * control packet response functions
  */
@@ -2463,7 +2580,7 @@ static int send_cp_publish(struct packet *pkt)
     uint8_t *packet, *ptr;
 
     uint8_t proplen[4], remlen[4];
-    unsigned proplen_len, remlen_len, prop_len;
+    int proplen_len, remlen_len, prop_len;
 
     uint16_t tmp, topic_len;
     const struct message *msg;
@@ -2473,46 +2590,46 @@ static int send_cp_publish(struct packet *pkt)
     assert(pkt->owner != NULL);
 
     dbg_printf("[%2d] send_cp_publish: owner=%s\n",
-            pkt->owner->session->id,
-            (char *)pkt->owner->client_id);
+            pkt->owner->session->id, (char *)pkt->owner->client_id);
 
     errno = 0;
+    packet = NULL;
     msg = pkt->message;
 
     /* Populate Properties */
-
     const struct property props[] = {
         { },
     };
     const unsigned num_props = 0; /* sizeof(props) / sizeof(struct property) */
 
-    /* Calculate the Remaining Length */
+    /* Calculate Property[] Length */
+    if ((prop_len = get_properties_size(&props, num_props)) == -1)
+        goto fail;
 
-    prop_len = get_properties_size(&props, num_props);
-    proplen_len = encode_var_byte(prop_len, proplen);
+    /* Calculate the length of Property Length */
+    if ((proplen_len = encode_var_byte(prop_len, proplen)) == -1)
+        goto fail;
 
     length = 0;
-
-    length += 2; /* UTF-8 length */
+    length += sizeof(uint16_t); /* UTF-8 length */
     length += (topic_len = strlen((char *)pkt->message->topic->name)); /* Actual String */
 
     if ((pkt->flags & MQTT_FLAG_PUBLISH_QOS_MASK))
-        length += 2; /* packet identifier */
+        length += sizeof(uint16_t); /* packet identifier */
 
     length += proplen_len;
     length += prop_len;
-
     length += msg->payload_len;
 
-    remlen_len = encode_var_byte(length, remlen);
+    /* Remaining Length excludes the fixed header */
+    if ((remlen_len = encode_var_byte(length, remlen)) == -1)
+        goto fail;
 
     /* Calculate the total length including header */
-
     length += sizeof(struct mqtt_fixed_header);
     length += remlen_len;
 
     /* Now build the packet */
-
     if ((ptr = packet = calloc(1, length)) == NULL)
         goto fail;
 
@@ -2545,14 +2662,12 @@ static int send_cp_publish(struct packet *pkt)
     memcpy(ptr, msg->payload, msg->payload_len);
 
     /* Now send the packet */
-
     if ((wr_len = write(pkt->owner->fd, packet, length)) != length) {
         free(packet);
         return log_io_error(NULL, wr_len, length, false);
     }
 
     free(packet);
-
     return 0;
 
 fail:
@@ -2567,13 +2682,18 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
 
+    uint8_t remlen[4]; int remlen_len;
+
     errno = 0;
 
-    length = sizeof(struct mqtt_fixed_header);
-    length += 1;
-
+    length = 0;
     length += 1; /* Disconnect Reason Code */
-    length += 1; /* Properties Length */
+
+    if ((remlen_len = encode_var_byte(length, remlen)) == -1)
+        return -1;
+
+    length += sizeof(struct mqtt_fixed_header);
+    length += remlen_len; /* Properties Length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
@@ -2581,8 +2701,8 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_DISCONNECT;
     ptr++;
 
-    *ptr = length - sizeof(struct mqtt_fixed_header) - 1;
-    ptr++;
+    memcpy(ptr, remlen, remlen_len);
+    ptr+= remlen_len;
 
     *ptr = reason_code;
     ptr++;
@@ -2621,7 +2741,7 @@ static int send_cp_pingresp(struct client *client)
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_PINGRESP;
     ptr++;
 
-    *ptr = 0;
+    *ptr = 0; /* Remaining Length */
     ptr++;
 
     dbg_printf("[%2d] send_cp_pingresp: sending\n", client->session->id);
@@ -2644,7 +2764,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     uint8_t *packet, *ptr;
 
     uint8_t proplen[4], remlen[4];
-    unsigned proplen_len, remlen_len, prop_len;
+    int proplen_len, remlen_len, prop_len;
 
     errno = 0;
 
@@ -2660,29 +2780,31 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     };
     const unsigned num_props = sizeof(props) / sizeof(struct property);
 
-    /* Calculate the Remaining Length */
+    /* Calculate the Property[] Length */
+    if ((prop_len = get_properties_size(&props, num_props)) == -1)
+        return -1;
 
-    prop_len = get_properties_size(&props, num_props);
-    proplen_len = encode_var_byte(prop_len, proplen);
+    /* Calculate the length of Property Length */
+    if ((proplen_len = encode_var_byte(prop_len, proplen)) == -1)
+        return -1;
 
     length = 0;
-
     length += 2;           /* connack var header (1byte for flags, 1byte for code) */
     length += proplen_len; /* properties length (0) */
     length += prop_len;    /* property[] */
 
-    remlen_len = encode_var_byte(length, remlen);
+    /* Calculate the length of Remaining Length */
+    if ((remlen_len = encode_var_byte(length, remlen)) == -1)
+        return -1;
 
     /* Calculate the total length including header */
-
     length += sizeof(struct mqtt_fixed_header);
-    length += remlen_len;  /* remaining length */
+    length += remlen_len;  /* Remaining Length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
 
     /* Now build the packet */
-
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_CONNACK;
     ptr++;
 
@@ -2702,7 +2824,6 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
         goto fail;
 
     /* Now send the packet */
-
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
         return log_io_error(NULL, wr_len, length, false);
@@ -2734,15 +2855,19 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
     uint16_t tmp;
+    uint8_t remlen[4]; int remlen_len;
 
     errno = 0;
 
-    length = sizeof(struct mqtt_fixed_header);
-    length += 1; /* Remaining Length */
-
+    length = 0;
     length += 3; /* Packet Identifier + Reason Code */
+    length += 1; /* Properties Length (0) */
 
-    length += 1; /* Properties Length */
+    if ((remlen_len = encode_var_byte(length, remlen)) == -1)
+        return -1;
+
+    length += sizeof(struct mqtt_fixed_header);
+    length += remlen_len; /* Remaining Length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
@@ -2750,14 +2875,17 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
     ((struct mqtt_fixed_header *)packet)->type = MQTT_CP_PUBREC;
     ptr++;
 
-    *ptr = length - sizeof(struct mqtt_fixed_header) - 1;
-    ptr++;
+    memcpy(ptr, remlen, remlen_len);
+    ptr += remlen_len;
 
     tmp = htons(packet_id);
     memcpy(ptr, &tmp, 2);
     ptr += 2;
 
     *ptr = reason_code;
+    ptr++;
+
+    *ptr = 0; /* Property Length */
     ptr++;
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
@@ -2777,6 +2905,7 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
     uint16_t tmp;
+    uint8_t remlen[4]; int remlen_len;
 
     errno = 0;
 
@@ -2784,12 +2913,16 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
             client->session->id,
             packet_id, reason_code);
 
-    length = sizeof(struct mqtt_fixed_header);
-    length +=1; /* Remaining Length */
-
+    length = 0;
     length +=2; /* Packet Identifier */
     length +=1; /* Reason Code */
     length +=1; /* Properties Length */
+
+    if ((remlen_len = encode_var_byte(length, remlen)) == -1)
+        return -1;
+
+    length += sizeof(struct mqtt_fixed_header);
+    length += remlen_len; /* Remaining Length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
@@ -2797,8 +2930,8 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_PUBCOMP;
     ptr++;
 
-    *ptr = length - sizeof(struct mqtt_fixed_header) - 1;
-    ptr++;
+    memcpy(ptr, remlen, remlen_len);
+    ptr += remlen_len;
 
     tmp = htons(packet_id);
     memcpy(ptr, &tmp, 2);
@@ -2834,7 +2967,6 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     pthread_rwlock_unlock(&client->session->delivery_states_lock);
 
     free(packet);
-
     return 0;
 }
 
@@ -2845,14 +2977,18 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
     uint16_t tmp;
+    uint8_t remlen[4]; int remlen_len;
 
     errno = 0;
 
-    length = sizeof(struct mqtt_fixed_header);
-    length += 1; /* Remaining Length */
-
+    length = 0;
     length += 3; /* Packet Identifier + Reason Code */
     length += 1; /* Properties Length */
+
+    remlen_len = encode_var_byte(length, remlen);
+
+    length += sizeof(struct mqtt_fixed_header);
+    length += remlen_len; /* Remaining Length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
@@ -2860,8 +2996,8 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_PUBREL;
     ptr++;
 
-    *ptr = length - sizeof(struct mqtt_fixed_header) - 1;
-    ptr++;
+    memcpy(ptr, remlen, remlen_len);
+    ptr += remlen_len;
 
     tmp = htons(packet_id);
     memcpy(ptr, &tmp, 2);
@@ -2892,15 +3028,19 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
     uint16_t tmp;
+    uint8_t remlen[4]; int remlen_len;
 
     errno = 0;
 
-    length = sizeof(struct mqtt_fixed_header);
-    length += 1; /* Remaining Length */
-
+    length = 0;
     length += 3; /* Packet Identifier + Reason Code */
-
     length += 1; /* Properties Length */
+
+    if ((remlen_len = encode_var_byte(length, remlen)) == -1)
+        return -1;
+
+    length += sizeof(struct mqtt_fixed_header);
+    length += remlen_len; /* Remaining Length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
@@ -2908,8 +3048,8 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_PUBACK;
     ptr++;
 
-    *ptr = length - sizeof(struct mqtt_fixed_header) - 1;
-    ptr++;
+    memcpy(ptr, remlen, remlen_len);
+    ptr += remlen_len;
 
     tmp = htons(packet_id);
     memcpy(ptr, &tmp, 2);
@@ -3107,121 +3247,6 @@ fail:
     return -1;
 }
 
-static int mark_one_mds(struct message_delivery_state *mds,
-        control_packet_t type, reason_code_t client_reason)
-{
-    assert(mds->packet_identifier != 0);
-
-    time_t now = time(0);
-
-    switch (type)
-    {
-        case MQTT_CP_PUBACK: /* QoS=1 */
-            if (mds->acknowledged_at)
-                warnx("mark_message: duplicate acknowledgment");
-            mds->acknowledged_at = now;
-            mds->released_at = now;
-            mds->completed_at = now;
-            mds->client_reason = client_reason;
-            break;
-
-        case MQTT_CP_PUBREC: /* QoS=2 */
-            if (mds->acknowledged_at)
-                warnx("mark_message: duplicate acknowledgment");
-            mds->acknowledged_at = now;
-            mds->client_reason = client_reason;
-            break;
-
-        case MQTT_CP_PUBREL: /* QoS=2 */
-            if (mds->released_at)
-                warnx("mark_message: duplicate release");
-            mds->released_at = now;
-            break;
-
-        case MQTT_CP_PUBCOMP: /* QoS=2 */
-            if (mds->completed_at)
-                warnx("mark_message: duplicate completed");
-            mds->completed_at = now;
-            break;
-
-        default:
-            warnx("mark_message: called with illegal type %s",
-                    control_packet_str[type]);
-            errno = EINVAL;
-            goto fail;
-    }
-
-    return 1;
-
-fail:
-    return -1;
-}
-
-[[gnu::nonnull, gnu::warn_unused_result]]
-static int mark_message(control_packet_t type, uint16_t packet_identifier,
-        reason_code_t client_reason, struct session *session, role_t role)
-{
-    int rc;
-    struct message_delivery_state *mds;
-
-    assert(packet_identifier != 0);
-
-    if (role == ROLE_RECV)
-        goto do_recv;
-
-    pthread_rwlock_wrlock(&global_messages_lock);
-    for (struct message *message = global_message_list; message; message = message->next)
-    {
-        if (message->sender != session)
-            continue;
-
-        if (message->sender_status.packet_identifier == packet_identifier) {
-            rc = mark_one_mds(&message->sender_status, type, client_reason);
-
-            if (rc == -1)
-                goto fail;
-
-            pthread_rwlock_unlock(&global_messages_lock);
-            return 0;
-
-        }
-    }
-    pthread_rwlock_unlock(&global_messages_lock);
-
-    errno = ENOENT;
-    goto fail;
-
-    /* else if (role == ROLE_RECV) ... */
-
-do_recv:
-    pthread_rwlock_wrlock(&session->delivery_states_lock);
-    for (unsigned idx = 0; idx < session->num_message_delivery_states; idx++)
-    {
-        mds = session->delivery_states[idx];
-
-        if (mds == NULL)
-            continue;
-
-        if (mds->packet_identifier != packet_identifier)
-            continue;
-
-        rc = mark_one_mds(mds, type, client_reason);
-
-        if (rc == -1)
-            goto fail;
-        else if (rc == 0)
-            continue;
-
-        pthread_rwlock_unlock(&session->delivery_states_lock);
-        return 0;
-    }
-
-    errno = ENOENT;
-fail:
-    pthread_rwlock_unlock(&session->delivery_states_lock);
-    return -1;
-}
-
 
 /*
  * control packet processing functions
@@ -3234,7 +3259,7 @@ static int handle_cp_pubrel(struct client *client, struct packet *packet,
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
     reason_code_t reason_code = MQTT_MALFORMED_PACKET;
-    [[maybe_unused]] reason_code_t pubrel_reason_code = 0;
+    reason_code_t pubrel_reason_code = 0;
     uint16_t tmp;
 
     errno = 0;
@@ -3520,8 +3545,8 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     uint16_t packet_identifier = 0;
     reason_code_t reason_code = MQTT_MALFORMED_PACKET;
     unsigned qos = 0;
-    [[maybe_unused]] bool flag_retain;
-    [[maybe_unused]] bool flag_dup;
+    bool flag_retain;
+    [[maybe_unused]] bool flag_dup; /* TODO use this somehow! */
 
     errno = 0;
 
