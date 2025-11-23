@@ -222,16 +222,20 @@ static void dump_all(void)
 }
 
 [[gnu::nonnull]]
-static int mds_detach_and_free(struct message_delivery_state *mds, bool session_lock)
+static int mds_detach_and_free(struct message_delivery_state *mds, bool session_lock, bool message_lock)
 {
     int rc = 0;
 
     if (mds->message) {
+        if (message_lock)
+            pthread_rwlock_wrlock(&mds->message->delivery_states_lock);
         if (remove_delivery_state(&mds->message->delivery_states,
                     &mds->message->num_message_delivery_states, mds) == -1) {
             warn("free_topic: remove_delivery_state(message)");
             rc = -1;
         }
+        if (message_lock)
+            pthread_rwlock_unlock(&mds->message->delivery_states_lock);
         DEC_REFCNT(&mds->message->refcnt);
         mds->message = NULL;
     }
@@ -380,7 +384,7 @@ static void free_topic(struct topic *topic)
         while (msg->num_message_delivery_states && msg->delivery_states)
         {
             assert(msg->delivery_states[0] != NULL);
-            mds_detach_and_free(msg->delivery_states[0], true);
+            mds_detach_and_free(msg->delivery_states[0], true, false);
         }
         pthread_rwlock_unlock(&msg->delivery_states_lock);
 
@@ -479,7 +483,7 @@ static void free_delivery_states(pthread_rwlock_t *lock, unsigned num, struct me
     for (unsigned idx = 0; idx < num; idx++) {
         if (*msgs[idx] == NULL)
             continue;
-        mds_detach_and_free(*msgs[idx], false);
+        mds_detach_and_free(*msgs[idx], false, false);
     }
     pthread_rwlock_unlock(lock);
 
@@ -1703,8 +1707,9 @@ static void close_all_sockets(void)
 static void free_all_message_delivery_states(void)
 {
     dbg_printf("     free_all_message_delivery_states\n");
+    /* don't bother locking this late in tear down */
     while (global_mds_list)
-        free_message_delivery_state(global_mds_list);
+        mds_detach_and_free(global_mds_list, false, false); 
 }
 
 static void free_all_sessions(void)
@@ -1969,7 +1974,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
                     &msg->delivery_states_lock,
                     mds) == -1) {
             warn("enqueue_message: add_to_delivery_state(msg)");
-            mds_detach_and_free(mds, true);
+            mds_detach_and_free(mds, true, true);
             continue;
         }
 
@@ -1979,7 +1984,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
                     &session->delivery_states_lock,
                     mds) == -1) {
             warn("enqueue_message: add_to_delivery_state(session)");
-            mds_detach_and_free(mds, true);
+            mds_detach_and_free(mds, true, true);
             continue;
         }
     }
@@ -3870,7 +3875,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                         &msg->delivery_states_lock,
                         mds) == -1) {
                 warn("handle_cp_subscribe: retain: add_to_delivery_state(msg)");
-                mds_detach_and_free(mds, true);
+                mds_detach_and_free(mds, true, true);
                 continue;
             }
 
@@ -3879,7 +3884,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                         &client->session->delivery_states_lock,
                         mds) == -1) {
                 warn("handle_cp_subscribe: retain: add_to_delivery_state(session)");
-                mds_detach_and_free(mds, true);
+                mds_detach_and_free(mds, true, true);
                 continue;
             }
 
@@ -4711,7 +4716,7 @@ again:
                     mds->message ? mds->message->id : 0,
                     mds->message ? mds->message->refcnt : 0);
 
-            mds_detach_and_free(mds, true);
+            mds_detach_and_free(mds, true, false);
         }
 
         /* We can't just dequeue() and MSG_DEAD if any mds are not complated_at */
