@@ -3959,7 +3959,7 @@ skip:
         }
     }
 
-    client->state = CS_CLOSING;
+    client->state = CS_DISCONNECTED;
     return 0;
 
 fail:
@@ -3993,6 +3993,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     uint16_t connect_header_length, keep_alive;
     uint8_t protocol_version, connect_flags;
     uint8_t protocol_name[4];
+    const struct property *prop;
 
     uint8_t *will_topic = NULL;
     uint8_t will_qos = 0;
@@ -4172,6 +4173,30 @@ create_new_session:
         client->num_will_props = num_will_props;
     }
 
+    if (get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_SESSION_EXPIRY_INTERVAL, &prop) == 0)
+        client->session->expiry_interval = prop->byte4;
+
+    if (get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_REQUEST_RESPONSE_INFORMATION, &prop) == 0)
+        client->session->request_response_information = prop->byte;
+    
+    if (get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_REQUEST_PROBLEM_INFORMATION, &prop) == 0)
+        client->session->request_problem_information = prop->byte;
+
+    if (get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_AUTHENTICATION_METHOD, &prop) == 0) {
+        reason_code = MQTT_BAD_AUTHENTICATION_METHOD;
+        goto fail;
+    }
+
+    if (get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_AUTHENTICATION_DATA, &prop) == 0) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
+
     if (send_cp_connack(client, MQTT_SUCCESS) == -1) {
         reason_code = MQTT_UNSPECIFIED_ERROR;
         goto fail;
@@ -4314,7 +4339,7 @@ more:
                 return 0;
             } else if (rd_len == -1) {
                 log_io_error(NULL, rd_len, client->read_need, false);
-                goto fail;
+                goto eof;
             } else if (rd_len == 0) {
 eof:
                 dbg_printf("[%2d] parse_incoming: %s EOF on client=%u <%s>\n",
@@ -4548,12 +4573,19 @@ static void client_tick(void)
 
                     clnt->session->last_connected = time(0);
                     clnt->session->client = NULL;
+
+                    if (clnt->session->expiry_interval == 0)
+                        clnt->session->state = SESSION_DELETE;
+
                     DEC_REFCNT(&clnt->session->refcnt);
                     clnt->session = NULL;
                 }
                 goto skip_send_disconnect;
 
             case CS_CLOSING:
+                if (clnt->session)
+                    warnx("[%2d] client_tick: session present in CS_CLOSING", clnt->session->id);
+
                 if (clnt->disconnect_reason) {
                     send_cp_disconnect(clnt, clnt->disconnect_reason);
                     clnt->disconnect_reason = 0;

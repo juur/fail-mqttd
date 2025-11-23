@@ -358,6 +358,10 @@ struct session {
 
     time_t last_connected;
 
+    uint32_t expiry_interval;
+    bool request_response_information;
+    bool request_problem_information;
+
     session_state_t state;
 
     alignas(16) _Atomic unsigned refcnt;
