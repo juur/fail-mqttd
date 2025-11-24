@@ -12,12 +12,21 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <sys/select.h>
-#include <stdatomic.h>
+#ifdef HAVE_STDATOMIC_H
+# include <stdatomic.h>
+#else
+# warning "stdatomic.h is missing"
+# define _Atomic
+#endif
 #include <signal.h>
 #include <assert.h>
-#include <pthread.h>
 #include <arpa/inet.h>
 #include <limits.h>
+#ifdef HAVE_PTHREAD_H
+# include <pthread.h>
+#else
+# error "pthread.h is required"
+#endif
 
 #include "mqtt.h"
 
@@ -27,9 +36,15 @@
 # define dbg_printf(...) printf(__VA_ARGS__)
 #endif
 
-#define GET_REFCNT(x) atomic_load_explicit(x, memory_order_relaxed)
-#define DEC_REFCNT(x) atomic_fetch_sub_explicit(x, 1, memory_order_acq_rel)
-#define INC_REFCNT(x) atomic_fetch_add_explicit(x, 1, memory_order_relaxed)
+#ifdef HAVE_STDATOMIC_H
+# define GET_REFCNT(x) atomic_load_explicit(x, memory_order_relaxed)
+# define DEC_REFCNT(x) atomic_fetch_sub_explicit(x, 1, memory_order_acq_rel)
+# define INC_REFCNT(x) atomic_fetch_add_explicit(x, 1, memory_order_relaxed)
+#else
+# define GET_REFCNT(x) x
+# define DEC_REFCNT(x) x--
+# define INC_REFCNT(x) x++
+#endif
 
 #define CRESET "\x1b[0m"
 #define BBLK "\x1b[1;30m"
@@ -69,15 +84,15 @@ static _Atomic id_t mds_id          = 1;
  * magic numbers
  */
 
-static constexpr unsigned MAX_PACKETS           = 256;
-static constexpr unsigned MAX_CLIETNS           = 64;
-static constexpr unsigned MAX_TOPICS            = 1024;
-static constexpr unsigned MAX_MESSAGES          = 16384;
-static constexpr unsigned MAX_PACKET_LENGTH     = 0x1000000U;
-static constexpr unsigned MAX_MESSAGES_PER_TICK = 100;
-static constexpr unsigned MAX_PROPERTIES        = 32;
-static constexpr unsigned MAX_RECEIVE_PUBS      = 8;
-static constexpr unsigned MAX_SESSIONS          = 128;
+static const unsigned MAX_PACKETS           = 256;
+static const unsigned MAX_CLIETNS           = 64;
+static const unsigned MAX_TOPICS            = 1024;
+static const unsigned MAX_MESSAGES          = 16384;
+static const unsigned MAX_PACKET_LENGTH     = 0x1000000U;
+static const unsigned MAX_MESSAGES_PER_TICK = 100;
+static const unsigned MAX_PROPERTIES        = 32;
+static const unsigned MAX_RECEIVE_PUBS      = 8;
+static const unsigned MAX_SESSIONS          = 128;
 
 /*
  * global lists and associated locks & counts
@@ -515,10 +530,13 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
     struct packet *tmp;
     unsigned lck;
 
-    dbg_printf("     free_packet: id=%u owner=%u <%s>\n",
+    dbg_printf("     free_packet: id=%u owner=%u <%s> owner.session=%u <%s>\n",
             pck->id,
             pck->owner ? pck->owner->id : 0,
-            pck->owner ? (char *)pck->owner->client_id : "");
+            pck->owner ? (char *)pck->owner->client_id : "",
+            (pck->owner && pck->owner->session) ? pck->owner->session->id : 0,
+            (pck->owner && pck->owner->session) ? (char *)pck->owner->session->client_id : ""
+            );
 
     if ((lck = GET_REFCNT(&pck->refcnt)) > 0) {
         warnx("free_packet: attempt to free with refcnt=%u", lck);
@@ -1549,6 +1567,9 @@ static int parse_properties(
 
     errno = 0;
 
+    if (*bytes_left == 0)
+        return 0;
+
     properties_length = read_var_byte(ptr, bytes_left);
 
     if (properties_length == 0 && errno)
@@ -2448,7 +2469,7 @@ static int subscribe_to_topics(struct session *session,
 
         request->options[idx] = 0;
         request->topic_refs[idx] = tmp_topic;
-        
+
         if (existing_idx == -1)
             session->num_subscriptions++;
     }
@@ -2610,11 +2631,18 @@ static int send_cp_publish(struct packet *pkt)
     uint16_t tmp, topic_len;
     const struct message *msg;
 
+    errno = 0;
+
     assert(pkt->message != NULL);
     assert(pkt->message->topic != NULL);
     assert(pkt->owner != NULL);
 
-    dbg_printf("[%2d] send_cp_publish: owner=%s\n",
+    if (pkt->owner->state != CS_ACTIVE) {
+        errno = EBADF;
+        return -1;
+    }
+
+    dbg_printf("[%2d] send_cp_publish: owner=<%s>\n",
             pkt->owner->session->id, (char *)pkt->owner->client_id);
 
     errno = 0;
@@ -2623,7 +2651,7 @@ static int send_cp_publish(struct packet *pkt)
 
     /* Populate Properties */
     const struct property props[] = {
-        { },
+        { 0 },
     };
     const unsigned num_props = 0; /* sizeof(props) / sizeof(struct property) */
 
@@ -2713,12 +2741,13 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
 
     length = 0;
     length += 1; /* Disconnect Reason Code */
+    length += 1; /* Property Length */
 
     if ((remlen_len = encode_var_byte(length, remlen)) == -1)
         return -1;
 
     length += sizeof(struct mqtt_fixed_header);
-    length += remlen_len; /* Properties Length */
+    length += remlen_len; /* Remaining Length */
 
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
@@ -2727,12 +2756,12 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
     ptr++;
 
     memcpy(ptr, remlen, remlen_len);
-    ptr+= remlen_len;
+    ptr += remlen_len;
 
     *ptr = reason_code;
     ptr++;
 
-    *ptr = 0;
+    *ptr = 0; /* Property Length */
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
@@ -4216,8 +4245,9 @@ create_new_session:
             goto create_new_session;
         }
         client->connect_response_flags |= MQTT_CONNACK_FLAG_SESSION_PRESENT;
-        dbg_printf("[%2d] handle_cp_connect: connection re-established\n",
-                client->session->id);
+        dbg_printf("[%2d] handle_cp_connect: connection re-established to client %d\n",
+                client->session->id, client->id);
+        client->session->client = client;
     }
     INC_REFCNT(&client->session->refcnt);
     client->session->last_connected = time(0);
@@ -4230,15 +4260,16 @@ create_new_session:
         }
         free(will_topic); /* find_or_register_topic duplicates */
         will_topic = NULL;
+
         INC_REFCNT(&client->will_topic->refcnt);
 
-        client->will_retain = will_retain;
-        client->will_payload = will_payload;
-        client->will_payload_len = will_payload_len;
-        client->will_qos = will_qos;
+        client->will_retain         = will_retain;
+        client->will_payload        = will_payload;
+        client->will_payload_len    = will_payload_len;
+        client->will_qos            = will_qos;
         client->will_payload_format = payload_format;
-        client->will_props = will_props;
-        client->num_will_props = num_will_props;
+        client->will_props          = will_props;
+        client->num_will_props      = num_will_props;
     }
 
     if (get_property_value(packet->properties, packet->property_count,
@@ -4645,9 +4676,10 @@ static void client_tick(void)
                     clnt->session->client = NULL;
 
                     /* TODO set a sensible maximum */
-                    if (clnt->session->expiry_interval == 0)
+                    if (clnt->session->expiry_interval == 0) {
+                        dbg_printf("[%2d] client_tick: expiring session instantly\n", clnt->session->id);
                         clnt->session->state = SESSION_DELETE;
-                    else
+                    } else
                         clnt->session->expires_at = now + clnt->session->expiry_interval;
 
                     DEC_REFCNT(&clnt->session->refcnt);
@@ -4699,9 +4731,9 @@ static void tick_msg(struct message *msg)
 
     time_t now = time(0);
 
-    dbg_printf(NGRN "     tick_msg: id=%u sender.id=%d #mds=%u"CRESET"\n",
-            msg->id, msg->sender ? msg->sender->id : (id_t)-1,
-            msg->num_message_delivery_states);
+    //dbg_printf(NGRN "     tick_msg: id=%u sender.id=%d #mds=%u"CRESET"\n",
+    //        msg->id, msg->sender ? msg->sender->id : (id_t)-1,
+    //        msg->num_message_delivery_states);
 
     pthread_rwlock_wrlock(&msg->delivery_states_lock);
     for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
@@ -4727,11 +4759,14 @@ static void tick_msg(struct message *msg)
         }
 
         /* disconnected session */
-        if (mds->session->client == NULL)
+        if (mds->session->client == NULL) {
+            //dbg_printf(NGRN"     tick_msg: skipping missing client for session %d"CRESET"\n", mds->session->id);
             continue;
+        }
 
-        dbg_printf(NGRN"     tick_msg: sending message: id=%u acknowledged_at=%lu last_sent=%lu"CRESET"\n",
-                mds->id, mds->acknowledged_at, mds->last_sent);
+        dbg_printf(BGRN"     tick_msg: sending message: id=%u subscriber.id=%d <%s> ackat=%lu lastsent=%lu"CRESET"\n",
+                mds->id, mds->session->id, (char *)mds->session->client_id,
+                mds->acknowledged_at, mds->last_sent);
 
         if ((packet = alloc_packet(mds->session->client)) == NULL) {
             warn("tick_msg: unable to alloc_packet for msg on topic <%s>",
@@ -4766,7 +4801,7 @@ static void tick_msg(struct message *msg)
         packet->reason_code = MQTT_SUCCESS;
 
         /* TODO make this async START ?? */
-        mds->last_sent = time(0);
+        mds->last_sent = now;
         if (send_cp_publish(packet) == -1) {
             mds->last_sent = 0;
             warn("tick_msg: unable to send_cp_publish");
@@ -4778,7 +4813,7 @@ static void tick_msg(struct message *msg)
 
         /* Unless we get a network error, just assume it works */
         if (msg->qos == 0) {
-            mds->acknowledged_at = time(0);
+            mds->acknowledged_at = now;
             mds->completed_at = mds->acknowledged_at;
             mds->released_at = mds->acknowledged_at;
         }
@@ -4789,8 +4824,8 @@ static void tick_msg(struct message *msg)
         /* TODO async END */
     }
 
-    dbg_printf(NGRN"     tick_msg: num_sent=%u num_message_delivery_states=%u"CRESET"\n",
-            num_sent, msg->num_message_delivery_states);
+    //dbg_printf(NGRN"     tick_msg: num_sent=%u num_message_delivery_states=%u"CRESET"\n",
+    //        num_sent, msg->num_message_delivery_states);
 
     /* We have now sent everything */
     if (num_sent == num_to_send /*msg->num_message_delivery_states*/) { /* TODO this doesn't handle holes? */
@@ -4908,7 +4943,7 @@ static void session_tick(void)
                 while(session->subscriptions && (*session->subscriptions)[0])
                     if (unsubscribe((*session->subscriptions)[0]) == -1)
                         warn("session_tick: unsubscribe");
-            } else { 
+            } else {
                 free_session(session, false);
                 session = NULL;
             }

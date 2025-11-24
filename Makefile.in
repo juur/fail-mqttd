@@ -13,8 +13,8 @@ LEX             := @@LEX@@
 YACC		    := @@YACC@@
 LFLAGS          := @@LFLAGS@@
 YFLAGS          := -d -t @@YFLAGS@@
-CFLAGS          := -std=c2x @@CFLAGS@@
-CPPFLAGS        := @@CPPFLAGS@@ -DNDEBUG
+CFLAGS          := -std=c2x -Og -ggdb -D_FORTIFY_SOURCE=2 -fstack-protector-strong @@CFLAGS@@
+CPPFLAGS        := -DNDEBUG @@CPPFLAGS@@
 LDFLAGS         := -L$(srcdir)/src -L$(objdir) -L. @@LDFLAGS@@
 CAT             := cat
 CP              := cp
@@ -49,7 +49,7 @@ ifeq ($(DEPS),1)
 CPPFLAGS += -MMD -MP
 endif
 CPPFLAGS += -I$(objdir) -I$(srcdir)/src
-CPPFLAGS += -D_XOPEN_SOURCE=700 -I$(srcdir)/include
+CPPFLAGS += -I$(srcdir)/include
 
 .PHONY: all
 all: $(objdir)/.d $(objdir)/$(PACKAGE) $(objdir)/$(PACKAGE).8

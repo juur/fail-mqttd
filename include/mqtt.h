@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <uchar.h>
 #include <arpa/inet.h>
+#include <stdbool.h>
 
 struct mqtt_fixed_header {
     unsigned flags:4;
@@ -261,7 +262,7 @@ struct packet {
     //unsigned num_will_props;
     reason_code_t reason_code;
 
-    alignas(16) _Atomic unsigned refcnt;
+    _Atomic unsigned refcnt;
 };
 
 struct client;
@@ -314,7 +315,7 @@ struct message {
     time_t completed_at;        /*   PUBACK-> |   PUBCOMP-> */
 #endif
 
-    alignas(16) _Atomic unsigned refcnt;
+    _Atomic unsigned refcnt;
 };
 
 struct topic_sub_request {
@@ -365,7 +366,7 @@ struct session {
 
     session_state_t state;
 
-    alignas(16) _Atomic unsigned refcnt;
+    _Atomic unsigned refcnt;
 };
 
 struct client {
@@ -421,7 +422,7 @@ struct client {
     time_t will_at;
 
 
-    alignas(16) _Atomic unsigned refcnt;
+    _Atomic unsigned refcnt;
 
     char hostname[INET_ADDRSTRLEN];
 };
@@ -436,7 +437,7 @@ struct topic {
     pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;
     unsigned num_subscribers;
-    alignas(16) _Atomic unsigned refcnt;
+    _Atomic unsigned refcnt;
 };
 
 

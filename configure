@@ -189,7 +189,7 @@ check_lib()
 	local F=/tmp/$$.c
 
 	echo "#define _XOPEN_SOURCE 700" >${F}
-	echo 'main(){}' >>${F}
+	echo 'void main(void){}' >>${F}
 	echo -n "Checking for -l${1} ... "
 	# shellcheck disable=SC2086
 	"${CC}" ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} -l"${1}" "${F}" -o /dev/null 2>>config.log
@@ -266,7 +266,7 @@ else
 fi
 
 echo -n "Checking $(basename "${CC}") can produce executables ... "
-echo -e '#include <stdlib.h>\nmain() {exit(0);}' | \
+echo -e '#include <stdlib.h>\nvoid main(void) {exit(0);}' | \
 	if "${CC}" -xc -o /dev/null - 2>>config.log; then 
 		echo "ok"
 	else
@@ -282,7 +282,7 @@ echo "objdir = ${OBJDIR}; srcdir = ${SRCDIR};"
 
 # List of system headers we need to check for
 
-H_FILES="stdlib.h netinet/in.h sys/socket.h fcntl.h unistd.h err.h stdio.h string.h stdbool.h errno.h sys/select.h stdatomic.h signal.h"
+H_FILES="stdlib.h netinet/in.h sys/socket.h fcntl.h unistd.h err.h stdio.h string.h stdbool.h errno.h sys/select.h stdatomic.h signal.h assert.h pthread.h arpa/inet.h limits.h"
 
 # List of system functions to check for function:arg0,arg1
 

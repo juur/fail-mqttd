@@ -2,4 +2,3 @@
 -std=c2x
 -Wall
 -Wextra
--Wpedantic
