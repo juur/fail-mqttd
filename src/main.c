@@ -725,27 +725,8 @@ static void free_client(struct client *client, bool needs_lock)
     }
     pthread_rwlock_unlock(&global_packets_lock);
 
-
     if (client->fd != -1)
         close_socket(&client->fd);
-
-    if (client->will_payload) {
-        free(client->will_payload);
-        client->will_payload = NULL;
-    }
-
-    client->will_payload_len = 0;
-
-    if (client->will_topic) {
-        DEC_REFCNT(&client->will_topic->refcnt);
-        client->will_topic = NULL;
-    }
-
-    if (client->will_props) {
-        free_properties(client->will_props, client->num_will_props);
-        client->will_props = NULL;
-        client->num_will_props = 0;
-    }
 
     if (client->client_id) {
         free ((void *)client->client_id);
@@ -842,6 +823,24 @@ static void free_session(struct session *session, bool need_lock)
     if (session->client_id) {
         free((void *)session->client_id);
         session->client_id = NULL;
+    }
+
+    if (session->will_payload) {
+        free(session->will_payload);
+        session->will_payload = NULL;
+    }
+
+    session->will_payload_len = 0;
+
+    if (session->will_topic) {
+        DEC_REFCNT(&session->will_topic->refcnt);
+        session->will_topic = NULL;
+    }
+
+    if (session->will_props) {
+        free_properties(session->will_props, session->num_will_props);
+        session->will_props = NULL;
+        session->num_will_props = 0;
     }
 
     pthread_rwlock_destroy(&session->subscriptions_lock);
@@ -2714,12 +2713,17 @@ static int send_cp_publish(struct packet *pkt)
 
     memcpy(ptr, msg->payload, msg->payload_len);
 
+    /* [MQTT-3.1.2-25] */
+    if (pkt->owner->maximum_packet_size && length > pkt->owner->maximum_packet_size)
+        goto skip_write;
+
     /* Now send the packet */
     if ((wr_len = write(pkt->owner->fd, packet, length)) != length) {
         free(packet);
         return log_io_error(NULL, wr_len, length, false);
     }
 
+skip_write:
     free(packet);
     return 0;
 
@@ -2805,7 +2809,8 @@ static int send_cp_pingresp(struct client *client)
         return log_io_error(NULL, wr_len, length, false);
     }
 
-    client->last_keep_alive = time(0);
+    /* last_keep_alive is updated in parse_incoming after
+     * any successful control packets */
     free(packet);
 
     return 0;
@@ -4037,20 +4042,20 @@ skip:
         goto fail;
 
     if (disconnect_reason == 0) {
-        if (client->will_retain) {
-            client->will_retain = false;
-            if (client->will_payload) {
-                free(client->will_payload);
-                client->will_payload = NULL;
+        if (client->session && client->session->will_retain) {
+            client->session->will_retain = false;
+            if (client->session->will_payload) {
+                free(client->session->will_payload);
+                client->session->will_payload = NULL;
             }
-            if (client->will_topic) {
-                DEC_REFCNT(&client->will_topic->refcnt);
-                client->will_topic = NULL;
+            if (client->session->will_topic) {
+                DEC_REFCNT(&client->session->will_topic->refcnt);
+                client->session->will_topic = NULL;
             }
-            if (client->will_props) {
-                free_properties(client->will_props, client->num_will_props);
-                client->num_will_props = 0;
-                client->will_props = NULL;
+            if (client->session->will_props) {
+                free_properties(client->session->will_props, client->session->num_will_props);
+                client->session->num_will_props = 0;
+                client->session->will_props = NULL;
             }
         }
     }
@@ -4099,6 +4104,11 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     uint8_t payload_format = 0;
     struct property (*will_props)[] = NULL;
     unsigned num_will_props = 0;
+
+    if (client->state != CS_ACTIVE || client->protocol_version == 0) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
 
     if (bytes_left < 2+4+1+1+2) /* Connect Header, Protocol Name, Protocol Version, Connect Flags, Keep Alive */
         goto fail;
@@ -4253,7 +4263,7 @@ create_new_session:
     client->session->last_connected = time(0);
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
-        if ((client->will_topic = find_or_register_topic(will_topic)) == NULL) {
+        if ((client->session->will_topic = find_or_register_topic(will_topic)) == NULL) {
             errno = EINVAL;
             reason_code = MQTT_TOPIC_NAME_INVALID;
             goto fail;
@@ -4261,15 +4271,15 @@ create_new_session:
         free(will_topic); /* find_or_register_topic duplicates */
         will_topic = NULL;
 
-        INC_REFCNT(&client->will_topic->refcnt);
+        INC_REFCNT(&client->session->will_topic->refcnt);
 
-        client->will_retain         = will_retain;
-        client->will_payload        = will_payload;
-        client->will_payload_len    = will_payload_len;
-        client->will_qos            = will_qos;
-        client->will_payload_format = payload_format;
-        client->will_props          = will_props;
-        client->num_will_props      = num_will_props;
+        client->session->will_retain         = will_retain;
+        client->session->will_payload        = will_payload;
+        client->session->will_payload_len    = will_payload_len;
+        client->session->will_qos            = will_qos;
+        client->session->will_payload_format = payload_format;
+        client->session->will_props          = will_props;
+        client->session->num_will_props      = num_will_props;
     }
 
     if (get_property_value(packet->properties, packet->property_count,
@@ -4296,6 +4306,11 @@ create_new_session:
         goto fail;
     }
 
+    if (get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_MAXIMUM_PACKET_SIZE, &prop) == 0) {
+        client->maximum_packet_size = prop->byte4;
+    }
+
     if (send_cp_connack(client, MQTT_SUCCESS) == -1) {
         reason_code = MQTT_UNSPECIFIED_ERROR;
         goto fail;
@@ -4306,7 +4321,7 @@ fail:
     if (send_cp_connack(client, reason_code) == -1) {
         client->state = CS_CLOSING;
         if (client->disconnect_reason == 0)
-            client->disconnect_reason = MQTT_UNSPECIFIED_ERROR;
+            client->disconnect_reason = reason_code;
     }
 
     if (will_topic)
@@ -4575,6 +4590,7 @@ exec_control:
                 warn("control_function");
                 goto fail;
             }
+            client->last_keep_alive = time(0);
 
             if (DEC_REFCNT(&client->new_packet->refcnt) == 1)
                 free_packet(client->new_packet, true, true);
@@ -4620,11 +4636,20 @@ static void client_tick(void)
         switch (clnt->state)
         {
             case CS_ACTIVE:
+                time_t now = time(0);
+
                 if (clnt->session == NULL && clnt->tcp_accepted_at != 0
                         && (time(0) - clnt->tcp_accepted_at) > 5) {
-                    warnx("client_tick: closing idle link without CONNECTION");
+                    warnx("client_tick: closing idle link: no CONNECTION");
                     goto force_close;
                 }
+
+                /* [MQTT-3.1.2-22] */
+                if (now > clnt->last_keep_alive + (clnt->keep_alive * 1.5f)) {
+                    warnx("client_tick: closing idle link: no PINGREQ within Keep Alive");
+                    goto force_close;
+                }
+
                 break;
 
             case CS_NEW:
@@ -4633,54 +4658,39 @@ static void client_tick(void)
             case CS_DISCONNECTED:
                 if (clnt->session) {
                     time_t now = time(0);
-                    if (clnt->will_topic) {
-                        struct message *msg;
 
+                    /* Prepare the Will Message to be sent, optionally
+                     * delaying by Will Delay. session_tick() will actually
+                     * send. */
+                    if (clnt->session->will_topic) {
                         dbg_printf("[%2d] client_tick: handling WILL\n",
                                 clnt->session->id);
 
-                        if (clnt->will_props)
-                            if (get_property_value(clnt->will_props,
-                                        clnt->num_will_props,
+                        will_delay = 0;
+                        if (clnt->session->will_props) {
+                            if (get_property_value(clnt->session->will_props,
+                                        clnt->session->num_will_props,
                                         MQTT_PROP_WILL_DELAY_INTERVAL,
                                         &prop) != -1)
                                 will_delay = prop->byte4;
-                        clnt->will_at = now + will_delay;
-
-                        /* TODO handle a) Will Delay Interval or b) Session end is the trigger */
-                        if ((msg = register_message(clnt->will_topic->name,
-                                    clnt->will_payload_format,
-                                    clnt->will_payload_len,
-                                    clnt->will_payload,
-                                    clnt->will_qos,
-                                    clnt->session, clnt->will_retain)) == NULL) {
-                            warn("client_tick: register_message(will)");
-                            if (clnt->will_payload) {
-                                free(clnt->will_payload);
-                                clnt->will_payload = NULL;
-                            }
                         }
-                        msg->sender_status.completed_at = now;
-                        msg->sender_status.last_sent = now;
-                        msg->sender_status.accepted_at = now;
-                        msg->sender_status.released_at = now;
-
-                        clnt->will_payload = NULL;
-                        clnt->will_retain = false;
-
-                        DEC_REFCNT(&clnt->will_topic->refcnt);
-                        clnt->will_topic = NULL;
+                        clnt->session->will_at = now + will_delay;
                     }
 
                     clnt->session->last_connected = now;
                     clnt->session->client = NULL;
 
                     /* TODO set a sensible maximum */
+                    /* [MQTT-3.1.2-23 */
                     if (clnt->session->expiry_interval == 0) {
                         dbg_printf("[%2d] client_tick: expiring session instantly\n", clnt->session->id);
                         clnt->session->state = SESSION_DELETE;
-                    } else
+                    } else if (clnt->session->expiry_interval == UINT_MAX) {
+                        clnt->session->expires_at = now - 1; /* "does not expire" */
+                    } else {
                         clnt->session->expires_at = now + clnt->session->expiry_interval;
+                    }
+
 
                     DEC_REFCNT(&clnt->session->refcnt);
                     clnt->session = NULL;
@@ -4936,6 +4946,9 @@ static void session_tick(void)
     {
         next = session->next;
 
+        if (session->state == SESSION_NEW)
+            continue;
+
         if (session->state == SESSION_DELETE) {
             if (GET_REFCNT(&session->refcnt) > 0) {
                 /* as the session is SESSION_DELETE, check we're unsubscribed
@@ -4947,12 +4960,44 @@ static void session_tick(void)
                 free_session(session, false);
                 session = NULL;
             }
-        } else if (session->client == NULL) {
+        } else if (session->client == NULL) { /* SESSION_ACTIVE */
             if (session->expires_at == 0 || now > session->expires_at) {
                 dbg_printf("[%2d] setting SESSION_DELETE refcnt is %u\n",
                         session->id, GET_REFCNT(&session->refcnt));
                 session->state = SESSION_DELETE;
+
+                if (session->will_at)
+                    goto force_will;
             }
+        }
+
+        if (session->will_at && (now > session->will_at)) {
+force_will:
+            struct message *msg;
+            /* a) Will Delay Interval or b) Session end is the trigger */
+            if ((msg = register_message(session->will_topic->name,
+                            session->will_payload_format,
+                            session->will_payload_len,
+                            session->will_payload,
+                            session->will_qos,
+                            session, session->will_retain)) == NULL) {
+                warn("client_tick: register_message(will)");
+                if (session->will_payload) {
+                    free(session->will_payload);
+                    session->will_payload = NULL;
+                }
+            }
+            msg->sender_status.completed_at = now;
+            msg->sender_status.last_sent = now;
+            msg->sender_status.accepted_at = now;
+            msg->sender_status.released_at = now;
+
+            session->will_payload = NULL;
+            session->will_retain = false;
+
+            DEC_REFCNT(&session->will_topic->refcnt);
+            session->will_topic = NULL;
+            session->will_at = 0;
         }
     }
     pthread_rwlock_unlock(&global_sessions_lock);

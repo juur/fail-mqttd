@@ -366,6 +366,17 @@ struct session {
 
     session_state_t state;
 
+    /* Will Flag handling */
+    struct topic *will_topic;
+    struct property (*will_props)[];
+    unsigned num_will_props;
+    void *will_payload;
+    size_t will_payload_len;
+    unsigned will_payload_format;
+    unsigned will_qos;
+    bool will_retain;
+    time_t will_at;
+
     _Atomic unsigned refcnt;
 };
 
@@ -397,6 +408,7 @@ struct client {
     time_t last_connected;
     time_t last_keep_alive;
     reason_code_t disconnect_reason;
+    uint32_t maximum_packet_size;
 
     /* used by parse_incoming() */
     uint8_t *packet_buf;
@@ -409,18 +421,6 @@ struct client {
     unsigned rl_multi;
     unsigned rl_offset;
     uint8_t header_buffer[sizeof(struct mqtt_fixed_header) + 4];
-
-    /* Will Flag handling */
-    struct topic *will_topic;
-    struct property (*will_props)[];
-    unsigned num_will_props;
-    void *will_payload;
-    size_t will_payload_len;
-    unsigned will_payload_format;
-    unsigned will_qos;
-    bool will_retain;
-    time_t will_at;
-
 
     _Atomic unsigned refcnt;
 
