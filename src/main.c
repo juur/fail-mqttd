@@ -1090,6 +1090,7 @@ fail:
     return NULL;
 }
 
+/* [MQTT-3.1.3-2] */
 [[gnu::nonnull, gnu::warn_unused_result]]
 static struct session *find_session(struct client *client)
 {
@@ -1099,11 +1100,6 @@ static struct session *find_session(struct client *client)
         if (strcmp((const char *)tmp->client_id,
                     (const char *)client->client_id))
             continue;
-
-        if (tmp->client) {
-            /* TODO */
-            continue;
-        }
 
         pthread_rwlock_unlock(&global_sessions_lock);
         return tmp;
@@ -1305,6 +1301,69 @@ static void *read_binary(const uint8_t **const ptr, size_t *bytes_left,
     return blob;
 }
 
+/* [MQTT-3.1.3-5]. */
+static int is_valid_connection_id(const uint8_t *str)
+{
+    const uint8_t *ptr = str;
+
+    errno = 0;
+
+    while (*ptr)
+    {
+        if (*ptr >= '0' && *ptr <= '9')
+            goto next;
+        if (*ptr >= 'A' && *ptr <= 'Z')
+            goto next;
+        if (*ptr >= 'a' && *ptr <= 'z')
+            goto next;
+
+        errno = EINVAL;
+        return -1;
+
+next:
+        ptr++;
+    }
+
+    return 0;
+}
+
+static int is_valid_utf8(const uint8_t *str)
+{
+    const uint8_t *ptr = str;
+
+    unsigned bytes;
+
+    while (*ptr)
+    {
+        if (*ptr < 0x80) {
+            ptr++;
+            continue;
+        }
+
+        if ((*ptr & 0xc0) == 0x80)
+            bytes = 1;
+        else if ((*ptr & 0xe0) == 0xc0)
+            bytes = 2;
+        else if ((*ptr & 0xf0) == 0xe0)
+            bytes = 3;
+        else
+            return -1;
+
+        ptr++;
+
+        while(bytes--)
+        {
+            if (*ptr == '\0')
+                return -1;
+            if ((*ptr & 0xc0) != 0x80)
+                return -1;
+            ptr++;
+        }
+    }
+
+    return 0;
+}
+
 [[gnu::nonnull, gnu::warn_unused_result]]
 static uint8_t *read_utf8(const uint8_t **const ptr, size_t *bytes_left)
 {
@@ -1347,6 +1406,9 @@ static uint8_t *read_utf8(const uint8_t **const ptr, size_t *bytes_left)
             }
         }
     }
+
+    if (is_valid_utf8(string) == -1)
+        goto fail;
 
     return string;
 fail:
@@ -4105,7 +4167,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     struct property (*will_props)[] = NULL;
     unsigned num_will_props = 0;
 
-    if (client->state != CS_ACTIVE || client->protocol_version == 0) {
+    if (client->state != CS_ACTIVE || client->protocol_version != 0) {
         reason_code = MQTT_PROTOCOL_ERROR;
         goto fail;
     }
@@ -4166,6 +4228,13 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
         goto fail;
     dbg_printf("[  ] handle_cp_connect: client_id=<%s> ",
             (char *)client->client_id);
+
+    /* [MQTT-3.1.3-5] */
+    if (is_valid_connection_id(client->client_id) == -1) {
+        warn("handle_cp_connect: invalid connection id");
+        reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
+        goto fail;
+    }
 
     if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START)
         dbg_printf("clean_start ");
@@ -4238,14 +4307,28 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 
     if ((client->session = find_session(client)) == NULL) {
         /* New Session */
+        dbg_printf("     handle_cp_connect: no existing session\n");
+
 create_new_session:
         if ((client->session = alloc_session(client)) == NULL) {
             reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
         }
-        dbg_printf("[%2d] handle_cp_connect: new_session\n", client->session->id);
+        dbg_printf("[%2d] handle_cp_connect: new session\n", client->session->id);
     } else {
         /* Existing Session */
+        dbg_printf("     handle_cp_connect: has existing session\n");
+
+        /* [MQTT-3.1.4-3] */
+        if (client->session->client) {
+            if (send_cp_disconnect(client->session->client, MQTT_SESSION_TAKEN_OVER) == -1)
+                client->session->client->state = CS_CLOSING;
+            DEC_REFCNT(&client->session->refcnt);
+            client->session->client->session = NULL;
+            client->session->client = NULL;
+        }
+
+        /* [MQTT-3.1.4-4] */
         if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
             /* ... we don't want to re-use it */
             dbg_printf("[  ] handle_cp_connect: clean existing session [%d]\n",
@@ -4254,6 +4337,8 @@ create_new_session:
             client->session = NULL;
             goto create_new_session;
         }
+        /* else [MQTT-3.1.2-5] */
+
         client->connect_response_flags |= MQTT_CONNACK_FLAG_SESSION_PRESENT;
         dbg_printf("[%2d] handle_cp_connect: connection re-established to client %d\n",
                 client->session->id, client->id);
@@ -4330,6 +4415,10 @@ fail:
         free_properties(will_props, num_will_props);
     if (will_payload)
         free(will_payload);
+
+    if (errno == 0)
+        errno = EINVAL;
+
     return -1;
 }
 
@@ -4645,7 +4734,8 @@ static void client_tick(void)
                 }
 
                 /* [MQTT-3.1.2-22] */
-                if (now > clnt->last_keep_alive + (clnt->keep_alive * 1.5f)) {
+                if (clnt->keep_alive &&
+                        now > clnt->last_keep_alive + (clnt->keep_alive * 1.5f)) {
                     warnx("client_tick: closing idle link: no PINGREQ within Keep Alive");
                     goto force_close;
                 }
@@ -4960,7 +5050,10 @@ static void session_tick(void)
                 free_session(session, false);
                 session = NULL;
             }
-        } else if (session->client == NULL) { /* SESSION_ACTIVE */
+            continue;
+        }
+
+        if (session->client == NULL) { /* SESSION_ACTIVE */
             if (session->expires_at == 0 || now > session->expires_at) {
                 dbg_printf("[%2d] setting SESSION_DELETE refcnt is %u\n",
                         session->id, GET_REFCNT(&session->refcnt));
@@ -5071,8 +5164,8 @@ static int main_loop(int mother_fd)
         tv.tv_usec = 10000;
 
         if (has_clients == false) {
-            tv.tv_sec = 1;
-            tv.tv_usec = 0;
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000;
             rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv);
         } else {
             rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv);
