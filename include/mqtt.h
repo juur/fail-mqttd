@@ -1,6 +1,9 @@
 #ifndef _FAIL_MQTT_H
 #define _FAIL_MQTT_H
-#define _XOPEN_SOURCE 800
+
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 700
+#endif
 
 #include <sys/types.h>
 #include <stdint.h>
@@ -33,7 +36,7 @@ struct mqtt_connack_header {
 } __attribute__((packed));
 
 typedef enum {
-    // Reserved = 0,
+    MQTT_CP_INVALID = 0,
     MQTT_CP_CONNECT = 1,
     MQTT_CP_CONNACK = 2,
     MQTT_CP_PUBLISH = 3,

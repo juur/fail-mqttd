@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE 800
+#define _XOPEN_SOURCE 700
 #include "config.h"
 
 #include <stdlib.h>
@@ -130,14 +130,14 @@ static struct in_addr opt_listen;
  * forward declarations
  */
 
-static int unsubscribe(struct subscription *sub);
-static int dequeue_message(struct message *msg);
-static void free_message(struct message *msg, bool need_lock);
-static struct topic *register_topic( const uint8_t *name);
-static int remove_delivery_state(
+[[gnu::nonnull]] static int unsubscribe(struct subscription *sub);
+[[gnu::nonnull]] static int dequeue_message(struct message *msg);
+[[gnu::nonnull]] static void free_message(struct message *msg, bool need_lock);
+[[gnu::nonnull]] static struct topic *register_topic( const uint8_t *name);
+[[gnu::nonnull]] static int remove_delivery_state(
         struct message_delivery_state ***state_array, unsigned *array_length,
         struct message_delivery_state *rem);
-static void free_message_delivery_state(struct message_delivery_state *mds);
+[[gnu::nonnull]] static void free_message_delivery_state(struct message_delivery_state *mds);
 
 /*
  * command line stuff
@@ -434,7 +434,7 @@ static void free_topic(struct topic *topic)
     free(topic);
 }
 
-[[gnu::nonnull, gnu::access(read_write,1,2)]]
+[[gnu::nonnull]]
 static void free_properties(
         struct property (*props)[], unsigned count)
 {
@@ -1609,8 +1609,9 @@ fail:
     return -1;
 }
 
-/* a type of -1U is used for situations where the properties are NOT the standard ones
- * in a packet, e.g. "will_properties" */
+/* a type of MQTT_CP_INVALID is used for situations where the
+ * properties are NOT the standard ones in a packet,
+ * e.g. "will_properties" */
 [[gnu::nonnull]]
 static int parse_properties(
         const uint8_t **ptr, size_t *bytes_left,
@@ -1676,7 +1677,8 @@ static int parse_properties(
 
         /* TODO perform "is this valid for this control type?" */
 
-        if (cp_type != -1U) /* for will_properties, there is cp_type */
+        /* for will_properties, there is no cp_type */
+        if (cp_type != MQTT_CP_INVALID)
             switch (prop->ident)
             {
                 default:
@@ -2159,7 +2161,7 @@ done:
 /**
  * refcnt for non-retained messages should only be touched in enqueue_message or dequeue_message
  */
-[[gnu::nonnull,gnu::access(read_only,4,3)]]
+[[gnu::nonnull]]
 static struct message *register_message(const uint8_t *topic_name, int format,
         uint16_t len, const void *payload, unsigned qos, struct session *sender,
         bool retain)
@@ -4242,7 +4244,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
         dbg_printf("will_properties ");
         if (parse_properties(&ptr, &bytes_left, &will_props,
-                    &num_will_props, -1) == -1)
+                    &num_will_props, MQTT_CP_INVALID) == -1)
             goto fail;
 
         dbg_printf("[%d props] will_topic ", num_will_props);
