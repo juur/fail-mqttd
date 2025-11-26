@@ -412,6 +412,8 @@ struct client {
     time_t last_keep_alive;
     reason_code_t disconnect_reason;
     uint32_t maximum_packet_size;
+    bool is_auth;
+    bool write_ok;
 
     /* used by parse_incoming() */
     uint8_t *packet_buf;

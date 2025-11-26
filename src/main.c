@@ -66,7 +66,7 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
  */
 
 static int mother_fd = -1;
-static bool running;
+static _Atomic bool running;
 
 /*
  * unique ids
@@ -1067,6 +1067,7 @@ static struct client *alloc_client(void)
     client->state = CS_NEW;
     client->fd = -1;
     client->parse_state = READ_STATE_NEW;
+    client->is_auth = false;
 
     if (pthread_rwlock_init(&client->active_packets_lock, NULL) == -1)
         goto fail;
@@ -4307,6 +4308,10 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     client->protocol_version = protocol_version;
     client->keep_alive = keep_alive;
 
+    /* FIXME */
+    if (client->username && client->password)
+        client->is_auth = true;
+
     if ((client->session = find_session(client)) == NULL) {
         /* New Session */
         dbg_printf("     handle_cp_connect: no existing session\n");
@@ -4478,18 +4483,21 @@ fail:
  * control packet function lookup table
  */
 
-static const control_func_t control_functions[MQTT_CP_MAX] = {
-    [MQTT_CP_PUBLISH]     = handle_cp_publish,
-    [MQTT_CP_PUBACK]      = handle_cp_puback,
-    [MQTT_CP_PUBREC]      = handle_cp_pubrec,
-    [MQTT_CP_PUBREL]      = handle_cp_pubrel,
-    [MQTT_CP_PUBCOMP]     = handle_cp_pubcomp,
-    [MQTT_CP_SUBSCRIBE]   = handle_cp_subscribe,
-    [MQTT_CP_UNSUBSCRIBE] = handle_cp_unsubscribe,
-    [MQTT_CP_CONNECT]     = handle_cp_connect,
-    [MQTT_CP_PINGREQ]     = handle_cp_pingreq,
-    [MQTT_CP_DISCONNECT]  = handle_cp_disconnect,
-    [MQTT_CP_AUTH]        = handle_cp_auth,
+static const struct {
+    control_func_t func;
+    bool needs_auth;
+} control_functions[MQTT_CP_MAX] = {
+    [MQTT_CP_PUBLISH]     = { handle_cp_publish     , true  },
+    [MQTT_CP_PUBACK]      = { handle_cp_puback      , true  },
+    [MQTT_CP_PUBREC]      = { handle_cp_pubrec      , true  },
+    [MQTT_CP_PUBREL]      = { handle_cp_pubrel      , true  },
+    [MQTT_CP_PUBCOMP]     = { handle_cp_pubcomp     , true  },
+    [MQTT_CP_SUBSCRIBE]   = { handle_cp_subscribe   , true  },
+    [MQTT_CP_UNSUBSCRIBE] = { handle_cp_unsubscribe , true  },
+    [MQTT_CP_CONNECT]     = { handle_cp_connect     , false },
+    [MQTT_CP_PINGREQ]     = { handle_cp_pingreq     , true  },
+    [MQTT_CP_DISCONNECT]  = { handle_cp_disconnect  , true  },
+    [MQTT_CP_AUTH]        = { handle_cp_auth        , false },
 };
 
 /*
@@ -4573,7 +4581,7 @@ eof:
                     goto fail;
                 }
 
-                if (control_functions[hdr->type] == NULL) {
+                if (control_functions[hdr->type].func == NULL) {
                     warnx("no func for %u", hdr->type);
                     goto fail;
                 }
@@ -4676,11 +4684,13 @@ exec_control:
                     client->session ? client->session->id : (id_t)-1,
                     client->id);
 
-            if (control_functions[client->new_packet->type](client,
-                        client->new_packet, client->packet_buf) == -1) {
-                warn("control_function");
-                goto fail;
-            }
+            /* [MQTT-3.1.4-6] - maybe */
+            if (!control_functions[client->new_packet->type].needs_auth || client->is_auth)
+                if (control_functions[client->new_packet->type].func(client,
+                            client->new_packet, client->packet_buf) == -1) {
+                    warn("control_function");
+                    goto fail;
+                }
             client->last_keep_alive = time(0);
 
             if (DEC_REFCNT(&client->new_packet->refcnt) == 1)
@@ -5122,12 +5132,31 @@ static void tick(void)
     packet_tick();
 }
 
-static int main_loop(int mother_fd)
+struct start_args {
+    int fd;
+};
+
+static void *tick_loop(void * /* arg */)
+{
+    while (running)
+    {
+        const struct timespec req = {
+            .tv_sec = 0,
+            .tv_nsec = 100000000,
+        };
+        nanosleep(&req, NULL);
+
+        tick();
+    }
+
+    return 0;
+}
+
+static void *main_loop(void *start_args)
 {
     bool has_clients;
     fd_set fds_in, fds_out, fds_exc;
-
-    running = true;
+    mother_fd = ((const struct start_args *)start_args)->fd;
 
     while (running)
     {
@@ -5155,7 +5184,7 @@ static int main_loop(int mother_fd)
                 max_fd = clnt->fd;
 
             FD_SET(clnt->fd, &fds_in);
-            //FD_SET(clnt->fd, &fds_out);
+            FD_SET(clnt->fd, &fds_out);
             FD_SET(clnt->fd, &fds_exc);
 
             has_clients = true;
@@ -5180,7 +5209,7 @@ static int main_loop(int mother_fd)
             continue;
         } else if (rc == -1) {
             warn("main_loop: select");
-            return -1;
+            pthread_exit(&errno);
         }
 
         if (FD_ISSET(mother_fd, &fds_in)) {
@@ -5239,20 +5268,29 @@ shit_fd:
         pthread_rwlock_rdlock(&global_clients_lock);
         for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
         {
-            if (clnt->state != CS_ACTIVE)
+            if (clnt->state != CS_ACTIVE || clnt->fd == -1)
                 continue;
 
-            if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_in)) {
+            if (FD_ISSET(clnt->fd, &fds_in)) {
                 if (parse_incoming(clnt) == -1) {
                     /* TODO do something? */ ;
                 }
             }
 
-            if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_out)) {
+            if (clnt->fd == -1)
+                continue;
+
+            if (FD_ISSET(clnt->fd, &fds_out)) {
+                clnt->write_ok = true;
                 /* socket is writable without blocking [ish] */
+            } else {
+                clnt->write_ok = false;
             }
 
-            if (clnt->fd != -1 && FD_ISSET(clnt->fd, &fds_exc)) {
+            if (clnt->fd == -1)
+                continue;
+
+            if (FD_ISSET(clnt->fd, &fds_exc)) {
                 dbg_printf("     main_loop exception event on %p[%d]\n",
                         (void *)clnt, clnt->fd);
                 /* TODO close? */
@@ -5260,10 +5298,11 @@ shit_fd:
         }
         pthread_rwlock_unlock(&global_clients_lock);
 
-        tick();
+        //tick();
     }
 
-    return 0;
+    errno = 0;
+    pthread_exit(&errno);
 }
 
 /*
@@ -5386,8 +5425,22 @@ int main(int argc, char *argv[])
     if (listen(mother_fd, 5) == -1)
         err(EXIT_FAILURE, "listen");
 
-    if (main_loop(mother_fd) == -1)
-        return EXIT_FAILURE;
+    running = true;
+
+    struct start_args start_args = {
+        .fd = mother_fd,
+    };
+
+    pthread_t main_thread, tick_thread;
+
+    if (pthread_create(&main_thread, NULL, main_loop, &start_args) == -1)
+        err(EXIT_FAILURE, "pthread_create: main_thread");
+
+    if (pthread_create(&tick_thread, NULL, tick_loop, NULL) == -1)
+        err(EXIT_FAILURE, "pthread_create: tick");
+
+    pthread_join(main_thread, NULL);
+    pthread_join(tick_thread, NULL);
 
     return EXIT_SUCCESS;
 }
