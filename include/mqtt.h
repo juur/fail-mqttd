@@ -450,6 +450,7 @@ extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
 extern const char *const control_packet_str[MQTT_CP_MAX];
 extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
 extern const type_t property_to_type[MQTT_MAX_PROPERTY_IDENT];
+extern const type_t property_per_control[MQTT_MAX_PROPERTY_IDENT][MQTT_CP_MAX];
 
 extern const char *const client_state_str[];
 extern const char *const message_state_str[];
