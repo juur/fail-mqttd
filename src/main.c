@@ -186,11 +186,20 @@ static void show_usage(FILE *fp, const char *name)
             "if provided.\n"
             "\n"
             "Options:\n"
-            "  -l LOGOPTIONS  comma separated suboptions: syslog,stdout,file=PATH,append\n"
             "  -h             show help\n"
-            "  -p PORT        bind to TCP port PORT   (default 1883)\n"
             "  -H ADDR        bind to IP address ADDR (default 127.0.0.1)\n"
-            "  -V             show version\n" "\n",
+            "  -l LOGOPTION   comma separated suboptions, described below\n"
+            "  -p PORT        bind to TCP port PORT (default 1883)\n"
+            "  -V             show version\n"
+            "\n"
+            "Each LOGOPTION may be:\n"
+            "  syslog     log to syslog\n"
+            "  stdout     log to stdout\n"
+            "  file=PATH  log to given PATH\n"
+            "  append     open PATH in append mode\n"
+            "\n"
+            "The default is stdout.\n"
+            "\n",
             name);
 }
 
@@ -198,28 +207,29 @@ static void show_usage(FILE *fp, const char *name)
  * debugging helpers
  */
 
-#define log_io_error(m,r,e,d) _log_io_error(m,r,e,d,__FILE__,__func__,__LINE__);
 static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die,
         const char *file, const char *func, int line)
 {
+    static const char *const read_error_fmt = "%s: read error at %s:%u: %s";
+    static const char *const short_read_fmt = "%s: short read (%lu < %lu) at %s:%u: %s";
+
     if (rc == -1) {
         if (die)
-            err(EXIT_FAILURE, "%s: read error at %s:%u: %s", func, file, line, msg ? msg : "");
-        else
-            warn("%s: read error at %s:%u: %s", func, file, line, msg ? msg : "");
+            err(EXIT_FAILURE, read_error_fmt, func, file, line, msg ? msg : "");
+        
+        warn(read_error_fmt, func, file, line, msg ? msg : "");
         return -1;
     }
 
     if (die)
-        errx(EXIT_FAILURE, "%s: short read (%lu < %lu) at %s:%u: %s",
-                func, rc, expected, file, line, msg ? msg : "");
-    else
-        warnx("%s: short read (%lu < %lu) at %s:%u: %s",
-                func, rc, expected, file, line, msg ? msg : "");
-    errno = ERANGE;
+        errx(EXIT_FAILURE, short_read_fmt, func, rc, expected, file, line, msg ? msg : "");
+    
+    warnx(short_read_fmt, func, rc, expected, file, line, msg ? msg : "");
 
+    errno = ERANGE;
     return -1;
 }
+#define log_io_error(m,r,e,d) _log_io_error(m,r,e,d,__FILE__,__func__,__LINE__)
 
 [[maybe_unused]]
 static void dump_topics(void)
@@ -1216,15 +1226,14 @@ static bool is_malformed(reason_code_t code)
 
 static int send_disconnect_if_malformed(struct client *client, reason_code_t code)
 {
-    errno = 0;
-
     if (!is_malformed(code))
         return 0;
 
     client->disconnect_reason = code;
     client->state = CS_CLOSED;
 
-    errno = EINVAL;
+    if (errno == 0)
+        errno = EINVAL;
     return -1;
 }
 
@@ -2302,7 +2311,12 @@ static struct message *register_message(const uint8_t *topic_name, int format,
         INC_REFCNT(&topic->refcnt);
         msg->topic = topic;
         /* if the sender disconnects, boom TODO check this is correct */
-        msg->sender = NULL;
+
+        if (qos == 0) {
+            msg->sender = NULL;
+        } else {
+            INC_REFCNT(&msg->sender->refcnt); /* send_cp_pubcomp || handle_cp_publish */
+        }
         topic->retained_message = msg;
         dbg_printf("     register_message: set retained_message on topic <%s>\n",
                 (char *)topic->name);
@@ -3177,6 +3191,11 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
             mds->completed_at = time(0);
             break;
         }
+
+        if (mds->message->retain && mds->message->sender) {
+            DEC_REFCNT(&mds->message->sender->refcnt);
+            mds->message->sender = NULL;
+        }
     }
     pthread_rwlock_unlock(&client->session->delivery_states_lock);
 
@@ -3528,14 +3547,15 @@ skip_props:
     } else
         reason_code = MQTT_SUCCESS;
 
-    if (send_cp_pubcomp(client, packet->packet_identifier, MQTT_SUCCESS) == -1)
+    if (send_cp_pubcomp(client, packet->packet_identifier, reason_code) == -1) {
+        warn("handle_cp_pubrel: send_cp_pubcomp");
         goto fail;
+    }
 
     return 0;
 
 fail:
-    send_disconnect_if_malformed(client, reason_code);
-    return -1;
+    return send_disconnect_if_malformed(client, reason_code);
 }
 
 [[gnu::nonnull]]
@@ -3839,6 +3859,10 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         if (send_cp_puback(client, packet_identifier, MQTT_SUCCESS) == -1) {
             reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
+        }
+        if (msg->retain) {
+            DEC_REFCNT(&msg->sender->refcnt);
+            msg->sender = NULL;
         }
         msg->sender_status.acknowledged_at = now;
         msg->sender_status.released_at = now;
@@ -4261,7 +4285,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     struct property (*will_props)[] = NULL;
     unsigned num_will_props = 0;
 
-    errno = 0;
+    errno = EINVAL;
 
     if (client->state != CS_ACTIVE || client->protocol_version != 0) {
         reason_code = MQTT_PROTOCOL_ERROR;
@@ -4403,6 +4427,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     if (client->username && client->password)
         client->is_auth = true;
     else {
+        errno = EACCES;
         reason_code = MQTT_BAD_USER_NAME_OR_PASSWORD;
         goto fail;
     }
@@ -4461,7 +4486,7 @@ create_new_session:
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
         if ((client->session->will_topic = find_or_register_topic(will_topic)) == NULL) {
-            errno = EINVAL;
+            errno = ENOENT;
             reason_code = MQTT_TOPIC_NAME_INVALID;
             goto fail;
         }
@@ -4618,6 +4643,7 @@ static int parse_incoming(struct client *client)
     reason_code_t reason_code;
     struct mqtt_fixed_header *hdr;
 
+    errno = 0;
     hdr = NULL;
     reason_code = MQTT_MALFORMED_PACKET;
 
@@ -4709,6 +4735,7 @@ lenread:
                 hdr = (void *)client->header_buffer;
 
                 if (client->rl_multi > 128*128*128) {
+                    errno = ERANGE;
                     warn("var len overflow");
                     goto fail;
                 }
@@ -4726,6 +4753,7 @@ lenread:
 
                 if (client->rl_value > MAX_PACKET_LENGTH) {
                     client->disconnect_reason = MQTT_PACKET_TOO_LARGE;
+                    errno = EFBIG;
                     goto fail;
                 }
 
