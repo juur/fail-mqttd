@@ -252,7 +252,7 @@ struct packet {
     struct packet *next_client;
 
     control_packet_t type;
-    ssize_t remaining_length;
+    size_t remaining_length;
     unsigned flags;
 
     struct property (*properties)[];
@@ -436,18 +436,17 @@ struct topic {
     struct topic *next;
     id_t id;
     const uint8_t *name;
+    unsigned num_subscribers;
     struct subscription *(*subscribers)[];
     struct message *retained_message;
     struct message *pending_queue;
     pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;
-    unsigned num_subscribers;
     _Atomic unsigned refcnt;
 };
 
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
-extern const char *const control_packet_str[MQTT_CP_MAX];
 extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
 extern const type_t property_to_type[MQTT_MAX_PROPERTY_IDENT];
 extern const type_t property_per_control[MQTT_MAX_PROPERTY_IDENT][MQTT_CP_MAX];
@@ -458,5 +457,6 @@ extern const char *const session_state_str[];
 extern const char *const property_str[MQTT_MAX_PROPERTY_IDENT];
 extern const char *const control_packet_str[MQTT_CP_MAX];
 extern const char *const read_state_str[];
+extern const char *const priority_str[];
 
 #endif

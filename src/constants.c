@@ -1,5 +1,7 @@
 #define _XOPEN_SOURCE 800
 
+#include <syslog.h>
+
 #include "mqtt.h"
 #include "config.h"
 
@@ -173,4 +175,15 @@ const char *const read_state_str[] = {
     [READ_STATE_HEADER]      = "HEADER",
     [READ_STATE_MORE_HEADER] = "MORE_HEADER",
     [READ_STATE_BODY]        = "BODY",
+};
+
+const char *const priority_str[] = {
+    [LOG_EMERG]   = "EMERG",
+    [LOG_ALERT]   = "ALERT",
+    [LOG_CRIT]    = "CRIT",
+    [LOG_ERR]     = "ERR",
+    [LOG_WARNING] = "WARNING",
+    [LOG_NOTICE]  = "NOTICE",
+    [LOG_INFO]    = "INFO",
+    [LOG_DEBUG]   = "DEBUG",
 };

@@ -27,6 +27,9 @@
 #else
 # error "pthread.h is required"
 #endif
+#include <stdarg.h>
+#include <syslog.h>
+#include <time.h>
 
 #include "mqtt.h"
 
@@ -73,7 +76,7 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
  * misc. globals
  */
 
-static int mother_fd = -1;
+static int global_mother_fd = -1;
 static _Atomic bool running;
 
 /*
@@ -93,7 +96,7 @@ static _Atomic id_t mds_id          = 1;
  */
 
 static const unsigned MAX_PACKETS           = 256;
-static const unsigned MAX_CLIETNS           = 64;
+static const unsigned MAX_CLIENTS           = 64;
 static const unsigned MAX_TOPICS            = 1024;
 static const unsigned MAX_MESSAGES          = 16384;
 static const unsigned MAX_PACKET_LENGTH     = 0x1000000U;
@@ -131,8 +134,14 @@ static unsigned num_mds      = 0;
  * command line options
  */
 
-static in_port_t opt_port = 1883;
-static int opt_backlog = 50;
+static   FILE       *opt_logfile       = NULL;
+static   bool        opt_logstdout     = true;
+static   in_port_t   opt_port          = 1883;
+static   int         opt_backlog       = 50;
+static   int         opt_loglevel      = LOG_INFO;
+static   bool        opt_logsyslog     = false;
+static   bool        opt_logfileappend = false;
+
 static struct in_addr opt_listen;
 
 /*
@@ -171,16 +180,17 @@ static void show_version(FILE *fp)
 static void show_usage(FILE *fp, const char *name)
 {
     fprintf(fp, "fail-mqttd -- a terrible implementation of MQTT\n" "\n"
-            "Usage: %s [-hV] [-H ADDR] [-p PORT] [TOPIC..]\n"
+            "Usage: %s [-hV] [-H ADDR] [-p PORT] [-l LOGOPTION,[LOGOPTION..]] [TOPIC..]\n"
             "Provides a MQTT broker, "
             "pre-creating topics per additional command line arguments, "
             "if provided.\n"
             "\n"
             "Options:\n"
-            "  -h         show help\n"
-            "  -p PORT    bind to TCP port PORT   (default 1883)\n"
-            "  -H ADDR    bind to IP address ADDR (default 127.0.0.1)\n"
-            "  -V         show version\n" "\n",
+            "  -l LOGOPTIONS  comma separated suboptions: syslog,stdout,file=PATH,append\n"
+            "  -h             show help\n"
+            "  -p PORT        bind to TCP port PORT   (default 1883)\n"
+            "  -H ADDR        bind to IP address ADDR (default 127.0.0.1)\n"
+            "  -V             show version\n" "\n",
             name);
 }
 
@@ -245,6 +255,41 @@ static void dump_all(void)
     dbg_printf("]}\n");
 }
 
+[[gnu::nonnull,gnu::format(printf,2,3)]]
+static void logger(int priority, const char *format, ...)
+{
+    static const char *fmt = "%s %s [%d]: %s";
+
+    va_list varargs;
+    char timebuf[128];
+    char linebuf[BUFSIZ];
+    struct tm *tm;
+    time_t now;
+    pid_t pid;
+
+    if (priority > opt_loglevel)
+        return;
+
+    now = time(NULL);
+    tm = gmtime(&now);
+    strftime(timebuf, sizeof(timebuf), "%FT%TZ", tm);
+
+    va_start(varargs, format);
+    vsnprintf(linebuf, sizeof(linebuf), format, varargs);
+    va_end(varargs);
+
+    pid = getpid();
+
+    if (opt_logstdout)
+        fprintf(stdout, fmt, timebuf, priority_str[priority], pid, linebuf);
+
+    if (opt_logfile != NULL)
+        fprintf(opt_logfile, fmt, timebuf, priority_str[priority], pid, linebuf);
+
+    if (opt_logsyslog)
+        syslog(priority, "%s", linebuf);
+}
+
 [[gnu::nonnull]]
 static int mds_detach_and_free(struct message_delivery_state *mds, bool session_lock, bool message_lock)
 {
@@ -301,7 +346,7 @@ static void close_socket(int *fd)
 static void free_subscription(struct subscription *sub)
 {
     dbg_printf("     free_subscription:  id=%u session=%d <%s> topic=%d <%s>\n",
-            sub->id, 
+            sub->id,
             sub->session ? sub->session->id : (id_t)-1,
             sub->session ? (char *)sub->session->client_id : "",
             sub->topic ? sub->topic->id : (id_t)-1,
@@ -554,7 +599,7 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
             );
 
     if ((lck = GET_REFCNT(&pck->refcnt)) > 0) {
-        warnx("free_packet: attempt to free with refcnt=%u", lck);
+        warnx("free_packet: attempt to free packet with refcnt=%u", lck);
         abort();
         return;
     }
@@ -634,13 +679,13 @@ static void free_message(struct message *msg, bool need_lock)
             msg->topic ? (char *)msg->topic->name : "");
 
     if ((lck = GET_REFCNT(&msg->refcnt)) > 0) {
-        warn("free_message: attempt to free with refcnt=%u", lck);
+        warnx("free_message: attempt to free message with refcnt=%u", lck);
         abort();
         return;
     }
 
     if (msg->topic) {
-        warn("free_message: attempt to free with topic <%s> set",
+        warnx("free_message: attempt to free message with topic <%s> set",
                 msg->topic->name);
         abort();
         return;
@@ -696,25 +741,40 @@ static void free_client(struct client *client, bool needs_lock)
             client->session ? client->session->id : 0,
             client->session ? (char *)client->session->client_id : "");
 
+
+    if (needs_lock)
+        pthread_rwlock_wrlock(&global_clients_lock);
+
+    if (client->state == CS_ACTIVE)
+        client->state = CS_CLOSING;
+
+    pthread_rwlock_wrlock(&client->active_packets_lock);
+    for (struct packet *p = client->active_packets, *next; p; p = next)
+    {
+        next = p->next_client;
+        DEC_REFCNT(&p->refcnt);
+        free_packet(p, true, false);
+    }
+    client->active_packets = NULL;
+    pthread_rwlock_unlock(&client->active_packets_lock);
+
     if (GET_REFCNT(&client->refcnt) > 0) {
-        warn("free_client: attempt to free with refcnt %d", client->refcnt);
+        warnx("free_client: attempt to free client with refcnt %d", client->refcnt);
+        warnx("free_client:   active_packets=%s", client->active_packets ? "yes" : "no");
+        if (needs_lock)
+            pthread_rwlock_unlock(&global_clients_lock);
         abort();
         return;
     }
 
     client->state = CS_CLOSED;
 
-    if (needs_lock)
-        pthread_rwlock_wrlock(&global_clients_lock);
-    {
-
-        if (global_client_list == client) {
-            global_client_list = client->next;
-        } else for (tmp = global_client_list; tmp; tmp = tmp->next) {
-            if (tmp->next == client) {
-                tmp->next = client->next;
-                break;
-            }
+    if (global_client_list == client) {
+        global_client_list = client->next;
+    } else for (tmp = global_client_list; tmp; tmp = tmp->next) {
+        if (tmp->next == client) {
+            tmp->next = client->next;
+            break;
         }
     }
     if (needs_lock)
@@ -773,7 +833,7 @@ static void free_client(struct client *client, bool needs_lock)
     free(client);
 }
 
-[[gnu::nonnull]]
+    [[gnu::nonnull]]
 static void free_session(struct session *session, bool need_lock)
 {
     struct session *tmp;
@@ -861,6 +921,7 @@ static void free_session(struct session *session, bool need_lock)
     pthread_rwlock_destroy(&session->subscriptions_lock);
     pthread_rwlock_destroy(&session->delivery_states_lock);
 
+    num_sessions--;
     free(session);
 }
 
@@ -1069,7 +1130,7 @@ static struct client *alloc_client(void)
 {
     struct client *client;
 
-    if (num_clients >= MAX_CLIETNS) {
+    if (num_clients >= MAX_CLIENTS) {
         errno = ENOSPC;
         return NULL;
     }
@@ -1234,7 +1295,7 @@ static int is_valid_topic_filter(const uint8_t *name)
 }
 
 [[gnu::nonnull, gnu::warn_unused_result]]
-static int encode_var_byte(uint32_t value, uint8_t out[4])
+static int encode_var_byte(uint32_t value, uint8_t out[static 4])
 {
     uint8_t byte;
     int out_len = 0;
@@ -1809,7 +1870,7 @@ fail:
 
 static void sh_sigint(int signum, siginfo_t * /*info*/, void * /*stuff*/)
 {
-    dbg_printf("     sh_sigint: received signal %u\n", signum);
+    logger(LOG_WARNING, "sh_sigint: received signal %u\n", signum);
     if (signum == SIGHUP) {
         dump_all();
         return;
@@ -1823,11 +1884,19 @@ static void sh_sigint(int signum, siginfo_t * /*info*/, void * /*stuff*/)
  * atexit() functions
  */
 
+static void close_logfile(void)
+{
+    if (opt_logfile) {
+        fclose(opt_logfile);
+        opt_logfile = NULL;
+    }
+}
+
 static void close_all_sockets(void)
 {
-    dbg_printf("     close_socket: closing mother_fd %u\n", mother_fd);
-    if (mother_fd != -1)
-        close_socket(&mother_fd);
+    dbg_printf("     close_socket: closing mother_fd %u\n", global_mother_fd);
+    if (global_mother_fd != -1)
+        close_socket(&global_mother_fd);
 }
 
 static void free_all_message_delivery_states(void)
@@ -2269,7 +2338,7 @@ static int add_subscription_to_topic(struct subscription *new_sub)
     errno = 0;
 
     size_t sub_size = sizeof(struct subscription *) * (topic->num_subscribers + 1);
-    if ((tmp_subs = (void *)realloc(topic->subscribers, sub_size)) == NULL)
+    if ((tmp_subs = realloc(topic->subscribers, sub_size)) == NULL)
         goto fail;
 
     topic->subscribers = tmp_subs;
@@ -2484,7 +2553,7 @@ static int subscribe_to_topics(struct session *session,
     pthread_rwlock_wrlock(&session->subscriptions_lock);
     size_t sub_size = sizeof(struct subscription *) * (session->num_subscriptions + request->num_topics);
 
-    if ((tmp_subs = (void *)realloc(session->subscriptions, sub_size)) == NULL) {
+    if ((tmp_subs = realloc(session->subscriptions, sub_size)) == NULL) {
         for (unsigned idx = 0; idx < request->num_topics; idx++)
             request->response_codes[idx] = MQTT_UNSPECIFIED_ERROR;
 
@@ -2576,7 +2645,7 @@ static int mark_one_mds(struct message_delivery_state *mds,
 {
     assert(mds->packet_identifier != 0);
 
-    time_t now = time(0);
+    const time_t now = time(NULL);
 
     switch (type)
     {
@@ -3758,7 +3827,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     packet->payload = NULL;
     packet->payload_len = 0;
 
-    time_t now = time(0);
+    const time_t now = time(NULL);
 
     msg->sender_status.accepted_at = now;
 
@@ -4264,8 +4333,9 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
         goto fail;
     }
 
-    if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START)
+    if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
         dbg_printf("clean_start ");
+    }
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
         dbg_printf("will_properties ");
@@ -4349,6 +4419,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 
 create_new_session:
         if ((client->session = alloc_session(client)) == NULL) {
+            warn("handle_cp_connect: alloc_session failed");
             reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
         }
@@ -4386,7 +4457,7 @@ create_new_session:
         client->session->client = client;
     }
     INC_REFCNT(&client->session->refcnt); /* free_client || client_tick || handle_cp_connect */
-    client->session->last_connected = time(0);
+    client->session->last_connected = time(NULL);
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
         if ((client->session->will_topic = find_or_register_topic(will_topic)) == NULL) {
@@ -4439,6 +4510,7 @@ create_new_session:
 
     if (send_cp_connack(client, MQTT_SUCCESS) == -1) {
         reason_code = MQTT_UNSPECIFIED_ERROR;
+        warn("handle_cp_connect: send_cp_connack failed");
         goto fail;
     }
     return 0;
@@ -4470,7 +4542,7 @@ static int handle_cp_auth(struct client *client, struct packet *packet,
     const uint8_t *ptr = remain;
     size_t bytes_left = packet->remaining_length;
     reason_code_t reason_code = MQTT_SUCCESS;
-    reason_code_t auth_reason_code = MQTT_SUCCESS;
+    [[maybe_unused]] reason_code_t auth_reason_code = MQTT_SUCCESS;
 
     if (bytes_left == 0)
         goto skip_props;
@@ -4518,8 +4590,8 @@ fail:
  */
 
 static const struct {
-    control_func_t func;
-    bool needs_auth;
+    const control_func_t func;
+    const bool needs_auth;
 } control_functions[MQTT_CP_MAX] = {
     [MQTT_CP_PUBLISH]     = { handle_cp_publish     , true  },
     [MQTT_CP_PUBACK]      = { handle_cp_puback      , true  },
@@ -4725,13 +4797,14 @@ exec_control:
                     warn("control_function");
                     goto fail;
                 }
-            client->last_keep_alive = time(0);
+            client->last_keep_alive = time(NULL);
 
-            if (IF_DEC_REFCNT(&client->new_packet->refcnt) == 1)
+            if (IF_DEC_REFCNT(&client->new_packet->refcnt) == 1) {
                 free_packet(client->new_packet, true, true);
-            else
+            } else {
                 dbg_printf("[%2d] parse_incoming: can't free packet refcnt>0\n",
                         client->session->id);
+            }
             client->new_packet = NULL;
 
             break;
@@ -4762,6 +4835,7 @@ static void client_tick(void)
 {
     const struct property *prop;
     uint32_t will_delay = 0;
+    const time_t now = time(NULL);
 
     pthread_rwlock_wrlock(&global_clients_lock);
     for (struct client *clnt = global_client_list, *next; clnt; clnt = next)
@@ -4771,10 +4845,9 @@ static void client_tick(void)
         switch (clnt->state)
         {
             case CS_ACTIVE:
-                time_t now = time(0);
 
                 if (clnt->session == NULL && clnt->tcp_accepted_at != 0
-                        && (time(0) - clnt->tcp_accepted_at) > 5) {
+                        && (now - clnt->tcp_accepted_at) > 5) {
                     warnx("client_tick: closing idle link: no CONNECTION");
                     goto force_close;
                 }
@@ -4793,7 +4866,6 @@ static void client_tick(void)
 
             case CS_DISCONNECTED:
                 if (clnt->session) {
-                    time_t now = time(0);
 
                     /* Prepare the Will Message to be sent, optionally
                      * delaying by Will Delay. session_tick() will actually
@@ -4844,7 +4916,7 @@ static void client_tick(void)
 skip_send_disconnect:
                 /* Common for CS_DISCONNECTED */
                 if (clnt->session && clnt->session->last_connected == 0)
-                    clnt->session->last_connected = time(0);
+                    clnt->session->last_connected = time(NULL);
 
 force_close:
                 /* Common for CS_ACTIVE with zero MQTT_CP_CONNECT */
@@ -4881,7 +4953,7 @@ static void tick_msg(struct message *msg)
         return;
     }
 
-    time_t now = time(0);
+    const time_t now = time(NULL);
 
     dbg_printf(NGRN "     tick_msg: id=%u sender.id=%d #mds=%u"CRESET"\n",
             msg->id, msg->sender ? msg->sender->id : (id_t)-1,
@@ -4983,28 +5055,30 @@ static void tick_msg(struct message *msg)
     if (num_sent == num_to_send /*msg->num_message_delivery_states*/) { /* TODO this doesn't handle holes? */
         /* TODO replace with list of subscribers to message, removal thereof,
          * then dequeue when none left */
-        dbg_printf(BGRN"     tick_msg: tidying up"CRESET"\n");
+        dbg_printf(BGRN"     tick_msg: tidying up #mds=%u"CRESET"\n", msg->num_message_delivery_states);
 
         while (msg->num_message_delivery_states && msg->delivery_states)
         {
             unsigned idx = 0;
             struct message_delivery_state *mds;
 again:
-            dbg_printf(NCYN"     tick_msg: idx=%u"CRESET"\n",idx);
+            dbg_printf(BGRN"     tick_msg: idx=%u"CRESET"\n",idx);
             if (idx >= msg->num_message_delivery_states)
                 break;
 
             mds = msg->delivery_states[idx++];
 
-            if (mds == NULL)
+            if (mds == NULL) {
+                dbg_printf(BYEL"     tick_msg: mds is NULL"CRESET"\n");
                 break;
+            }
 
             if (mds->completed_at == 0) {
-                dbg_printf(NCYN"     tick_msg: not completed"CRESET"\n");
+                dbg_printf(NGRN"     tick_msg: not completed"CRESET"\n");
                 goto again;
             }
 
-            dbg_printf(NCYN"     tick_msg: unlink %u from session %u[%u] and message %u[%u]"CRESET"\n",
+            dbg_printf(NGRN"     tick_msg: unlink %u from session %u[%u] and message %u[%u]"CRESET"\n",
                     mds->id,
                     mds->session ? mds->session->id : 0,
                     mds->session ? mds->session->refcnt : 0,
@@ -5012,14 +5086,12 @@ again:
                     mds->message ? mds->message->refcnt : 0);
 
             mds_detach_and_free(mds, true, false);
-            if (msg->delivery_states)
-                msg->delivery_states[idx - 1] = NULL;
             mds = NULL;
         }
 
         /* We can't just dequeue() and MSG_DEAD if any mds are not complated_at */
         if (msg->topic && msg->num_message_delivery_states == 0) {
-            dbg_printf(BGRN"     tick_msg: dequeue"CRESET"\n");
+            dbg_printf(NGRN"     tick_msg: dequeue"CRESET"\n");
             if (dequeue_message(msg) == -1) {
                 warn("tick_msg: dequeue_message failed");
             }
@@ -5041,7 +5113,7 @@ static void topic_tick(void)
 
         if (max_messages == 0 || topic->pending_queue == NULL)
             continue;
-        
+
         dbg_printf("     topic_tick: <%s> %p\n", topic->name, (void *)topic->pending_queue);
 
         /* Iterate over the queued messages on this topic */
@@ -5086,7 +5158,7 @@ static void message_tick(void)
 
 static void session_tick(void)
 {
-    const time_t now = time(0);
+    const time_t now = time(NULL);
 
     pthread_rwlock_wrlock(&global_sessions_lock);
     for (struct session *session = global_session_list, *next; session; session = next)
@@ -5203,7 +5275,7 @@ static void *main_loop(void *start_args)
 {
     bool has_clients;
     fd_set fds_in, fds_out, fds_exc;
-    mother_fd = ((const struct start_args *)start_args)->fd;
+    int mother_fd = ((const struct start_args *)start_args)->fd;
 
     while (running)
     {
@@ -5299,7 +5371,7 @@ shit_fd:
 
             new_client->fd = child_fd;
             new_client->state = CS_ACTIVE;
-            new_client->tcp_accepted_at = time(0);
+            new_client->tcp_accepted_at = time(NULL);
             new_client->remote_port = ntohs(sin_client.sin_port);
             new_client->remote_addr = ntohl(sin_client.sin_addr.s_addr);
 
@@ -5360,13 +5432,50 @@ shit_fd:
 int main(int argc, char *argv[])
 {
     opt_listen.s_addr = htonl(INADDR_LOOPBACK);
+    char *logfile_name = NULL;
 
     {
         int opt;
-        while ((opt = getopt(argc, argv, "hVp:H:")) != -1)
+        char *subopts;
+        char *value;
+
+        enum {
+            LOGGER_SYSLOG = 0,
+            LOGGER_FILE,
+            LOGGER_STDOUT,
+        };
+
+        char *const token[] = {
+            [LOGGER_SYSLOG] = "syslog",
+            [LOGGER_FILE] = "file",
+            [LOGGER_STDOUT] = "stdout",
+        };
+
+        while ((opt = getopt(argc, argv, "hVp:H:l:")) != -1)
         {
             switch (opt)
             {
+                case 'l':
+                    subopts = optarg;
+                    while (*subopts != '\0') {
+                        switch(getsubopt(&subopts, token, &value))
+                        {
+                            case LOGGER_SYSLOG:
+                                opt_logsyslog = true;
+                                break;
+                            case LOGGER_FILE:
+                                if (value == NULL)
+                                    goto shit_usage;
+                                logfile_name = value;
+                                break;
+                            case LOGGER_STDOUT:
+                                opt_logstdout = true;
+                                break;
+                            default:
+                                goto shit_usage;
+                        }
+                    }
+                    break;
                 case 'H':
                     if (inet_pton(AF_INET, optarg, &opt_listen) == -1) {
                         warn("main: inet_pton");
@@ -5388,6 +5497,7 @@ int main(int argc, char *argv[])
                     show_version(stdout);
                     exit(EXIT_SUCCESS);
                 default:
+shit_usage:
                     show_usage(stderr, argv[0]);
                     exit(EXIT_FAILURE);
             }
@@ -5397,6 +5507,12 @@ int main(int argc, char *argv[])
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    if (logfile_name) {
+        if ((opt_logfile = fopen(logfile_name, opt_logfileappend ? "a" : "w")) == NULL)
+            errx(EXIT_FAILURE, "fopen(%s)", logfile_name);
+        atexit(close_logfile);
+    }
 
     struct sigaction sa = {
         .sa_sigaction = sh_sigint,
@@ -5427,8 +5543,7 @@ int main(int argc, char *argv[])
             err(EXIT_FAILURE, "main: strdup(argv[])");
         if (is_valid_topic_filter((const uint8_t *)topic_name) == -1) {
             free((void *)topic_name);
-            warn("main: <%s> is not a valid topic filter, skipping",
-                    (char *)argv[optind]);
+            warn("main: <%s> is not a valid topic filter, skipping", argv[optind]);
             topic_name = NULL;
         } else if (register_topic((const uint8_t *)topic_name) == NULL) {
             warn("main: register_topic(<%s>)", topic_name);
@@ -5438,7 +5553,7 @@ int main(int argc, char *argv[])
         optind++;
     }
 
-    if ((mother_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
+    if ((global_mother_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
         err(EXIT_FAILURE, "socket");
 
     struct linger linger = {
@@ -5446,13 +5561,13 @@ int main(int argc, char *argv[])
         .l_linger = 0,
     };
 
-    if (setsockopt(mother_fd, SOL_SOCKET, SO_LINGER, &linger,
+    if (setsockopt(global_mother_fd, SOL_SOCKET, SO_LINGER, &linger,
                 sizeof(linger)) == -1)
         warn("setsockopt(SO_LINGER)");
 
     int reuse = 1;
 
-    if (setsockopt(mother_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+    if (setsockopt(global_mother_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
                 sizeof(reuse)) == -1)
         warn("setsockopt(SO_REUSEADDR)");
 
@@ -5465,19 +5580,19 @@ int main(int argc, char *argv[])
     char bind_addr[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &sin.sin_addr, bind_addr, sizeof(bind_addr));
 
-    dbg_printf("     main: binding to %s:%u\n", bind_addr, opt_port);
-
-    if (bind(mother_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
+    if (bind(global_mother_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
         err(EXIT_FAILURE, "bind");
 
-    if (listen(mother_fd, opt_backlog) == -1)
+    if (listen(global_mother_fd, opt_backlog) == -1)
         err(EXIT_FAILURE, "listen");
 
-    running = true;
+    logger(LOG_NOTICE, "main: binding to %s:%u\n", bind_addr, opt_port);
 
     struct start_args start_args = {
-        .fd = mother_fd,
+        .fd = global_mother_fd,
     };
+
+    running = true;
 
 #ifdef WITH_THREADS
     pthread_t main_thread, tick_thread;
