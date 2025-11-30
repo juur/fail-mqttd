@@ -4,7 +4,7 @@ set -o errexit
 set -o pipefail
 set -o nounset
 
-show_help() 
+show_help()
 {
 	cat <<EOF
 	Usage: configure [options]
@@ -77,7 +77,7 @@ while :; do
 		--sbindir=?*) SBINDIR=${1#*=} ;;
 		--sharedstatedir=?*) SHAREDSTATEDIR=${1#*=} ;;
 		--sysconfdir=?*) SYSCONFDIR=${1#*=} ;;
-# These are added to keep RPM %configure error free		
+# These are added to keep RPM %configure error free
 		--build=?*) BUILD=${1#*=} ;;
 		--host=?*) HOST=${1#*=} ;;
 		--program-prefix=?*) PROGPREFIX=${1#*=} ;;
@@ -158,7 +158,7 @@ VERSION=$(cat "${SRCDIR}"/misc/VERSION)
 
 # Support functions
 
-check_pkg() 
+check_pkg()
 {
 	echo -n "Checking for $1 ... "
 	"${PKG_CONFIG}" --exists "${1}"
@@ -245,7 +245,7 @@ check_lex()
 {
 	local F
 	F=$(mktemp); trap "{ rm -f \"${F}\"; }" EXIT
-	
+
 	# shellcheck disable=SC2086
 	echo -e '%x TEMP\n%option stack bison-bridge reentrant\n%%\n. { ECHO; }\n%%\n' | \
 		"${LEX}" ${LFLAGS} -o "${F}" -
@@ -267,7 +267,7 @@ fi
 
 echo -n "Checking $(basename "${CC}") can produce executables ... "
 echo -e '#include <stdlib.h>\nvoid main(void) {exit(0);}' | \
-	if "${CC}" -xc -o /dev/null - 2>>config.log; then 
+	if "${CC}" -xc -o /dev/null - 2>>config.log; then
 		echo "ok"
 	else
 		fail "${CC} cannot produce executables"
@@ -313,7 +313,7 @@ export PKG_CONFIG
 which "${PKG_CONFIG}"
 
 # start a new configuration file
-if [[ -e ${OBJDIR}/config.h ]]; then 
+if [[ -e ${OBJDIR}/config.h ]]; then
 	mv -f "${OBJDIR}"/config.h "${OBJDIR}"/config.h~
 fi
 rm -f "${OBJDIR}"/config.h
@@ -345,14 +345,14 @@ done
 
 for f in ${H_FILES} ; do
 	def=$(echo "${f}" | sed "s#/#_#;s#\.#_#;s#/#_#;" | tr "[:lower:]" "[:upper:]")
-    if check_header "${f}"; then 
+    if check_header "${f}"; then
 		echo "#define HAVE_${def} 1" >> "${OBJDIR}"/config.h
 	fi
 done
 
 for f in ${FUNC_CHECK}; do
 	def=$(echo "${f}" | cut -d: -f1 | tr "[:lower:]" "[:upper:]")
-	if check_func "${f}"; then 
+	if check_func "${f}"; then
 		echo "#define HAVE_${def} 1" >> "${OBJDIR}"/config.h
 	fi
 done

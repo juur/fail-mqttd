@@ -5274,7 +5274,6 @@ static void topic_tick(void)
     pthread_rwlock_wrlock(&global_topics_lock);
     for (struct topic *topic = global_topic_list; topic; topic = topic->next)
     {
-
         if (max_messages == 0 || topic->pending_queue == NULL)
             continue;
 

@@ -6,7 +6,7 @@ objdir := @@OBJDIR@@
 .SUFFIXES:
 .SUFFIXES: .c .o
 
-DESTDIR         := 
+DESTDIR         :=
 CC              := @@CC@@
 CXX             := @@CXX@@
 LEX             := @@LEX@@
@@ -105,11 +105,10 @@ dist:
 $(objdir)/%.o: $(srcdir)/src/%.c
 ifeq ($(DEPS),1)
 	$(CC) -c $(CFLAGS) $(CPPFLAGS) -MF $(objdir)/.d/$*.d $< -o $@
-else	
+else
 	$(CC) -c $(CFLAGS) $(CPPFLAGS) $< -o $@
 endif
 
 ifeq ($(DEPS),1)
 -include $(all_SRCS:$(srcdir)/src/%.c=$(objdir)/.d/%.d)
 endif
-
