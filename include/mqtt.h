@@ -53,7 +53,7 @@ typedef enum {
     MQTT_CP_DISCONNECT = 14,
     MQTT_CP_AUTH = 15,
 
-    MQTT_CP_MAX = 16,
+    MQTT_CP_MAX
 } control_packet_t;
 
 #define MQTT_FLAG_PUBREL (1<<1)
@@ -112,7 +112,7 @@ typedef enum {
     MQTT_TYPE_2BYTE = 6,
     MQTT_TYPE_UTF8_STRING_PAIR = 7,
 
-    MQTT_TYPE_MAX = 8
+    MQTT_TYPE_MAX
 } type_t;
 
 /* Properties */
@@ -145,13 +145,14 @@ typedef enum {
     MQTT_PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE = 41,
     MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE = 42,
 
-    MQTT_MAX_PROPERTY_IDENT = 43,
+    MQTT_PROPERTY_IDENT_MAX
 } property_ident_t;
 
 typedef enum {
     MQTT_PAYLOAD_NONE = 0,
     MQTT_PAYLOAD_REQUIRED = 1,
     MQTT_PAYLOAD_OPTIONAL = 2,
+    MQTT_PAYLOAD_REQUIRED_MAX
 } payload_required_t;
 
 typedef enum {
@@ -200,6 +201,7 @@ typedef enum {
     MQTT_MAXIMUM_CONNECT_TIME = 160,
     MQTT_SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED = 161,
     MQTT_WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED = 162,
+    MQTT_REASON_CODE_MAX
 } reason_code_t;
 
 typedef enum {
@@ -208,24 +210,51 @@ typedef enum {
     CS_CLOSING = 2,
     CS_CLOSED = 3,
     CS_DISCONNECTED = 4,
+    CLIENT_STATE_MAX
 } client_state_t;
+
+typedef enum {
+    TOPIC_NEW = 0,
+    TOPIC_ACTIVE = 1,
+    TOPIC_DEAD = 2,
+    TOPIC_STATE_MAX
+} topic_state_t;
 
 typedef enum {
     MSG_NEW = 0,
     MSG_ACTIVE = 1,
     MSG_DEAD = 2,
+    MSG_STATE_MAX
 } message_state_t;
+
+typedef enum {
+    MSG_NORMAL = 0,
+    MSG_WILL = 1,
+    MSG_TYPE_MAX
+} message_type_t;
 
 typedef enum {
     SESSION_NEW = 0,
     SESSION_ACTIVE = 1,
     SESSION_DELETE = 2,
+    SESSION_STATE_MAX
 } session_state_t;
 
 typedef enum {
     ROLE_SEND = 0,
     ROLE_RECV = 1,
+    ROLE_MAX
 } role_t;
+
+/* client.parse_state */
+typedef enum {
+    READ_STATE_NEW,
+    READ_STATE_HEADER,
+    READ_STATE_MORE_HEADER,
+    READ_STATE_BODY,
+    READ_STATE_MAX
+} read_state_t;
+
 
 struct property {
     property_ident_t ident;
@@ -303,6 +332,7 @@ struct message {
     size_t payload_len;
     unsigned qos;
     message_state_t state;
+    message_type_t type;
     bool retain;
 
     unsigned num_message_delivery_states;
@@ -326,7 +356,7 @@ struct topic_sub_request {
     const uint8_t **topics;
     struct topic **topic_refs;
     uint8_t *options;
-    uint8_t *response_codes;
+    uint8_t *reason_codes;
     unsigned num_topics;
 };
 
@@ -336,14 +366,6 @@ struct subscription {
     struct topic *topic;
     uint8_t option;
 };
-
-/* client.parse_state */
-typedef enum {
-    READ_STATE_NEW,
-    READ_STATE_HEADER,
-    READ_STATE_MORE_HEADER,
-    READ_STATE_BODY,
-} read_state_t;
 
 struct session {
     struct session *next;
@@ -442,21 +464,24 @@ struct topic {
     struct message *pending_queue;
     pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;
+    topic_state_t state;
     _Atomic unsigned refcnt;
 };
 
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
 extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
-extern const type_t property_to_type[MQTT_MAX_PROPERTY_IDENT];
-extern const type_t property_per_control[MQTT_MAX_PROPERTY_IDENT][MQTT_CP_MAX];
+extern const type_t property_to_type[MQTT_PROPERTY_IDENT_MAX];
+extern const type_t property_per_control[MQTT_PROPERTY_IDENT_MAX][MQTT_CP_MAX];
 
-extern const char *const client_state_str[];
-extern const char *const message_state_str[];
-extern const char *const session_state_str[];
-extern const char *const property_str[MQTT_MAX_PROPERTY_IDENT];
+extern const char *const client_state_str[CLIENT_STATE_MAX];
+extern const char *const message_state_str[MSG_STATE_MAX];
+extern const char *const session_state_str[SESSION_STATE_MAX];
+extern const char *const property_str[MQTT_PROPERTY_IDENT_MAX];
 extern const char *const control_packet_str[MQTT_CP_MAX];
-extern const char *const read_state_str[];
+extern const char *const read_state_str[READ_STATE_MAX];
 extern const char *const priority_str[];
+extern const char *const reason_codes_str[MQTT_REASON_CODE_MAX];
+extern const char *const message_type_str[MSG_TYPE_MAX];
 
 #endif

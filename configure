@@ -130,7 +130,7 @@ TARGET=${TARGET:-}
 
 # Default compiler flags
 
-CFLAGS=${CFLAGS:--O2 -Wall -Wextra}
+CFLAGS=${CFLAGS:--Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong -Og -g}
 CPPFLAGS=${CPPFLAGS:-}
 LDFLAGS=${LDFLAGS:-}
 TARGET=${TARGET:-}
