@@ -318,6 +318,8 @@ if [[ -e ${OBJDIR}/config.h ]]; then
 fi
 rm -f "${OBJDIR}"/config.h
 
+printf "#ifndef CONFIG_H\n#define CONFIG_H\n\n" >> "${OBJDIR}"/config.h
+
 # kludge any defines here
 
 # set-up defines
@@ -385,6 +387,7 @@ fi
 
 # Finish config.h
 echo "#define SYSCONFDIR \"${SYSCONFDIR}\"" >> "${OBJDIR}"/config.h
+printf "\n#endif\n" >> "${OBJDIR}"/config.h
 
 # Create Makefile from template
 
