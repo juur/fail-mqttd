@@ -4295,6 +4295,9 @@ static int handle_cp_disconnect(struct client *client, struct packet *packet,
         bytes_left--;
         dbg_printf("[%2d] handle_cp_disconnect: disconnect reason was %u\n",
                 client->session->id, disconnect_reason);
+        logger(LOG_INFO, client, "disconnect request with reason %s",
+                (disconnect_reason < MQTT_REASON_CODE_MAX) ? reason_codes_str[disconnect_reason] :
+                "UNKNOWN");
     }
 
     if (bytes_left > 0) {
@@ -4305,6 +4308,7 @@ static int handle_cp_disconnect(struct client *client, struct packet *packet,
     } else {
 skip:
         dbg_printf("[%2d] handle_cp_disconnect: no reason\n", client->session->id);
+        logger(LOG_INFO, client, "disconnect request with no reason");
     }
 
     if (bytes_left)
@@ -4364,6 +4368,8 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     uint8_t protocol_version, connect_flags;
     uint8_t protocol_name[4];
     const struct property *prop;
+    bool reconnect = false;
+    bool clean = false;
 
     uint8_t *will_topic = NULL;
     uint8_t will_qos = 0;
@@ -4567,8 +4573,11 @@ create_new_session:
             client->session->client = NULL;
         }
 
+        reconnect = true;
+
         /* [MQTT-3.1.4-4] */
         if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
+            clean = true;
             /* ... we don't want to re-use it */
             dbg_printf(BWHT"[  ] handle_cp_connect: clean existing session [%d]"CRESET"\n",
                     client->session->id);
@@ -4641,6 +4650,11 @@ create_new_session:
         warn("handle_cp_connect: send_cp_connack failed");
         goto fail;
     }
+
+    logger(LOG_INFO, client, "session established%s%s",
+            reconnect ? " (reconnect)" : "",
+            clean ? " (clean_start)" : "");
+
     return 0;
 
 fail:
@@ -5000,6 +5014,7 @@ static void client_tick(void)
                 break;
 
             case CS_DISCONNECTED:
+                logger(LOG_INFO, clnt, "client disconnected");
                 if (clnt->session) {
 
                     /* Prepare the Will Message to be sent, optionally
@@ -5044,6 +5059,8 @@ static void client_tick(void)
                     warnx("[%2d] client_tick: session present in CS_CLOSING", clnt->session->id);
 
                 if (clnt->disconnect_reason) {
+                    logger(LOG_NOTICE, clnt, "disconnecting client with reason %s",
+                            reason_codes_str[clnt->disconnect_reason]);
                     send_cp_disconnect(clnt, clnt->disconnect_reason);
                     clnt->disconnect_reason = 0;
                 }
@@ -5543,6 +5560,7 @@ shit_fd:
 
             dbg_printf("     main_loop: new client from [%s:%u]\n",
                     new_client->hostname, new_client->remote_port);
+            logger(LOG_INFO, new_client, "new connection");
         }
 
         if (FD_ISSET(mother_fd, &fds_exc))
