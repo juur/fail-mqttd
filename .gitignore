@@ -1,0 +1,14 @@
+*.c
+*.h
+*~
+*.o
+config.status
+doc
+*.txt
+Makefile*
+.clangd
+.d
+.vscode
+fail-mqttd*
+*.sh
+configure
