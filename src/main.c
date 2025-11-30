@@ -75,6 +75,12 @@
 # define INC_REFCNT(x) x++
 #endif
 
+#ifdef WITH_THREADS
+# define RETURN_TYPE void *
+#else
+# define RETURN_TYPE int
+#endif
+
 typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 
 /*
@@ -901,11 +907,12 @@ static void free_session(struct session *session, bool need_lock)
 {
     struct session *tmp;
 
-    dbg_printf("     free_session: session=%d <%s> [%s] client=%u <%s> refcnt=%u\n",
+    dbg_printf("     free_session: session=%d <%s> [%s] client=%u <%s> exp_at=%lu refcnt=%u\n",
             session->id,
             session->client_id, session_state_str[session->state],
             session->client ? session->client->id : 0,
             session->client ? (char *)session->client->client_id : "",
+            session->expires_at,
             GET_REFCNT(&session->refcnt));
 
     if (GET_REFCNT(&session->refcnt) > 0) {
@@ -4592,6 +4599,9 @@ create_new_session:
                 client->session->id, client->id);
         client->session->client = client;
     }
+
+    assert(client->session->state != SESSION_DELETE);
+
     INC_REFCNT(&client->session->refcnt); /* free_client || client_tick || handle_cp_connect */
     client->session->last_connected = time(NULL);
 
@@ -4650,6 +4660,8 @@ create_new_session:
         warn("handle_cp_connect: send_cp_connack failed");
         goto fail;
     }
+
+    client->session->state = SESSION_ACTIVE;
 
     logger(LOG_INFO, client, "session established%s%s",
             reconnect ? " (reconnect)" : "",
@@ -5452,11 +5464,11 @@ static void *tick_loop(void * /* arg */)
 }
 #endif
 
-static void *main_loop(void *start_args)
+static RETURN_TYPE main_loop(void *start_args)
 {
     bool has_clients;
     fd_set fds_in, fds_out, fds_exc;
-    int mother_fd = ((const struct start_args *)start_args)->fd;
+    const int mother_fd = ((const struct start_args *)start_args)->fd;
 
     while (running)
     {
@@ -5492,23 +5504,37 @@ static void *main_loop(void *start_args)
         pthread_rwlock_unlock(&global_clients_lock);
 
         tv.tv_sec = 0;
-        tv.tv_usec = 10000;
 
         if (has_clients == false) {
-            tv.tv_sec = 0;
             tv.tv_usec = 100000;
-            rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv);
+            rc = select(max_fd + 1, &fds_in, NULL, NULL, &tv);
         } else {
-            rc = select(max_fd + 1, &fds_in, &fds_out, &fds_exc, &tv);
+            tv.tv_usec = 10000;
+            rc = select(max_fd + 1, &fds_in, NULL, &fds_exc, &tv);
+
+            /* this is a kludge but not sure how else a) get a hint at blocked writes
+             * and b) avoid select instantly returning (as any non-blocking writable fd
+             * seems to terminate the select, i.e. all of them
+             */
+            tv.tv_sec = 0;
+            tv.tv_usec = 1000;
+            select(max_fd + 1, NULL, &fds_out, NULL, &tv);
         }
 
         if (rc == 0) {
-            continue;
+            /* a timeout occured, but no fds */
+            goto tick_me;
         } else if (rc == -1 && (errno == EAGAIN || errno == EINTR)) {
+            /* TODO calculate the remaining time to sleep? */
             continue;
         } else if (rc == -1) {
             warn("main_loop: select");
+#ifdef WITH_THREADS
             pthread_exit(&errno);
+#else
+            running = false;
+            return -1;
+#endif
         }
 
         if (FD_ISSET(mother_fd, &fds_in)) {
@@ -5599,12 +5625,17 @@ shit_fd:
         pthread_rwlock_unlock(&global_clients_lock);
 
 #ifndef WITH_THREADS
+tick_me:
             tick();
 #endif
     }
 
     errno = 0;
+#ifdef WITH_THREADS
     pthread_exit(&errno);
+#else
+    return -1;
+#endif
 }
 
 /*
@@ -5789,8 +5820,9 @@ shit_usage:
     pthread_join(main_thread, NULL);
     pthread_join(tick_thread, NULL);
 #else
-    main_loop(&start_args);
+    if (main_loop(&start_args) == -1)
+        exit(EXIT_FAILURE);
 #endif
 
-    return EXIT_SUCCESS;
+    exit(EXIT_SUCCESS);
 }
