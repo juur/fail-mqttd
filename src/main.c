@@ -5044,7 +5044,7 @@ static void client_tick(void)
                         dbg_printf("[%2d] client_tick: expiring session instantly\n", clnt->session->id);
                         clnt->session->state = SESSION_DELETE;
                     } else if (clnt->session->expiry_interval == UINT_MAX) {
-                        clnt->session->expires_at = now - 1; /* "does not expire" */
+                        clnt->session->expires_at = LONG_MAX; /* "does not expire" */
                     } else {
                         clnt->session->expires_at = now + clnt->session->expiry_interval;
                     }
