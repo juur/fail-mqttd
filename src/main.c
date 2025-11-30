@@ -221,14 +221,14 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     if (rc == -1) {
         if (die)
             err(EXIT_FAILURE, read_error_fmt, func, file, line, msg ? msg : "");
-        
+
         warn(read_error_fmt, func, file, line, msg ? msg : "");
         return -1;
     }
 
     if (die)
         errx(EXIT_FAILURE, short_read_fmt, func, rc, expected, file, line, msg ? msg : "");
-    
+
     warnx(short_read_fmt, func, rc, expected, file, line, msg ? msg : "");
 
     errno = ERANGE;
@@ -334,7 +334,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds, bool session_
 
         if (message_lock)
             pthread_rwlock_unlock(&mds->message->delivery_states_lock);
-        
+
         DEC_REFCNT(&mds->message->refcnt); /* alloc_message_delivery_state */
         mds->message = NULL;
     }
@@ -2012,7 +2012,7 @@ static void free_all_topics(void)
     bool to_parse;
 
     dbg_printf("     "BYEL"free_all_topics"CRESET"\n");
-    
+
     to_parse = (global_topic_list != NULL);
 
     while (to_parse)
@@ -5082,7 +5082,7 @@ force_close:
                 free_client(clnt, false);
                 clnt = NULL;
                 break;
-                
+
             case CLIENT_STATE_MAX:
                 warn("client_tick: illegal client_state, closing.");
                 clnt->state = CS_CLOSING;
@@ -5221,16 +5221,16 @@ static void tick_msg(struct message *msg)
 again:
             if (idx >= msg->num_message_delivery_states)
                 break;
-            
+
             mds = msg->delivery_states[idx++];
 
             if (mds == NULL) {
                 dbg_printf(BYEL"     tick_msg: mds.idx=%u is NULL"CRESET"\n", idx-1);
                 break;
             }
-            
+
             dbg_printf(NGRN"     tick_msg: mds.idx=%u acc=%lu ack=%lu rel=%lu cmp=%lu"CRESET"\n",
-                    idx - 1, 
+                    idx - 1,
                     mds->accepted_at,
                     mds->acknowledged_at,
                     mds->released_at,
