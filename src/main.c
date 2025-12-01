@@ -39,19 +39,21 @@
 # define dbg_printf(...) printf(__VA_ARGS__)
 #endif
 
-#define CRESET "\x1b[0m"
-#define BBLK "\x1b[1;30m"
-#define BRED "\x1b[1;31m"
-#define NRED "\x1b[0;31m"
-#define BGRN "\x1b[1;32m"
-#define NGRN "\x1b[0;32m"
-#define BYEL "\x1b[1;33m"
-#define NYEL "\x1b[0;33m"
-#define BBLU "\x1b[1;34m"
-#define BMAG "\x1b[1;35m"
-#define BCYN "\x1b[1;36m"
-#define NCYN "\x1b[1;36m"
-#define BWHT "\x1b[1;37m"
+#ifndef NDEBUG
+# define CRESET "\x1b[0m"
+# define BBLK "\x1b[1;30m"
+# define BRED "\x1b[1;31m"
+# define NRED "\x1b[0;31m"
+# define BGRN "\x1b[1;32m"
+# define NGRN "\x1b[0;32m"
+# define BYEL "\x1b[1;33m"
+# define NYEL "\x1b[0;33m"
+# define BBLU "\x1b[1;34m"
+# define BMAG "\x1b[1;35m"
+# define BCYN "\x1b[1;36m"
+# define NCYN "\x1b[1;36m"
+# define BWHT "\x1b[1;37m"
+#endif
 
 #ifdef HAVE_STDATOMIC_H
 # define GET_REFCNT(x) atomic_load_explicit(x, memory_order_relaxed)
@@ -59,21 +61,21 @@
 # ifdef DEBUG_REFCNT
 #  define DEC_REFCNT(x) { \
     atomic_fetch_sub_explicit(x, 1, memory_order_acq_rel); \
-    dbg_printf(NRED "     %s:%d DEC_REFCNT(%s)" CRESET "\n", __func__, __LINE__, #x); \
-}
+    dbg_printf(NRED "     %s:%d DEC_REFCNT(%s)" CRESET "\n", \
+            __func__, __LINE__, #x); }
 #  define INC_REFCNT(x) { \
     atomic_fetch_add_explicit(x, 1, memory_order_relaxed); \
-    dbg_printf(NYEL "     %s:%d INC_REFCNT(%s)" CRESET "\n", __func__, __LINE__, #x); \
-}
-# else
+    dbg_printf(NYEL "     %s:%d INC_REFCNT(%s)" CRESET "\n", \
+            __func__, __LINE__, #x); }
+# else /* !DEBUG_REFCNT */
 #  define DEC_REFCNT(x) atomic_fetch_sub_explicit(x, 1, memory_order_acq_rel)
 #  define INC_REFCNT(x) atomic_fetch_add_explicit(x, 1, memory_order_relaxed)
-# endif
-#else
+# endif /* DEBUG_REFCNT */
+#else /* !HAVE_STDATOMIC_H */
 # define GET_REFCNT(x) x
 # define DEC_REFCNT(x) x--
 # define INC_REFCNT(x) x++
-#endif
+#endif /* HAVE_STDATOMIC_H */
 
 #ifdef WITH_THREADS
 # define RETURN_TYPE void *
@@ -88,6 +90,7 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
  */
 
 static int global_mother_fd = -1;
+static int global_om_fd = -1;
 static _Atomic bool running;
 
 /*
@@ -167,6 +170,7 @@ static struct in_addr opt_listen;
         struct message_delivery_state ***state_array, unsigned *array_length,
         struct message_delivery_state *rem);
 [[gnu::nonnull]] static void free_message_delivery_state(struct message_delivery_state **mds);
+[[gnu::nonnull(3),gnu::format(printf,3,4)]] static void logger(int priority, const struct client *client, const char *format, ...);
 
 /*
  * command line stuff
@@ -269,6 +273,120 @@ static void dump_clients(void)
     pthread_rwlock_unlock(&global_clients_lock);
 }
 
+
+static int openmetrics_export(int fd)
+{
+    FILE *mem = NULL, *in = NULL;
+    size_t size, len;
+    char *buffer = NULL;
+    struct tm *tm = NULL;
+    char date[BUFSIZ];
+    char hdrbuf[BUFSIZ];
+    time_t now;
+    ssize_t nread;
+    char *line = NULL;
+    size_t line_len = 0;
+
+    if ((in = fdopen(fd, "r+b")) == NULL)
+        goto fail;
+
+    setvbuf(in, NULL, _IONBF, 0);
+
+    while ((nread = getline(&line, &line_len, in)) != -1)
+    {
+        //printf("got %ld bytes <%s>\n", nread, line);
+        if (nread == 0)
+            break;
+
+        if (nread == 2 && !memcmp(line, "\r\n", 2))
+            break;
+    }
+    if (line)
+        free(line);
+    if (nread == -1)
+        goto fail;
+
+    const char *const datefmt = "%a, %d %b %Y %T %Z";
+
+    now = time(NULL);
+    tm = gmtime(&now);
+    strftime(date, sizeof(date), datefmt, tm);
+
+    const char *const http_response = 
+        "HTTP/1.1 200 OK\r\n"
+        "content-type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n"
+        "connection: close\r\n"
+        "date: %s\r\n"
+        "content-length: %lu\r\n"
+        "\r\n";
+
+    if ((mem = open_memstream(&buffer, &size)) == NULL) {
+        logger(LOG_WARNING, NULL, "unable to open_memstream: %s", strerror(errno));
+        goto fail;
+    }
+
+    fprintf(mem,
+            "# TYPE num_sessions gauge\n"
+            "num_sessions %u\n"
+            "# TYPE num_clients gauge\n"
+            "num_clients %u\n"
+            "# TYPE num_messages gauge\n"
+            "num_messages %u\n"
+            "# TYPE num_topics gauge\n"
+            "num_topics %u\n"
+            "# TYPE num_mds gauge\n"
+            "num_mds %u\n"
+            "# TYPE num_packets gauge\n"
+            "num_packets %u\n"
+            ,
+            num_sessions,
+            num_clients,
+            num_messages,
+            num_topics,
+            num_mds,
+            num_packets
+           );
+
+    fprintf(mem, "# TYPE topic_subscribers gauge\n");
+    pthread_rwlock_rdlock(&global_topics_lock);
+    for (struct topic *topic = global_topic_list; topic; topic = topic->next)
+    {
+        fprintf(mem,
+                "topic_subscribers{topic_name=\"%s\",topic_id=\"%u\"} %u\n"
+                ,
+                topic->name,
+                topic->id,
+                topic->num_subscribers
+               );
+    }
+    pthread_rwlock_unlock(&global_topics_lock);
+
+    fprintf(mem, "# EOF\n");
+
+    fclose(mem);
+    mem = NULL;
+    
+    len = snprintf(hdrbuf, sizeof(hdrbuf), http_response, date, size);
+
+    if (fwrite(hdrbuf, 1, len, in) != len)
+        goto fail;
+
+    if (fwrite(buffer, 1, size, in) == size)
+        goto fail;
+
+    fclose(in);
+
+    return 0;
+
+fail:
+    if (mem)
+        fclose(mem);
+    if (in)
+        fclose(in);
+
+    return -1;
+}
+
 static void dump_all(void)
 {
     dbg_printf("{\"clients\":[\n");
@@ -276,7 +394,6 @@ static void dump_all(void)
     dbg_printf("]}\n");
 }
 
-[[gnu::nonnull(3),gnu::format(printf,3,4)]]
 static void logger(int priority, const struct client *client, const char *format, ...)
 {
     static const char *fmt = "%s %s [%d]: <%s> %s\n";
@@ -1968,6 +2085,9 @@ static void close_all_sockets(void)
     dbg_printf("     close_socket: closing mother_fd %u\n", global_mother_fd);
     if (global_mother_fd != -1)
         close_socket(&global_mother_fd);
+    dbg_printf("     close_socket: closing openmetrics_fd %u\n", global_om_fd);
+    if (global_om_fd != -1)
+        close_socket(&global_om_fd);
 }
 
 static void free_all_message_delivery_states(void)
@@ -5444,6 +5564,7 @@ static void tick(void)
 
 struct start_args {
     int fd;
+    int om_fd;
 };
 
 #ifdef WITH_THREADS
@@ -5469,10 +5590,11 @@ static RETURN_TYPE main_loop(void *start_args)
     bool has_clients;
     fd_set fds_in, fds_out, fds_exc;
     const int mother_fd = ((const struct start_args *)start_args)->fd;
+    const int om_fd = ((const struct start_args *)start_args)->om_fd;
 
     while (running)
     {
-        int max_fd = mother_fd;
+        int max_fd = mother_fd > om_fd ? mother_fd : om_fd;
         int rc = 0;
         struct timeval tv;
 
@@ -5481,7 +5603,7 @@ static RETURN_TYPE main_loop(void *start_args)
         FD_ZERO(&fds_exc);
 
         FD_SET(mother_fd, &fds_in);
-        FD_SET(mother_fd, &fds_exc);
+        FD_SET(om_fd, &fds_in);
 
         has_clients = false;
 
@@ -5537,6 +5659,15 @@ static RETURN_TYPE main_loop(void *start_args)
 #endif
         }
 
+        if (FD_ISSET(om_fd, &fds_in)) {
+            int tmp_fd;
+
+            if ((tmp_fd = accept(om_fd, NULL, NULL)) != -1) {
+                openmetrics_export(tmp_fd);
+                close(tmp_fd);
+            }
+        }
+
         if (FD_ISSET(mother_fd, &fds_in)) {
             struct sockaddr_in sin_client;
             socklen_t sin_client_len = sizeof(sin_client);
@@ -5587,9 +5718,6 @@ shit_fd:
                     new_client->hostname, new_client->remote_port);
             logger(LOG_INFO, new_client, "new connection");
         }
-
-        if (FD_ISSET(mother_fd, &fds_exc))
-            warnx("main_loop: mother_fd is in fds_exc??");
 
         pthread_rwlock_rdlock(&global_clients_lock);
         for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
@@ -5770,6 +5898,9 @@ shit_usage:
     if ((global_mother_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
         err(EXIT_FAILURE, "socket");
 
+    if ((global_om_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
+        err(EXIT_FAILURE, "socket(openmetrics)");
+
     struct linger linger = {
         .l_onoff = 0,
         .l_linger = 0,
@@ -5779,11 +5910,19 @@ shit_usage:
                 sizeof(linger)) == -1)
         warn("setsockopt(SO_LINGER)");
 
+    if (setsockopt(global_om_fd, SOL_SOCKET, SO_LINGER, &linger,
+                sizeof(linger)) == -1)
+        warn("setsockopt(SO_LINGER, openmetrics)");
+
     int reuse = 1;
 
     if (setsockopt(global_mother_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
                 sizeof(reuse)) == -1)
         warn("setsockopt(SO_REUSEADDR)");
+    
+    if (setsockopt(global_om_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                sizeof(reuse)) == -1)
+        warn("setsockopt(SO_REUSEADDR, openmetrics)");
 
     struct sockaddr_in sin = {0};
 
@@ -5802,8 +5941,19 @@ shit_usage:
 
     logger(LOG_NOTICE, NULL, "main: binding to %s:%u", bind_addr, opt_port);
 
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(1337);
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(global_om_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
+        err(EXIT_FAILURE, "bind(openmetrics)");
+
+    if (listen(global_om_fd, 5) == -1)
+        err(EXIT_FAILURE, "listen(openmetrics)");
+
     struct start_args start_args = {
         .fd = global_mother_fd,
+        .om_fd = global_om_fd,
     };
 
     running = true;
