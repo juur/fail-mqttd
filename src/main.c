@@ -374,6 +374,8 @@ static int openmetrics_export(int fd)
     if (fwrite(buffer, 1, size, in) == size)
         goto fail;
 
+    if (buffer)
+        free(buffer);
     fclose(in);
 
     return 0;
@@ -383,6 +385,8 @@ fail:
         fclose(mem);
     if (in)
         fclose(in);
+    if (buffer)
+        free(buffer);
 
     return -1;
 }
@@ -2363,6 +2367,10 @@ static int enqueue_message(struct topic *topic, struct message *msg)
 
     errno = 0;
 
+    /* TODO check the specification to see if empty topic handling is conformant */
+    if (topic->num_subscribers == 0)
+        goto no_subscribers;
+
     pthread_rwlock_rdlock(&topic->subscribers_lock);
     bool found = false;
     for (unsigned src_idx = 0; src_idx < topic->num_subscribers; src_idx++)
@@ -2417,6 +2425,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
     if (found == false) {
         warnx("enqueue_message: failed to add to subscribers!");
     }
+no_subscribers:
 
     INC_REFCNT(&topic->refcnt);
     msg->topic = topic;
@@ -5580,6 +5589,51 @@ static void *tick_loop(void * /* arg */)
 
         tick();
     }
+    logger(LOG_INFO, NULL, "tick_loop terminated normally");
+
+    return NULL;
+}
+#endif
+
+#ifdef WITH_THREADS
+static RETURN_TYPE om_loop(void *start_args)
+{
+    const int om_fd = ((const struct start_args *)start_args)->om_fd;
+
+    while (running)
+    {
+        int fd, rc;
+        fd_set fds_in;
+
+        FD_ZERO(&fds_in);
+        FD_SET(om_fd, &fds_in);
+
+        struct timeval timeout = {
+            .tv_sec = 1,
+            .tv_usec = 0,
+        };
+
+        if ((rc = select(om_fd + 1, &fds_in, NULL, NULL, &timeout)) == -1) {
+            if (errno == EINTR)
+                continue;
+            logger(LOG_WARNING, NULL, "om_loop: select: %s", strerror(errno));
+            sleep(1);
+        }
+
+        if (rc == 0)
+            continue;
+
+        if ((fd = accept(om_fd, NULL, NULL)) == -1) {
+            logger(LOG_WARNING, NULL, "om_loop: accept: %s", strerror(errno));
+            sleep(1);
+            continue;
+        }
+
+        openmetrics_export(fd);
+        close_socket(&fd);
+    }
+    
+    logger(LOG_INFO, NULL, "om_loop terminated normally");
 
     return 0;
 }
@@ -5603,7 +5657,8 @@ static RETURN_TYPE main_loop(void *start_args)
         FD_ZERO(&fds_exc);
 
         FD_SET(mother_fd, &fds_in);
-        FD_SET(om_fd, &fds_in);
+        if (om_fd > 0)
+            FD_SET(om_fd, &fds_in);
 
         has_clients = false;
 
@@ -5645,7 +5700,9 @@ static RETURN_TYPE main_loop(void *start_args)
 
         if (rc == 0) {
             /* a timeout occured, but no fds */
+#ifndef WITH_THREADS
             goto tick_me;
+#endif
         } else if (rc == -1 && (errno == EAGAIN || errno == EINTR)) {
             /* TODO calculate the remaining time to sleep? */
             continue;
@@ -5659,7 +5716,7 @@ static RETURN_TYPE main_loop(void *start_args)
 #endif
         }
 
-        if (FD_ISSET(om_fd, &fds_in)) {
+        if (om_fd > 0 && FD_ISSET(om_fd, &fds_in)) {
             int tmp_fd;
 
             if ((tmp_fd = accept(om_fd, NULL, NULL)) != -1) {
@@ -5758,11 +5815,13 @@ tick_me:
 #endif
     }
 
+    logger(LOG_INFO, NULL, "main_loop terminated normally");
+
     errno = 0;
 #ifdef WITH_THREADS
     pthread_exit(&errno);
 #else
-    return -1;
+    return 0;
 #endif
 }
 
@@ -5784,12 +5843,14 @@ int main(int argc, char *argv[])
             LOGGER_SYSLOG = 0,
             LOGGER_FILE,
             LOGGER_STDOUT,
+            LOGGER_NOSTDOUT,
         };
 
         char *const token[] = {
             [LOGGER_SYSLOG] = "syslog",
             [LOGGER_FILE] = "file",
             [LOGGER_STDOUT] = "stdout",
+            [LOGGER_NOSTDOUT] = "nostdout",
         };
 
         while ((opt = getopt(argc, argv, "hVp:H:l:")) != -1)
@@ -5811,6 +5872,9 @@ int main(int argc, char *argv[])
                                 break;
                             case LOGGER_STDOUT:
                                 opt_logstdout = true;
+                                break;
+                            case LOGGER_NOSTDOUT:
+                                opt_logstdout = false;
                                 break;
                             default:
                                 goto shit_usage;
@@ -5951,15 +6015,29 @@ shit_usage:
     if (listen(global_om_fd, 5) == -1)
         err(EXIT_FAILURE, "listen(openmetrics)");
 
+#ifdef WITH_THREADS
+    struct start_args start_args = {
+        .fd = global_mother_fd,
+        .om_fd = -1,
+    };
+
+    struct start_args start_args_om = {
+        .fd = -1,
+        .om_fd = global_om_fd,
+    };
+#else
     struct start_args start_args = {
         .fd = global_mother_fd,
         .om_fd = global_om_fd,
     };
+#endif
 
     running = true;
 
 #ifdef WITH_THREADS
-    pthread_t main_thread, tick_thread;
+    pthread_t main_thread, tick_thread, om_thread;
+    if (pthread_create(&om_thread, NULL, om_loop, &start_args_om) == -1)
+        err(EXIT_FAILURE, "pthread_create: om_loop");
 
     if (pthread_create(&main_thread, NULL, main_loop, &start_args) == -1)
         err(EXIT_FAILURE, "pthread_create: main_thread");
@@ -5969,6 +6047,7 @@ shit_usage:
 
     pthread_join(main_thread, NULL);
     pthread_join(tick_thread, NULL);
+    pthread_join(om_thread, NULL);
 #else
     if (main_loop(&start_args) == -1)
         exit(EXIT_FAILURE);
