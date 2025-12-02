@@ -286,6 +286,19 @@ static int openmetrics_export(int fd)
     ssize_t nread;
     char *line = NULL;
     size_t line_len = 0;
+    struct sockaddr_in sin;
+    socklen_t sin_len;
+    char remote_addr[INET_ADDRSTRLEN];
+
+    sin_len = sizeof(sin);
+
+    if (getpeername(fd, (struct sockaddr *)&sin, &sin_len) == -1) {
+        logger(LOG_WARNING, NULL, "openmetrics_export: getpeername: %s", strerror(errno));
+        return -1;
+    }
+
+    inet_ntop(AF_INET, &sin.sin_addr, remote_addr, sizeof(remote_addr));
+    logger(LOG_INFO, NULL, "openmetrics_export connection from %s:%u", remote_addr, htons(sin.sin_port));
 
     if ((in = fdopen(fd, "r+b")) == NULL)
         goto fail;
