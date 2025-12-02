@@ -273,22 +273,51 @@ static void dump_clients(void)
     pthread_rwlock_unlock(&global_clients_lock);
 }
 
+static const char *get_http_error(int error)
+{
+    switch (error)
+    {
+        case 400: return "Bad Request";
+        case 404: return "Not Found";
+        case 501: return "Not Implemented";
+        case 505: return "HTTP Version Not Supported";
+    }
+
+    return "unknown";
+}
+
+static void http_error(FILE *out, int error)
+{
+    fprintf(out,
+            "HTTP/1.1 %u %s\r\n"
+            "connection: close"
+            "content-length: 0"
+            "\r\n"
+            ,
+            error,
+            get_http_error(error)
+           );
+}
 
 static int openmetrics_export(int fd)
 {
     FILE *mem = NULL, *in = NULL;
-    size_t size, len;
+    bool head_request = false;
     char *buffer = NULL;
-    struct tm *tm = NULL;
+    char *http_method = NULL, *http_uri = NULL, *http_version = NULL;
+    char *line = NULL;
     char date[BUFSIZ];
     char hdrbuf[BUFSIZ];
-    time_t now;
-    ssize_t nread;
-    char *line = NULL;
-    size_t line_len = 0;
-    struct sockaddr_in sin;
-    socklen_t sin_len;
     char remote_addr[INET_ADDRSTRLEN];
+    int rc;
+    size_t line_len = 0;
+    size_t size, len;
+    socklen_t sin_len;
+    ssize_t nread;
+    struct sockaddr_in sin;
+    struct tm *tm = NULL;
+    time_t now;
+    unsigned num_lines = 0;
 
     sin_len = sizeof(sin);
 
@@ -305,19 +334,66 @@ static int openmetrics_export(int fd)
 
     setvbuf(in, NULL, _IONBF, 0);
 
+    alarm(5);
     while ((nread = getline(&line, &line_len, in)) != -1)
     {
-        //printf("got %ld bytes <%s>\n", nread, line);
         if (nread == 0)
             break;
 
+        if (nread > 4096 || num_lines > 50) {
+            goto fail;
+        }
+
         if (nread == 2 && !memcmp(line, "\r\n", 2))
             break;
+
+        if (num_lines == 0) {
+            rc = sscanf(line, "%m[A-Z] %ms HTTP/%m[0-9.]", &http_method, &http_uri, &http_version);
+
+            if (rc != 3) {
+                http_error(in, 400);
+                goto fail;
+            }
+
+            if (strcmp("GET", http_method) && strcmp("HEAD", http_method)) {
+                http_error(in, 501);
+                goto fail;
+            }
+
+            if (strcmp("1.0", http_version) && strcmp("1.1", http_version)) {
+                http_error(in, 505);
+                goto fail;
+            }
+
+            if (strcmp("/metrics", http_uri)) {
+                http_error(in, 404);
+                goto fail;
+            }
+
+            if (!strcmp("HEAD", http_method))
+                head_request = true;
+
+            free(http_method);
+            free(http_version);
+            free(http_uri);
+
+            http_method = NULL;
+            http_version = NULL;
+            http_uri = NULL;
+        }
+
+        num_lines++;
     }
-    if (line)
+    alarm(0);
+
+    if (line) {
         free(line);
-    if (nread == -1)
+        line = NULL;
+    }
+
+    if (nread == -1 || num_lines == 0) {
         goto fail;
+    }
 
     const char *const datefmt = "%a, %d %b %Y %T %Z";
 
@@ -381,25 +457,47 @@ static int openmetrics_export(int fd)
     
     len = snprintf(hdrbuf, sizeof(hdrbuf), http_response, date, size);
 
-    if (fwrite(hdrbuf, 1, len, in) != len)
+    alarm(5);
+    if (fwrite(hdrbuf, 1, len, in) != len) {
         goto fail;
+    }
 
-    if (fwrite(buffer, 1, size, in) == size)
-        goto fail;
+    if (!head_request) {
+        if (fwrite(buffer, 1, size, in) != size) {
+            goto fail;
+        }
+    } else
+        size = 0;
+
 
     if (buffer)
         free(buffer);
     fclose(in);
+    alarm(0);
+
+    logger(LOG_INFO, NULL, "openmetrics_export sent %lu bytes of metrics", size);
 
     return 0;
 
 fail:
+    alarm(0);
+
+    logger(LOG_WARNING, NULL, "openmetrics_export connection closed in error");
+
+    if (line)
+        free(line);
     if (mem)
         fclose(mem);
     if (in)
         fclose(in);
     if (buffer)
         free(buffer);
+    if (http_uri)
+        free(http_uri);
+    if (http_method)
+        free(http_method);
+    if (http_uri)
+        free(http_uri);
 
     return -1;
 }
@@ -2075,13 +2173,19 @@ fail:
 
 static void sh_sigint(int signum, siginfo_t * /*info*/, void * /*stuff*/)
 {
+    if (signum == SIGALRM)
+        return;
+
     logger(LOG_WARNING, NULL, "sh_sigint: received signal %u", signum);
+
     if (signum == SIGHUP) {
         dump_all();
         return;
     }
+    
     if (running == false)
         _exit(EXIT_FAILURE);
+    
     running = false;
 }
 
@@ -5945,6 +6049,8 @@ shit_usage:
         err(EXIT_FAILURE, "sigaction(SIGTERM)");
     if (sigaction(SIGHUP, &sa, NULL) == -1)
         err(EXIT_FAILURE, "sigaction(SIGHUP)");
+    if (sigaction(SIGALRM, &sa, NULL) == -1)
+        err(EXIT_FAILURE, "sigaction(SIGALRM)");
 
     atexit(close_all_sockets);
     atexit(free_all_topics_two);
