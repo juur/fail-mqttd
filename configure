@@ -34,6 +34,7 @@ Directory and file names:
   --sbindir=DIR
   --sharedstatedir=DIR
   --sysconfdir=DIR
+  --runstatedir=DIR
 
 Optional features:
   --disable-dependency-tracking
@@ -72,6 +73,7 @@ while :; do
 		--libexecdir=?*) LIBEXECDIR=${1#*=} ;;
 		--localedir=?*) LOCALEDIR=${1#*=} ;;
 		--localstatedir=?*) LOCALSTATEDIR=${1#*=} ;;
+		--runstatedir=?*) RUNSTATEDIR=${1#*=} ;;
 		--mandir=?*) MANDIR=${1#*=} ;;
 		--prefix=?*) PREFIX=${1#*=} ;;
 		--sbindir=?*) SBINDIR=${1#*=} ;;
@@ -119,6 +121,7 @@ LIBDIR=${LIBDIR:-${PREFIX}/lib}
 LIBEXECDIR=${LIBEXECDIR:-${EXECPREFIX}/libexec}
 LOCALEDIR=${LOCALEDIR:-${DATAROOTDIR}/locale}
 LOCALSTATEDIR=${LOCALSTATEDIR:-${PREFIX}/var}
+RUNSTATEDIR=${RUNSTATEDIR:-${LOCALSTATEDIR}/run}
 MANDIR=${MANDIR:-${DATAROOTDIR}/man}
 SBINDIR=${SBINDIR:-${EXECPREFIX}/sbin}
 SHAREDSTATEDIR=${SHAREDSTATEDIR:-${PREFIX}/var/lib}
@@ -387,6 +390,7 @@ fi
 
 # Finish config.h
 echo "#define SYSCONFDIR \"${SYSCONFDIR}\"" >> "${OBJDIR}"/config.h
+echo "#define RUNSTATEDIR \"${RUNSTATEDIR}\"" >> "${OBJDIR}"/config.h 
 printf "\n#endif\n" >> "${OBJDIR}"/config.h
 
 # Create Makefile from template

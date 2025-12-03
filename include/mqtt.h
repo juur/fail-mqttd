@@ -255,6 +255,9 @@ typedef enum {
     READ_STATE_MAX
 } read_state_t;
 
+struct uuid {
+    uint8_t val[16];
+};
 
 struct property {
     property_ident_t ident;
@@ -457,6 +460,7 @@ struct client {
 struct topic {
     struct topic *next;
     id_t id;
+    const struct uuid *uuid;
     const uint8_t *name;
     unsigned num_subscribers;
     struct subscription *(*subscribers)[];
@@ -468,6 +472,16 @@ struct topic {
     _Atomic unsigned refcnt;
 };
 
+/* used to help build a uuid */
+struct uuid_build {
+    uint32_t time_low;
+    uint16_t time_mid;
+    uint16_t time_hi_and_version;
+    uint8_t clk_seq_hi_res;
+    uint8_t clk_seq_low;
+    uint16_t node01;
+    uint32_t node25;
+};
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
 extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];

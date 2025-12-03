@@ -30,6 +30,9 @@
 #include <stdarg.h>
 #include <syslog.h>
 #include <time.h>
+#include <ifaddrs.h>
+#include <net/if_arp.h>
+#include <linux/if_packet.h>
 
 #include "mqtt.h"
 
@@ -92,6 +95,7 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 static int global_mother_fd = -1;
 static int global_om_fd = -1;
 static _Atomic bool running;
+static uint8_t global_hwaddr[8];
 
 /*
  * unique ids
@@ -118,6 +122,8 @@ static const unsigned MAX_MESSAGES_PER_TICK = 100;
 static const unsigned MAX_PROPERTIES        = 32;
 static const unsigned MAX_RECEIVE_PUBS      = 8;
 static const unsigned MAX_SESSIONS          = 128;
+
+static const uint64_t UUID_EPOCH_OFFSET = 0x01B21DD213814000ULL;
 
 /*
  * global lists and associated locks & counts
@@ -272,6 +278,98 @@ static void dump_clients(void)
     }
     pthread_rwlock_unlock(&global_clients_lock);
 }
+
+/* 
+ * UUID helpers
+ */
+
+static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
+{
+    struct ifaddrs *ifaddr;
+    int copy_len;
+    const struct sockaddr_ll *sock;
+
+    if (getifaddrs(&ifaddr) == -1)
+        err(EXIT_FAILURE, "getifaddress");
+
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next)
+    {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        if (ifa->ifa_addr->sa_family != AF_PACKET)
+            continue;
+        
+        sock = (void *)ifa->ifa_addr;
+
+        if (sock->sll_hatype != ARPHRD_ETHER)
+            continue;
+
+        copy_len = sock->sll_halen < out_length ? sock->sll_halen : out_length;
+        memcpy(out, sock->sll_addr, copy_len);
+
+        return copy_len;
+    }
+
+    errno = ENOENT;
+    return -1;
+}
+
+static struct uuid *generate_uuid(uint8_t hwaddr[static 6])
+{
+    struct uuid_build uuid;
+    struct timespec tp;
+    uint64_t t = UUID_EPOCH_OFFSET;
+    struct uuid *ret = NULL;
+
+    if (clock_gettime(CLOCK_REALTIME, &tp) == -1)
+        return NULL;
+
+    t += (uint64_t)tp.tv_sec * 10000000ULL;
+    t += (uint64_t)tp.tv_nsec / 100;
+
+    t &= 0x0fffffffffffffffULL;
+
+    uuid.time_low = (t & 0xffffffffULL);
+    uuid.time_mid = ((t >> 32) & 0xffffULL);
+    uuid.time_hi_and_version = ((t >> 48) & 0x0fffULL);
+    uuid.time_hi_and_version |= (1U << 12);
+
+    srand(time(NULL) ^ getpid());
+    uint16_t rnd = (uint16_t)(rand() & 0x3fff);
+
+    uuid.clk_seq_low = (uint8_t)(rnd & 0xff);
+    uuid.clk_seq_hi_res = (uint8_t)((rnd >> 8) & 0x3f);
+    uuid.clk_seq_hi_res |= 0x80; // (variant 10xxxxx)
+
+    uint8_t out[16];
+
+    out[0] = (uuid.time_low >> 24) & 0xff;
+    out[1] = (uuid.time_low >> 16) & 0xff;
+    out[2] = (uuid.time_low >>  8) & 0xff;
+    out[3] = (uuid.time_low      ) & 0xff;
+
+    out[4] = (uuid.time_mid >>  8) & 0xff;
+    out[5] = (uuid.time_mid      ) & 0xff;
+
+    out[6] = (uuid.time_hi_and_version >> 8) & 0xff;
+    out[7] = (uuid.time_hi_and_version     ) & 0xff;
+
+    out[8] = (uuid.clk_seq_hi_res);
+    out[9] = (uuid.clk_seq_low);
+
+    memcpy(&out[10], hwaddr, 6);
+    
+    if ((ret = malloc(sizeof(struct uuid))) == NULL)
+        return NULL;
+
+    memcpy(ret->val, out, sizeof(out));
+    return ret;
+}
+
+/*
+ * Open Metrics
+ */
 
 static const char *get_http_error(int error)
 {
@@ -496,8 +594,8 @@ fail:
         free(http_uri);
     if (http_method)
         free(http_method);
-    if (http_uri)
-        free(http_uri);
+    if (http_version)
+        free(http_version);
 
     return -1;
 }
@@ -555,6 +653,10 @@ static void logger(int priority, const struct client *client, const char *format
     }
 }
 
+/*
+ * allocators / deallocators
+ */
+
 [[gnu::nonnull]]
 static int mds_detach_and_free(struct message_delivery_state *mds, bool session_lock, bool message_lock)
 {
@@ -598,10 +700,6 @@ static int mds_detach_and_free(struct message_delivery_state *mds, bool session_
 
     return rc;
 }
-
-/*
- * allocators / deallocators
- */
 
 [[gnu::nonnull]]
 static void close_socket(int *fd)
@@ -769,6 +867,11 @@ static void free_topic(struct topic *topic)
     if (topic->name) {
         free((void *)topic->name);
         topic->name = NULL;
+    }
+
+    if (topic->uuid) {
+        free((void *)topic->uuid);
+        topic->uuid = NULL;
     }
 
     pthread_rwlock_destroy(&topic->pending_queue_lock);
@@ -1336,7 +1439,7 @@ fail:
 [[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
 static struct topic *alloc_topic(const uint8_t *name)
 {
-    struct topic *ret;
+    struct topic *ret = NULL;
 
     if (num_topics >= MAX_TOPICS) {
         errno = ENOSPC;
@@ -1348,6 +1451,9 @@ static struct topic *alloc_topic(const uint8_t *name)
     if ((ret = calloc(1, sizeof(struct topic))) == NULL)
         return NULL;
 
+    if ((ret->uuid = generate_uuid(global_hwaddr)) == NULL)
+        goto fail;
+
     pthread_rwlock_init(&ret->subscribers_lock, NULL);
     pthread_rwlock_init(&ret->pending_queue_lock, NULL);
 
@@ -1358,6 +1464,12 @@ static struct topic *alloc_topic(const uint8_t *name)
     dbg_printf("     alloc_topic: id=%u <%s>\n", ret->id, (char *)name);
 
     return ret;
+
+fail:
+    if (ret)
+        free(ret);
+
+    return NULL;
 }
 
 [[gnu::malloc,gnu::warn_unused_result]]
@@ -5206,7 +5318,7 @@ exec_control:
                 free_packet(client->new_packet, true, true);
             } else {
                 dbg_printf("[%2d] parse_incoming: can't free packet refcnt>0\n",
-                        client->session->id);
+                        client->session ? client->session->id : (id_t)-1);
             }
             client->new_packet = NULL;
 
@@ -6060,6 +6172,9 @@ shit_usage:
     atexit(free_all_topics);
     atexit(free_all_packets);
     atexit(free_all_clients);
+
+    if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
+        err(EXIT_FAILURE, "get_first_hwaddr");
 
     const char *topic_name;
     while (optind < argc)
