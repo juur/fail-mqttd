@@ -1486,12 +1486,10 @@ static struct uuid *alloc_uuid(const uint8_t uuid[static 16])
     return ret;
 }
 
-[[gnu::malloc, gnu::warn_unused_result]]
+[[gnu::nonnull(1), gnu::malloc, gnu::warn_unused_result]]
 static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[16])
 {
     struct topic *ret = NULL;
-
-    assert(name != NULL);
 
     if (num_topics >= MAX_TOPICS) {
         errno = ENOSPC;
@@ -1688,9 +1686,17 @@ static int save_message(const struct message *msg)
         goto fail;
 
     save->id = msg->id;
-    memcpy(save->uuid, msg->uuid->val, sizeof(save->uuid));
+    save->format = msg->format;
     save->payload_len = msg->payload_len;
-    memcpy(&save->payload, msg->payload, msg->payload_len);
+    save->qos = msg->qos;
+    save->retain = msg->retain;
+    save->type = msg->type;
+
+    memcpy(save->uuid, msg->uuid->val, sizeof(save->uuid));
+    if (msg->topic)
+        memcpy(save->topic_uuid, msg->topic->uuid, sizeof(save->topic_uuid));
+    if (msg->payload)
+        memcpy(&save->payload, msg->payload, msg->payload_len);
 
     datum key = {
         .dptr = (char *)msg->uuid->val,
@@ -1701,7 +1707,6 @@ static int save_message(const struct message *msg)
         .dptr = (void *)save,
         .dsize = size
     };
-
 
     if (dbm_store(message_dbm, key, content, DBM_REPLACE) < 0) {
         int err = dbm_error(message_dbm);
@@ -2618,13 +2623,13 @@ static void free_all_topics(void)
 static struct message *find_message_by_uuid(const uint8_t uuid[static 16])
 {
     errno = 0;
-    dbg_printf("     find_message_by_uuid: looking for %s\n", uuid_to_string(uuid));
+    //dbg_printf("     find_message_by_uuid: looking for %s\n", uuid_to_string(uuid));
 
     pthread_rwlock_rdlock(&global_messages_lock);
     for (struct message *msg = global_message_list; msg; msg = msg->next)
     {
         if (!memcmp(msg->uuid->val, uuid, 16)) {
-            dbg_printf("     find_message_by_uuid: match\n");
+            //dbg_printf("     find_message_by_uuid: match\n");
             pthread_rwlock_unlock(&global_messages_lock);
             return msg;
         }
@@ -2632,7 +2637,7 @@ static struct message *find_message_by_uuid(const uint8_t uuid[static 16])
     pthread_rwlock_unlock(&global_messages_lock);
 
     errno = ENOENT;
-    dbg_printf("     find_message_by_uuid: no match\n");
+    //dbg_printf("     find_message_by_uuid: no match\n");
     return NULL;
 }
 
@@ -2670,6 +2675,7 @@ static struct topic *find_or_register_topic(const uint8_t *name)
         }
 
         free((void *)tmp_name);
+        save_topic(topic);
     }
 
     return topic;
@@ -2714,7 +2720,7 @@ static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[16])
         return NULL;
 
     ret->state = TOPIC_ACTIVE;
-    save_topic(ret);
+    /* We do not save here, caller must save, find_or_register_topic() does this */
 
     pthread_rwlock_wrlock(&global_topics_lock);
     ret->next = global_topic_list;
@@ -2990,7 +2996,6 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     msg->sender = sender;
     msg->state = MSG_NEW;
     msg->retain = retain;
-
 
     if (retain) {
         /* TODO retained_message locking ? */
@@ -5179,7 +5184,8 @@ create_new_session:
 
         /* [MQTT-3.1.4-3] */
         if (client->session->client) {
-            if (send_cp_disconnect(client->session->client, MQTT_SESSION_TAKEN_OVER) == -1)
+            if (send_cp_disconnect(client->session->client,
+                        MQTT_SESSION_TAKEN_OVER) == -1)
                 client->session->client->state = CS_CLOSING;
 
             DEC_REFCNT(&client->session->refcnt); /* handle_cp_connect */
@@ -5494,7 +5500,8 @@ lenread:
                     goto fail;
                 }
 
-                dbg_printf("[%2d] parse_incoming: client=%u type=%u <"BRED"%s"CRESET"> flags=%u remaining_length=%u\n",
+                dbg_printf("[%2d] parse_incoming: client=%u type=%u <"
+                        BRED"%s"CRESET"> flags=%u remaining_length=%u\n",
                         client->session ? client->session->id : (id_t)-1,
                         client->id,
                         hdr->type, control_packet_str[hdr->type],
@@ -5546,7 +5553,8 @@ readbody:
 exec_control:
             client->parse_state = READ_STATE_NEW;
 
-            if (client->session == NULL && client->new_packet->type != MQTT_CP_CONNECT) {
+            if (client->session == NULL &&
+                    client->new_packet->type != MQTT_CP_CONNECT) {
                 warnx("parse_incoming: first packet is not CONNECT");
                 goto fail;
             }
@@ -5556,7 +5564,8 @@ exec_control:
                     client->id);
 
             /* [MQTT-3.1.4-6] - maybe */
-            if (!control_functions[client->new_packet->type].needs_auth || client->is_auth)
+            if (!control_functions[client->new_packet->type].needs_auth ||
+                    client->is_auth)
                 if (control_functions[client->new_packet->type].func(client,
                             client->new_packet, client->packet_buf) == -1) {
                     warn("control_function");
@@ -5661,12 +5670,14 @@ static void client_tick(void)
                     /* TODO set a sensible maximum */
                     /* [MQTT-3.1.2-23 */
                     if (clnt->session->expiry_interval == 0) {
-                        dbg_printf("[%2d] client_tick: expiring session instantly\n", clnt->session->id);
+                        dbg_printf("[%2d] client_tick: expiring session instantly\n",
+                                clnt->session->id);
                         clnt->session->state = SESSION_DELETE;
                     } else if (clnt->session->expiry_interval == UINT_MAX) {
                         clnt->session->expires_at = LONG_MAX; /* "does not expire" */
                     } else {
-                        clnt->session->expires_at = now + clnt->session->expiry_interval;
+                        clnt->session->expires_at =
+                            now + clnt->session->expiry_interval;
                     }
 
                     DEC_REFCNT(&clnt->session->refcnt); /* handle_cp_connect */
@@ -5676,10 +5687,12 @@ static void client_tick(void)
 
             case CS_CLOSING:
                 if (clnt->session)
-                    warnx("[%2d] client_tick: session present in CS_CLOSING", clnt->session->id);
+                    warnx("[%2d] client_tick: session present in CS_CLOSING",
+                            clnt->session->id);
 
                 if (clnt->disconnect_reason) {
-                    logger(LOG_NOTICE, clnt, "client_tick: disconnecting client with reason %s",
+                    logger(LOG_NOTICE, clnt,
+                            "client_tick: disconnecting client with reason %s",
                             reason_codes_str[clnt->disconnect_reason]);
                     send_cp_disconnect(clnt, clnt->disconnect_reason);
                     clnt->disconnect_reason = 0;
@@ -5726,7 +5739,8 @@ static void tick_msg(struct message *msg)
         if (msg->topic) {
             if (dequeue_message(msg) == -1)
                 warn("tick_msg: dequeue_message failed");
-            if (!msg->retain && msg->topic->retained_message != msg)
+            if (!msg->retain || msg->topic == NULL
+                    || msg->topic->retained_message != msg)
                 msg->state = MSG_DEAD;
         }
         return;
@@ -5763,11 +5777,12 @@ static void tick_msg(struct message *msg)
 
         /* disconnected session */
         if (mds->session->client == NULL) {
-            //dbg_printf(NGRN"     tick_msg: skipping missing client for session %d"CRESET"\n", mds->session->id);
             continue;
         }
 
-        dbg_printf(BGRN"     tick_msg: sending message: id=%u subscriber.id=%d <%s> ackat=%lu lastsent=%lu"CRESET"\n",
+        dbg_printf(BGRN
+                "     tick_msg: sending message: id=%u subscriber.id=%d <%s> ackat=%lu lastsent=%lu"
+                CRESET"\n",
                 mds->id, mds->session->id, (char *)mds->session->client_id,
                 mds->acknowledged_at, mds->last_sent);
 
@@ -5831,7 +5846,9 @@ static void tick_msg(struct message *msg)
     //        num_sent, msg->num_message_delivery_states);
 
     /* We have now sent everything */
-    if (num_sent == num_to_send /*msg->num_message_delivery_states*/) { /* TODO this doesn't handle holes? */
+    if (num_sent == num_to_send /*msg->num_message_delivery_states*/) {
+        /* TODO this doesn't handle holes? */
+
         /* TODO replace with list of subscribers to message, removal thereof,
          * then dequeue when none left */
 
@@ -5860,7 +5877,9 @@ again:
             if (mds->completed_at == 0)
                 goto again;
 
-            dbg_printf(NGRN"     tick_msg: mds.idx=%u unlink mds.id=%u from session %u[%u] and message %u[%u]"CRESET"\n",
+            dbg_printf(NGRN
+                    "     tick_msg: mds.idx=%u unlink mds.id=%u from session %u[%u] and message %u[%u]"
+                    CRESET"\n",
                     idx - 1,
                     mds->id,
                     mds->session ? mds->session->id : 0,
@@ -5878,7 +5897,8 @@ again:
             if (dequeue_message(msg) == -1) {
                 warn("tick_msg: dequeue_message failed");
             }
-            if (!msg->retain && msg->topic->retained_message != msg)
+            if (!msg->retain || msg->topic == NULL
+                    || msg->topic->retained_message != msg)
                 msg->state = MSG_DEAD;
         }
 
@@ -5906,7 +5926,8 @@ static void topic_tick(void)
             first = false;
         }
 
-        dbg_printf("     topic_tick: <%s> %p\n", topic->name, (void *)topic->pending_queue);
+        dbg_printf("     topic_tick: <%s> %p\n",
+                topic->name, (void *)topic->pending_queue);
 
         /* Iterate over the queued messages on this topic */
         pthread_rwlock_wrlock(&topic->pending_queue_lock);
@@ -5957,7 +5978,8 @@ static void session_tick(void)
     const time_t now = time(NULL);
 
     pthread_rwlock_wrlock(&global_sessions_lock);
-    for (struct session *session = global_session_list, *next; session; session = next)
+    for (struct session *session = global_session_list, *next; session;
+            session = next)
     {
         next = session->next;
 
@@ -5972,7 +5994,8 @@ static void session_tick(void)
                     if (unsubscribe((*session->subscriptions)[0]) == -1)
                         warn("session_tick: unsubscribe");
             } else if (session->will_at) {
-                dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n", session->id);
+                dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
+                        session->id);
                 goto force_will;
             } else {
                 free_session(session, false);
@@ -5988,7 +6011,8 @@ static void session_tick(void)
                 session->state = SESSION_DELETE;
 
                 if (session->will_at) {
-                    dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n", session->id);
+                    dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
+                            session->id);
                     goto force_will;
                 }
             }
@@ -6170,10 +6194,10 @@ static RETURN_TYPE main_loop(void *start_args)
             tv.tv_usec = 10000;
             rc = select(max_fd + 1, &fds_in, NULL, &fds_exc, &tv);
 
-            /* this is a kludge but not sure how else a) get a hint at blocked writes
-             * and b) avoid select instantly returning (as any non-blocking writable fd
-             * seems to terminate the select, i.e. all of them
-             */
+            /* this is a kludge but not sure how else a) get a hint at blocked
+             * writes and b) avoid select instantly returning (as any
+             * non-blocking writable fd seems to terminate the select,
+             * i.e. all of them */
             tv.tv_sec = 0;
             tv.tv_usec = 1000;
             select(max_fd + 1, NULL, &fds_out, NULL, &tv);
@@ -6315,11 +6339,16 @@ static int load_message(datum /* key */, datum content)
         return -1;
 
     if (save->payload_len) {
-        msg->payload_len = save->payload_len;
         if ((msg->payload = malloc(save->payload_len)) == NULL)
             goto fail;
         memcpy((void *)msg->payload, save->payload, save->payload_len);
     }
+
+    msg->format = save->format;
+    msg->payload_len = save->payload_len;
+    msg->qos = save->qos;
+    msg->retain = save->retain;
+    msg->type = save->type;
 
     msg->state = MSG_ACTIVE;
 
@@ -6345,25 +6374,28 @@ static bool is_null_uuid(const uint8_t uuid[static 16])
 
 static int load_topic(datum /* key */, datum content)
 {
-    const struct topic_save *topic_save = (void *)content.dptr;
-    struct topic *topic;
+    const struct topic_save *save = (void *)content.dptr;
+    struct topic *topic = NULL;
 
-    if ((topic = find_topic((void *)topic_save->name)) != NULL) {
-        logger(LOG_WARNING, NULL, "open_databases: duplicate topic for %s", topic_save->name);
+    if (find_topic((void *)save->name) != NULL) {
+        logger(LOG_WARNING, NULL, "open_databases: duplicate topic for %s",
+                save->name);
         errno = EEXIST;
         return -1;
     }
 
-    if ((topic = register_topic((void *)topic_save->name, topic_save->uuid)) == NULL)
+    if ((topic = register_topic((void *)save->name, save->uuid)) == NULL)
         return -1;
 
-    dbg_printf("     open_databases: retained_message_uuid=%s\n",
-            uuid_to_string(topic_save->retained_message_uuid));
-    if (!is_null_uuid(topic_save->retained_message_uuid)) {
-        if ((topic->retained_message = find_message_by_uuid(topic_save->retained_message_uuid)) == NULL)
-            logger(LOG_WARNING, NULL, "open_databases: unable to find retained message for topic <%s>", topic->name);
+    if (!is_null_uuid(save->retained_message_uuid)) {
+        dbg_printf("     open_databases: retained_message_uuid=%s\n",
+                uuid_to_string(save->retained_message_uuid));
+        if ((topic->retained_message =
+                    find_message_by_uuid(save->retained_message_uuid)) == NULL)
+            logger(LOG_WARNING, NULL,
+                    "open_databases: unable to find retained message for topic <%s>",
+                    topic->name);
         else {
-            topic->retained_message->retain = true;
             topic->retained_message->topic = topic;
             INC_REFCNT(&topic->retained_message->refcnt);
             INC_REFCNT(&topic->refcnt);
@@ -6373,7 +6405,9 @@ static int load_topic(datum /* key */, datum content)
 
     topic->state = TOPIC_ACTIVE;
 
-    logger(LOG_INFO, NULL, "open_databases: registered previously saved topic <%s>", topic->name);
+    logger(LOG_INFO, NULL,
+            "open_databases: registered previously saved topic <%s>",
+            topic->name);
 
     return 0;
 }
@@ -6382,10 +6416,11 @@ static const struct {
     DBM **global;
     char *filename;
     int (*const func)(datum key, datum content);
+    size_t size;
 } database_init[] = {
-    { &message_dbm, "messages", load_message },
-    { &topic_dbm, "topics", load_topic },
-    { NULL, NULL, NULL },
+    { &message_dbm, "messages", load_message, sizeof(struct message_save) },
+    { &topic_dbm, "topics", load_topic, sizeof(struct topic_save) },
+    { NULL, NULL, NULL, -1 },
 };
 
 static int open_databases(void)
@@ -6409,9 +6444,21 @@ static int open_databases(void)
             if (tmp_content.dptr == NULL)
                 goto skip;
 
+            /* TODO message_save.payload is variable so < not != but this then
+             * makes others more error prone ... */
+            if ((size_t)tmp_content.dsize < database_init[idx].size) {
+                logger(LOG_ERR, NULL,
+                        "open_databases: content.dsize mismatch in <%s> (got %d, expected %lu)",
+                        database_init[idx].filename,
+                        tmp_content.dsize,
+                        database_init[idx].size);
+                errno = EIO;
+                goto fail;
+            }
+
             if (database_init[idx].func(tmp_key, tmp_content) == -1) {
                 logger(LOG_WARNING, NULL,
-                        "     open_databases: <%s>.func failed: %s",
+                        "open_databases: <%s>.func failed: %s",
                         database_init[idx].filename,
                         strerror(errno));
                 goto skip;
@@ -6517,7 +6564,8 @@ shit_usage:
     setvbuf(stderr, NULL, _IONBF, 0);
 
     if (logfile_name) {
-        if ((opt_logfile = fopen(logfile_name, opt_logfileappend ? "a" : "w")) == NULL)
+        if ((opt_logfile = fopen(logfile_name,
+                        opt_logfileappend ? "a" : "w")) == NULL)
             errx(EXIT_FAILURE, "fopen(%s)", logfile_name);
         atexit(close_logfile);
     }
@@ -6556,13 +6604,10 @@ shit_usage:
     if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
         err(EXIT_FAILURE, "get_first_hwaddr");
 
-    logger(LOG_INFO, NULL, "main: using hardware address %02x:%02x:%02x:%02x:%02x:%02x",
-            global_hwaddr[0],
-            global_hwaddr[1],
-            global_hwaddr[2],
-            global_hwaddr[3],
-            global_hwaddr[4],
-            global_hwaddr[5]
+    logger(LOG_INFO, NULL,
+            "main: using hardware address %02x:%02x:%02x:%02x:%02x:%02x",
+            global_hwaddr[0], global_hwaddr[1], global_hwaddr[2],
+            global_hwaddr[3], global_hwaddr[4], global_hwaddr[5]
           );
 
     const char *topic_name;

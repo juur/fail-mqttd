@@ -52,7 +52,7 @@ EOF
 
 QUIET=0
 DEPS=1
-FEATURE_INET=1
+#FEATURE_INET=1
 SAVED_ARGS="$*"
 
 while :; do
@@ -86,8 +86,8 @@ while :; do
 		--program-prefix=) PROGPREFIX= ;;
 		--disable-dependency-tracking) DEPS=0 ;;
 		--enable-dependency-tracking) DEPS=1 ;;
-		--enable-inet) FEATURE_INET=1 ;;
-		--disable-inet) FEATURE_INET=0 ;;
+#		--enable-inet) FEATURE_INET=1 ;;
+#		--disable-inet) FEATURE_INET=0 ;;
 		*) [[ -n "${1-}" ]] && { echo "Unknown argument ${1-}" >&2; exit 1; } ;;
 	esac
 	shift || break
@@ -285,11 +285,11 @@ echo "objdir = ${OBJDIR}; srcdir = ${SRCDIR};"
 
 # List of system headers we need to check for
 
-H_FILES="stdlib.h netinet/in.h sys/socket.h fcntl.h unistd.h err.h stdio.h string.h stdbool.h errno.h sys/select.h stdatomic.h signal.h assert.h pthread.h arpa/inet.h limits.h pthread.h stdarg.h syslog.h time.h db.h"
+H_FILES="stdlib.h netinet/in.h sys/socket.h fcntl.h unistd.h err.h stdio.h string.h stdbool.h errno.h sys/select.h stdatomic.h signal.h assert.h pthread.h arpa/inet.h limits.h pthread.h stdarg.h syslog.h time.h ifaddrs.h net/if_arp.h linux/if_packet.h ndbm.h"
 
 # List of system functions to check for function:arg0,arg1
 
-FUNC_CHECK=""
+FUNC_CHECK="dbm_close:NULL dbm_open:NULL,0,0 getifaddrs:NULL"
 
 # List of pkg-config things to check for
 
@@ -384,9 +384,9 @@ if [[ "${LEX}" ]]; then
 	fi
 fi
 
-if [[ FEATURE_INET -eq 1 ]]; then
-	echo "#define ENABLE_INET 1" >> "${OBJDIR}"/config.h
-fi
+#if [[ FEATURE_INET -eq 1 ]]; then
+#	echo "#define ENABLE_INET 1" >> "${OBJDIR}"/config.h
+#fi
 
 # Finish config.h
 echo "#define SYSCONFDIR \"${SYSCONFDIR}\"" >> "${OBJDIR}"/config.h

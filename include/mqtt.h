@@ -248,7 +248,7 @@ typedef enum {
 
 /* client.parse_state */
 typedef enum {
-    READ_STATE_NEW,
+    READ_STATE_NEW = 0,
     READ_STATE_HEADER,
     READ_STATE_MORE_HEADER,
     READ_STATE_BODY,
@@ -324,8 +324,13 @@ struct message_delivery_state {
 };
 
 struct message_save {
-    id_t id;
+    uint64_t id;
     uint8_t uuid[16];
+    uint8_t topic_uuid[16];
+    uint8_t format;
+    uint8_t retain;
+    uint8_t qos;
+    uint8_t type;
     uint32_t payload_len;
     uint8_t payload[] __attribute__((counted_by(payload_len)));
 };
