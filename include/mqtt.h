@@ -323,6 +323,13 @@ struct message_delivery_state {
     reason_code_t client_reason;
 };
 
+struct message_save {
+    id_t id;
+    uint8_t uuid[16];
+    uint32_t payload_len;
+    uint8_t payload[] __attribute__((counted_by(payload_len)));
+};
+
 struct message {
     struct message *next;
     id_t id;
@@ -337,6 +344,7 @@ struct message {
     message_state_t state;
     message_type_t type;
     bool retain;
+    struct uuid *uuid;
 
     unsigned num_message_delivery_states;
     struct message_delivery_state **delivery_states;
@@ -461,6 +469,7 @@ struct topic_save {
     id_t id;
     uint8_t uuid[16];
     char name[128];
+    uint8_t retained_message_uuid[16];
 } __attribute__((packed));
 
 struct topic {

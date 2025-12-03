@@ -156,6 +156,7 @@ static unsigned num_mds      = 0;
  */
 
 static DBM *topic_dbm = NULL;
+static DBM *message_dbm = NULL;
 
 /*
  * command line options
@@ -260,6 +261,25 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 }
 #define log_io_error(m,r,e,d) _log_io_error(m,r,e,d,__FILE__,__func__,__LINE__)
 
+static const char *uuid_to_string(const uint8_t uuid[static 16])
+{
+    static char buf[64];
+
+     snprintf(buf, sizeof(buf), "%02x%02x%02x%02x-"
+             "%02x%02x-"
+             "%02x%02x-"
+             "%02x%02x-"
+             "%02x%02x%02x%02x%02x%02x",
+             uuid[0], uuid[1], uuid[2], uuid[3],
+             uuid[4], uuid[5],
+             uuid[6], uuid[7],
+             uuid[8], uuid[9],
+             uuid[10], uuid[11], uuid[12],
+             uuid[13], uuid[14], uuid[15]);
+
+     return buf;
+}
+
 [[maybe_unused]]
 static void dump_topics(void)
 {
@@ -316,9 +336,11 @@ static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
         copy_len = sock->sll_halen < out_length ? sock->sll_halen : out_length;
         memcpy(out, sock->sll_addr, copy_len);
 
+        freeifaddrs(ifaddr);
         return copy_len;
     }
 
+    freeifaddrs(ifaddr);
     errno = ENOENT;
     return -1;
 }
@@ -842,6 +864,7 @@ static void free_topic(struct topic *topic)
         pthread_rwlock_unlock(&msg->delivery_states_lock);
 
         DEC_REFCNT(&msg->refcnt);
+        DEC_REFCNT(&msg->topic->refcnt);
         msg->topic = NULL;
 
         if (GET_REFCNT(&msg->refcnt) == 0) {
@@ -1127,7 +1150,6 @@ static void free_message(struct message *msg, bool need_lock)
 
     pthread_rwlock_destroy(&msg->delivery_states_lock);
 
-
     if (msg->type == MSG_WILL && msg->sender) {
         msg->sender->will_topic = NULL;
     }
@@ -1135,6 +1157,11 @@ static void free_message(struct message *msg, bool need_lock)
     /* INC in register_message(), doesn't happen to RETAIN */
     if (msg->sender && GET_REFCNT(&msg->sender->refcnt))
         DEC_REFCNT(&msg->sender->refcnt);
+
+    if (msg->uuid) {
+        free(msg->uuid);
+        msg->uuid = NULL;
+    }
 
     num_messages--;
     free(msg);
@@ -1455,7 +1482,7 @@ static struct uuid *alloc_uuid(const uint8_t uuid[static 16])
         return NULL;
 
     memcpy(ret->val, uuid, sizeof(ret->val));
-    
+
     return ret;
 }
 
@@ -1484,10 +1511,12 @@ static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[16])
             goto fail;
     }
 
+    if ((ret->name = (void *)strdup((char *)name)) == NULL)
+        goto fail;
+
     pthread_rwlock_init(&ret->subscribers_lock, NULL);
     pthread_rwlock_init(&ret->pending_queue_lock, NULL);
 
-    ret->name = name;
     ret->id = topic_id++;
     num_topics++;
 
@@ -1496,6 +1525,11 @@ static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[16])
     return ret;
 
 fail:
+    if (ret->uuid) {
+        free((void *)ret->uuid);
+        ret->uuid = NULL;
+    }
+
     if (ret)
         free(ret);
 
@@ -1545,7 +1579,7 @@ static struct packet *alloc_packet(struct client *owner)
 }
 
 [[gnu::malloc, gnu::warn_unused_result]]
-static struct message *alloc_message(void)
+static struct message *alloc_message(const uint8_t uuid[16])
 {
     struct message *msg;
 
@@ -1560,6 +1594,13 @@ static struct message *alloc_message(void)
         return NULL;
 
     msg->state = MSG_NEW;
+    if (uuid) {
+        if ((msg->uuid = alloc_uuid(uuid)) == NULL)
+            goto fail;
+    } else {
+        if ((msg->uuid = generate_uuid(global_hwaddr)) == NULL)
+            goto fail;
+    }
     pthread_rwlock_wrlock(&global_messages_lock);
     msg->next = global_message_list;
     global_message_list = msg;
@@ -1569,6 +1610,13 @@ static struct message *alloc_message(void)
     msg->id = message_id++;
 
     return msg;
+
+fail:
+
+    if (msg)
+        free(msg);
+
+    return NULL;
 }
 
 [[gnu::malloc, gnu::warn_unused_result]]
@@ -1617,6 +1665,65 @@ fail:
  * persistence functions
  */
 
+[[gnu::nonnull]]
+static int save_message(const struct message *msg)
+{
+    struct message_save *save = NULL;
+
+    assert(msg->uuid);
+
+    errno = EINVAL;
+
+    pthread_rwlock_rdlock(&global_messages_lock);
+
+    if (msg->state != MSG_ACTIVE)
+        goto fail;
+
+    dbg_printf("     save_message: saving message id=%u uuid=%s\n",
+            msg->id, uuid_to_string(msg->uuid->val));
+
+    size_t size = sizeof(struct message_save) + msg->payload_len;
+
+    if ((save = malloc(size)) == NULL)
+        goto fail;
+
+    save->id = msg->id;
+    memcpy(save->uuid, msg->uuid->val, sizeof(save->uuid));
+    save->payload_len = msg->payload_len;
+    memcpy(&save->payload, msg->payload, msg->payload_len);
+
+    datum key = {
+        .dptr = (char *)msg->uuid->val,
+        .dsize = sizeof(msg->uuid->val),
+    };
+
+    datum content = {
+        .dptr = (void *)save,
+        .dsize = size
+    };
+
+
+    if (dbm_store(message_dbm, key, content, DBM_REPLACE) < 0) {
+        int err = dbm_error(message_dbm);
+        logger(LOG_WARNING, NULL, "save_message: dbm_store: %u:%s", err, strerror(err));
+        errno = err;
+        dbm_clearerr(message_dbm);
+        goto fail;
+    }
+
+    free(save);
+
+    pthread_rwlock_unlock(&global_messages_lock);
+    return 0;
+
+fail:
+    if (save)
+        free(save);
+    pthread_rwlock_unlock(&global_messages_lock);
+    return -1;
+}
+
+[[gnu::nonnull]]
 static int save_topic(const struct topic *topic)
 {
     errno = EINVAL;
@@ -1626,15 +1733,23 @@ static int save_topic(const struct topic *topic)
     if (topic->state != TOPIC_ACTIVE)
         goto fail;
 
-    dbg_printf("     save_topic: saving topic id=%u name=<%s>\n", topic->id, topic->name);
+    dbg_printf("     save_topic: saving topic id=%u name=<%s> %s%s\n",
+            topic->id, topic->name,
+            topic->retained_message ? "retained=" : "",
+            topic->retained_message ? uuid_to_string(topic->retained_message->uuid->val) : ""
+            );
 
     struct topic_save save;
-
     memset(&save, 0, sizeof(save));
 
     save.id = topic->id;
     memcpy(save.uuid, topic->uuid->val, sizeof(save.uuid));
     strncpy(save.name, (char *)topic->name, sizeof(save.name) - 1);
+    if (topic->retained_message) {
+        memcpy(save.retained_message_uuid, topic->retained_message->uuid->val, sizeof(save.retained_message_uuid));
+        dbg_printf("     save_topic: set retained_message_uuid to %s\n",
+                uuid_to_string(save.retained_message_uuid));
+    }
 
     datum key = {
         .dptr = (char *)topic->uuid->val,
@@ -1645,6 +1760,12 @@ static int save_topic(const struct topic *topic)
         .dptr = (char *)&save,
         .dsize = sizeof(save),
     };
+
+    if (topic->retained_message)
+        if (save_message(topic->retained_message) == -1) {
+            logger(LOG_WARNING, NULL, "save_topic: not saving topic due to save_message: %s", strerror(errno));
+            goto fail;
+        }
 
     if (dbm_store(topic_dbm, key, content, DBM_REPLACE) < 0) {
         int err = dbm_error(topic_dbm);
@@ -2396,6 +2517,11 @@ static void close_databases(void)
         dbm_close(topic_dbm);
         topic_dbm = NULL;
     }
+
+    if (message_dbm) {
+        dbm_close(message_dbm);
+        message_dbm = NULL;
+    }
 }
 
 static void close_all_sockets(void)
@@ -2406,6 +2532,13 @@ static void close_all_sockets(void)
     dbg_printf("     close_socket: closing openmetrics_fd %u\n", global_om_fd);
     if (global_om_fd != -1)
         close_socket(&global_om_fd);
+}
+
+static void save_all_topics(void)
+{
+    dbg_printf("     "BYEL"save_all_topics"CRESET"\n");
+    for (const struct topic *topic = global_topic_list; topic; topic = topic->next)
+        save_topic(topic);
 }
 
 static void free_all_message_delivery_states(void)
@@ -2482,6 +2615,28 @@ static void free_all_topics(void)
  */
 
 [[gnu::nonnull, gnu::warn_unused_result]]
+static struct message *find_message_by_uuid(const uint8_t uuid[static 16])
+{
+    errno = 0;
+    dbg_printf("     find_message_by_uuid: looking for %s\n", uuid_to_string(uuid));
+
+    pthread_rwlock_rdlock(&global_messages_lock);
+    for (struct message *msg = global_message_list; msg; msg = msg->next)
+    {
+        if (!memcmp(msg->uuid->val, uuid, 16)) {
+            dbg_printf("     find_message_by_uuid: match\n");
+            pthread_rwlock_unlock(&global_messages_lock);
+            return msg;
+        }
+    }
+    pthread_rwlock_unlock(&global_messages_lock);
+
+    errno = ENOENT;
+    dbg_printf("     find_message_by_uuid: no match\n");
+    return NULL;
+}
+
+[[gnu::nonnull, gnu::warn_unused_result]]
 static struct topic *find_topic(const uint8_t *name)
 {
     errno = 0;
@@ -2503,7 +2658,7 @@ static struct topic *find_topic(const uint8_t *name)
 static struct topic *find_or_register_topic(const uint8_t *name)
 {
     struct topic *topic;
-    const uint8_t *tmp_name;
+    const uint8_t *tmp_name = NULL;
 
     if ((topic = find_topic(name)) == NULL) {
         if ((tmp_name = (void *)strdup((const char *)name)) == NULL)
@@ -2513,6 +2668,8 @@ static struct topic *find_or_register_topic(const uint8_t *name)
             warn("find_or_register_topic: register_topic <%s>", tmp_name);
             goto fail;
         }
+
+        free((void *)tmp_name);
     }
 
     return topic;
@@ -2792,8 +2949,10 @@ static int dequeue_message(struct message *msg)
 
 done:
     msg->next_queue = NULL;
-    DEC_REFCNT(&msg->topic->refcnt);
-    msg->topic = NULL;
+    if (!msg->retain || msg->topic->retained_message != msg) {
+        DEC_REFCNT(&msg->topic->refcnt);
+        msg->topic = NULL;
+    }
     return 0;
 }
 
@@ -2820,7 +2979,7 @@ static struct message *register_message(const uint8_t *topic_name, int format,
 
     struct message *msg;
 
-    if ((msg = alloc_message()) == NULL)
+    if ((msg = alloc_message(NULL)) == NULL)
         goto fail;
 
     msg->type = type;
@@ -4683,6 +4842,9 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
             if (msg->state != MSG_ACTIVE)
                 continue;
 
+            dbg_printf("[%2d] handle_cp_subscribe: handling retain message\n",
+                    client->session->id);
+
             struct message_delivery_state *mds;
 
             if ((mds = alloc_message_delivery_state(msg, client->session)) == NULL) {
@@ -5564,7 +5726,8 @@ static void tick_msg(struct message *msg)
         if (msg->topic) {
             if (dequeue_message(msg) == -1)
                 warn("tick_msg: dequeue_message failed");
-            msg->state = MSG_DEAD;
+            if (!msg->retain && msg->topic->retained_message != msg)
+                msg->state = MSG_DEAD;
         }
         return;
     }
@@ -5715,7 +5878,8 @@ again:
             if (dequeue_message(msg) == -1) {
                 warn("tick_msg: dequeue_message failed");
             }
-            msg->state = MSG_DEAD;
+            if (!msg->retain && msg->topic->retained_message != msg)
+                msg->state = MSG_DEAD;
         }
 
     }
@@ -6142,38 +6306,119 @@ tick_me:
 #endif
 }
 
+static int load_message(datum /* key */, datum content)
+{
+    const struct message_save *save = (void *)content.dptr;
+    struct message *msg;
+
+    if ((msg = alloc_message(save->uuid)) == NULL)
+        return -1;
+
+    if (save->payload_len) {
+        msg->payload_len = save->payload_len;
+        if ((msg->payload = malloc(save->payload_len)) == NULL)
+            goto fail;
+        memcpy((void *)msg->payload, save->payload, save->payload_len);
+    }
+
+    msg->state = MSG_ACTIVE;
+
+    dbg_printf("     open_databases: loaded saved message with uuid=%s\n",
+            uuid_to_string(msg->uuid->val));
+
+    return 0;
+fail:
+    if (msg) {
+        msg->state = MSG_DEAD;
+        free_message(msg, true);
+    }
+    return -1;
+}
+
+static bool is_null_uuid(const uint8_t uuid[static 16])
+{
+    for (unsigned idx = 0; idx < 16; idx++)
+        if (uuid[idx] != 0)
+            return false;
+    return true;
+}
+
+static int load_topic(datum /* key */, datum content)
+{
+    const struct topic_save *topic_save = (void *)content.dptr;
+    struct topic *topic;
+
+    if ((topic = find_topic((void *)topic_save->name)) != NULL) {
+        logger(LOG_WARNING, NULL, "open_databases: duplicate topic for %s", topic_save->name);
+        errno = EEXIST;
+        return -1;
+    }
+
+    if ((topic = register_topic((void *)topic_save->name, topic_save->uuid)) == NULL)
+        return -1;
+
+    dbg_printf("     open_databases: retained_message_uuid=%s\n",
+            uuid_to_string(topic_save->retained_message_uuid));
+    if (!is_null_uuid(topic_save->retained_message_uuid)) {
+        if ((topic->retained_message = find_message_by_uuid(topic_save->retained_message_uuid)) == NULL)
+            logger(LOG_WARNING, NULL, "open_databases: unable to find retained message for topic <%s>", topic->name);
+        else {
+            topic->retained_message->retain = true;
+            topic->retained_message->topic = topic;
+            INC_REFCNT(&topic->retained_message->refcnt);
+            INC_REFCNT(&topic->refcnt);
+            dbg_printf("     load_topic: set retained message\n");
+        }
+    }
+
+    topic->state = TOPIC_ACTIVE;
+
+    logger(LOG_INFO, NULL, "open_databases: registered previously saved topic <%s>", topic->name);
+
+    return 0;
+}
+
+static const struct {
+    DBM **global;
+    char *filename;
+    int (*const func)(datum key, datum content);
+} database_init[] = {
+    { &message_dbm, "messages", load_message },
+    { &topic_dbm, "topics", load_topic },
+    { NULL, NULL, NULL },
+};
+
 static int open_databases(void)
 {
     datum tmp_key, tmp_content;
+    DBM *dbm;
 
-    if ((topic_dbm = dbm_open("topics", O_RDWR|O_CREAT, S_IRUSR|S_IWUSR)) == NULL)
-        goto fail;
-
-    tmp_key = dbm_firstkey(topic_dbm);
-
-    while (tmp_key.dptr)
+    for (unsigned idx = 0; database_init[idx].filename; idx++)
     {
-        tmp_content = dbm_fetch(topic_dbm, tmp_key);
-        
-        if (tmp_content.dptr == NULL)
-            continue;
+        if ((dbm = dbm_open(database_init[idx].filename,
+                        O_RDWR|O_CREAT, S_IRUSR|S_IWUSR)) == NULL)
+            goto fail;
 
-        const struct topic_save *topic_save = (void *)tmp_content.dptr;
-        //dbg_printf("     open_databases: loaded topic <%s>\n", topic_save->name);
+        *database_init[idx].global = dbm;
 
-        struct topic *topic;
+        tmp_key = dbm_firstkey(dbm);
+        while (tmp_key.dptr)
+        {
+            tmp_content = dbm_fetch(dbm, tmp_key);
 
-        if ((topic = find_topic((void *)topic_save->name)) != NULL) {
-            logger(LOG_WARNING, NULL, "open_databases: duplicate topic for %s", topic_save->name);
-            goto skip;
-        }
+            if (tmp_content.dptr == NULL)
+                goto skip;
 
-        if ((topic = register_topic((void *)topic_save->name, topic_save->uuid)) == NULL)
-            goto skip;
-
-        logger(LOG_INFO, NULL, "open_databases: registered previously saved topic <%s>", topic->name);
+            if (database_init[idx].func(tmp_key, tmp_content) == -1) {
+                logger(LOG_WARNING, NULL,
+                        "     open_databases: <%s>.func failed: %s",
+                        database_init[idx].filename,
+                        strerror(errno));
+                goto skip;
+            }
 skip:
-        tmp_key = dbm_nextkey(topic_dbm);
+            tmp_key = dbm_nextkey(dbm);
+        }
     }
 
     return 0;
@@ -6306,6 +6551,8 @@ shit_usage:
     atexit(free_all_packets);
     atexit(free_all_clients);
 
+    atexit(save_all_topics);
+
     if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
         err(EXIT_FAILURE, "get_first_hwaddr");
 
@@ -6323,19 +6570,16 @@ shit_usage:
     {
         if ((topic_name = strdup(argv[optind])) == NULL)
             err(EXIT_FAILURE, "main: strdup(argv[])");
+
         if (is_valid_topic_filter((const uint8_t *)topic_name) == -1) {
-            free((void *)topic_name);
             warn("main: <%s> is not a valid topic filter, skipping", argv[optind]);
-            topic_name = NULL;
         } else if (find_topic((const uint8_t *)topic_name) != NULL) {
             logger(LOG_INFO, NULL, "main: topic <%s> already exists", topic_name);
-            free((void *)topic_name);
-            topic_name = NULL;
         } else if (register_topic((const uint8_t *)topic_name, NULL) == NULL) {
             warn("main: register_topic(<%s>)", topic_name);
-            free((void *)topic_name);
-            topic_name = NULL;
         }
+        free((void *)topic_name);
+        topic_name = NULL;
         optind++;
     }
 
