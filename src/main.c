@@ -279,7 +279,7 @@ static void dump_clients(void)
     pthread_rwlock_unlock(&global_clients_lock);
 }
 
-/* 
+/*
  * UUID helpers
  */
 
@@ -299,7 +299,7 @@ static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
 
         if (ifa->ifa_addr->sa_family != AF_PACKET)
             continue;
-        
+
         sock = (void *)ifa->ifa_addr;
 
         if (sock->sll_hatype != ARPHRD_ETHER)
@@ -359,7 +359,7 @@ static struct uuid *generate_uuid(uint8_t hwaddr[static 6])
     out[9] = (uuid.clk_seq_low);
 
     memcpy(&out[10], hwaddr, 6);
-    
+
     if ((ret = malloc(sizeof(struct uuid))) == NULL)
         return NULL;
 
@@ -499,7 +499,7 @@ static int openmetrics_export(int fd)
     tm = gmtime(&now);
     strftime(date, sizeof(date), datefmt, tm);
 
-    const char *const http_response = 
+    const char *const http_response =
         "HTTP/1.1 200 OK\r\n"
         "content-type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n"
         "connection: close\r\n"
@@ -508,7 +508,7 @@ static int openmetrics_export(int fd)
         "\r\n";
 
     if ((mem = open_memstream(&buffer, &size)) == NULL) {
-        logger(LOG_WARNING, NULL, "unable to open_memstream: %s", strerror(errno));
+        logger(LOG_WARNING, NULL, "openmetrics_export: unable to open_memstream: %s", strerror(errno));
         goto fail;
     }
 
@@ -552,7 +552,7 @@ static int openmetrics_export(int fd)
 
     fclose(mem);
     mem = NULL;
-    
+
     len = snprintf(hdrbuf, sizeof(hdrbuf), http_response, date, size);
 
     alarm(5);
@@ -573,14 +573,14 @@ static int openmetrics_export(int fd)
     fclose(in);
     alarm(0);
 
-    logger(LOG_INFO, NULL, "openmetrics_export sent %lu bytes of metrics", size);
+    logger(LOG_INFO, NULL, "openmetrics_export: sent %lu bytes of metrics", size);
 
     return 0;
 
 fail:
     alarm(0);
 
-    logger(LOG_WARNING, NULL, "openmetrics_export connection closed in error");
+    logger(LOG_WARNING, NULL, "openmetrics_export: connection closed in error");
 
     if (line)
         free(line);
@@ -2294,10 +2294,10 @@ static void sh_sigint(int signum, siginfo_t * /*info*/, void * /*stuff*/)
         dump_all();
         return;
     }
-    
+
     if (running == false)
         _exit(EXIT_FAILURE);
-    
+
     running = false;
 }
 
@@ -4660,7 +4660,7 @@ static int handle_cp_disconnect(struct client *client, struct packet *packet,
         bytes_left--;
         dbg_printf("[%2d] handle_cp_disconnect: disconnect reason was %u\n",
                 client->session->id, disconnect_reason);
-        logger(LOG_INFO, client, "disconnect request with reason %s",
+        logger(LOG_INFO, client, "handle_cp_disconnect: disconnect request with reason %s",
                 (disconnect_reason < MQTT_REASON_CODE_MAX) ? reason_codes_str[disconnect_reason] :
                 "UNKNOWN");
     }
@@ -4673,7 +4673,7 @@ static int handle_cp_disconnect(struct client *client, struct packet *packet,
     } else {
 skip:
         dbg_printf("[%2d] handle_cp_disconnect: no reason\n", client->session->id);
-        logger(LOG_INFO, client, "disconnect request with no reason");
+        logger(LOG_INFO, client, "handle_cp_disconnect: disconnect request with no reason");
     }
 
     if (bytes_left)
@@ -4900,7 +4900,7 @@ version_fail:
         client->is_auth = true;
     else {
         errno = EACCES;
-        logger(LOG_WARNING, client, "invalid/empty username and/or password received");
+        logger(LOG_WARNING, client, "handle_cp_connect: invalid/empty username and/or password received");
         reason_code = MQTT_BAD_USER_NAME_OR_PASSWORD;
         goto fail;
     }
@@ -5021,7 +5021,7 @@ create_new_session:
 
     client->session->state = SESSION_ACTIVE;
 
-    logger(LOG_INFO, client, "session established%s%s",
+    logger(LOG_INFO, client, "handle_cp_connect: session established%s%s",
             reconnect ? " (reconnect)" : "",
             clean ? " (clean_start)" : "");
 
@@ -5384,7 +5384,7 @@ static void client_tick(void)
                 break;
 
             case CS_DISCONNECTED:
-                logger(LOG_INFO, clnt, "client disconnected");
+                logger(LOG_INFO, clnt, "client_tick: client disconnected");
                 if (clnt->session) {
 
                     /* Prepare the Will Message to be sent, optionally
@@ -5429,7 +5429,7 @@ static void client_tick(void)
                     warnx("[%2d] client_tick: session present in CS_CLOSING", clnt->session->id);
 
                 if (clnt->disconnect_reason) {
-                    logger(LOG_NOTICE, clnt, "disconnecting client with reason %s",
+                    logger(LOG_NOTICE, clnt, "client_tick: disconnecting client with reason %s",
                             reason_codes_str[clnt->disconnect_reason]);
                     send_cp_disconnect(clnt, clnt->disconnect_reason);
                     clnt->disconnect_reason = 0;
@@ -5818,7 +5818,7 @@ static void *tick_loop(void * /* arg */)
 
         tick();
     }
-    logger(LOG_INFO, NULL, "tick_loop terminated normally");
+    logger(LOG_INFO, NULL, "tick_loop: terminated normally");
 
     return NULL;
 }
@@ -5861,8 +5861,8 @@ static RETURN_TYPE om_loop(void *start_args)
         openmetrics_export(fd);
         close_socket(&fd);
     }
-    
-    logger(LOG_INFO, NULL, "om_loop terminated normally");
+
+    logger(LOG_INFO, NULL, "om_loop: terminated normally");
 
     return 0;
 }
@@ -6002,7 +6002,7 @@ shit_fd:
 
             dbg_printf("     main_loop: new client from [%s:%u]\n",
                     new_client->hostname, new_client->remote_port);
-            logger(LOG_INFO, new_client, "new connection");
+            logger(LOG_INFO, new_client, "main_loop: new connection");
         }
 
         pthread_rwlock_rdlock(&global_clients_lock);
@@ -6044,7 +6044,7 @@ tick_me:
 #endif
     }
 
-    logger(LOG_INFO, NULL, "main_loop terminated normally");
+    logger(LOG_INFO, NULL, "main_loop: terminated normally");
 
     errno = 0;
 #ifdef WITH_THREADS
@@ -6176,6 +6176,15 @@ shit_usage:
     if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
         err(EXIT_FAILURE, "get_first_hwaddr");
 
+    logger(LOG_INFO, NULL, "main: using hardware address %02x:%02x:%02x:%02x:%02x:%02x",
+            global_hwaddr[0],
+            global_hwaddr[1],
+            global_hwaddr[2],
+            global_hwaddr[3],
+            global_hwaddr[4],
+            global_hwaddr[5]
+          );
+
     const char *topic_name;
     while (optind < argc)
     {
@@ -6217,7 +6226,7 @@ shit_usage:
     if (setsockopt(global_mother_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
                 sizeof(reuse)) == -1)
         warn("setsockopt(SO_REUSEADDR)");
-    
+
     if (setsockopt(global_om_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
                 sizeof(reuse)) == -1)
         warn("setsockopt(SO_REUSEADDR, openmetrics)");
