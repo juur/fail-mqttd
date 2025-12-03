@@ -457,6 +457,12 @@ struct client {
     char hostname[INET_ADDRSTRLEN];
 };
 
+struct topic_save {
+    id_t id;
+    uint8_t uuid[16];
+    char name[128];
+} __attribute__((packed));
+
 struct topic {
     struct topic *next;
     id_t id;

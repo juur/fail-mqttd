@@ -1,4 +1,4 @@
-#define _XOPEN_SOURCE 700
+#define _XOPEN_SOURCE 800
 #include "config.h"
 
 #include <stdlib.h>
@@ -33,6 +33,7 @@
 #include <ifaddrs.h>
 #include <net/if_arp.h>
 #include <linux/if_packet.h>
+#include <ndbm.h>
 
 #include "mqtt.h"
 
@@ -151,6 +152,12 @@ static unsigned num_sessions = 0;
 static unsigned num_mds      = 0;
 
 /*
+ * databases
+ */
+
+static DBM *topic_dbm = NULL;
+
+/*
  * command line options
  */
 
@@ -171,12 +178,13 @@ static struct in_addr opt_listen;
 [[gnu::nonnull]] static int unsubscribe(struct subscription *sub);
 [[gnu::nonnull]] static int dequeue_message(struct message *msg);
 [[gnu::nonnull]] static void free_message(struct message *msg, bool need_lock);
-[[gnu::nonnull]] static struct topic *register_topic( const uint8_t *name);
 [[gnu::nonnull]] static int remove_delivery_state(
         struct message_delivery_state ***state_array, unsigned *array_length,
         struct message_delivery_state *rem);
 [[gnu::nonnull]] static void free_message_delivery_state(struct message_delivery_state **mds);
 [[gnu::nonnull(3),gnu::format(printf,3,4)]] static void logger(int priority, const struct client *client, const char *format, ...);
+
+static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[16]);
 
 /*
  * command line stuff
@@ -1436,10 +1444,27 @@ fail:
     return NULL;
 }
 
-[[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
-static struct topic *alloc_topic(const uint8_t *name)
+[[gnu::malloc]]
+static struct uuid *alloc_uuid(const uint8_t uuid[static 16])
+{
+    struct uuid *ret;
+
+    assert(uuid != NULL);
+
+    if ((ret = malloc(sizeof(struct uuid))) == NULL)
+        return NULL;
+
+    memcpy(ret->val, uuid, sizeof(ret->val));
+    
+    return ret;
+}
+
+[[gnu::malloc, gnu::warn_unused_result]]
+static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[16])
 {
     struct topic *ret = NULL;
+
+    assert(name != NULL);
 
     if (num_topics >= MAX_TOPICS) {
         errno = ENOSPC;
@@ -1451,8 +1476,13 @@ static struct topic *alloc_topic(const uint8_t *name)
     if ((ret = calloc(1, sizeof(struct topic))) == NULL)
         return NULL;
 
-    if ((ret->uuid = generate_uuid(global_hwaddr)) == NULL)
-        goto fail;
+    if (uuid == NULL) {
+        if ((ret->uuid = generate_uuid(global_hwaddr)) == NULL)
+            goto fail;
+    } else {
+        if ((ret->uuid = alloc_uuid(uuid)) == NULL)
+            goto fail;
+    }
 
     pthread_rwlock_init(&ret->subscribers_lock, NULL);
     pthread_rwlock_init(&ret->pending_queue_lock, NULL);
@@ -1581,6 +1611,53 @@ fail:
         free(client);
 
     return NULL;
+}
+
+/*
+ * persistence functions
+ */
+
+static int save_topic(const struct topic *topic)
+{
+    errno = EINVAL;
+
+    pthread_rwlock_rdlock(&global_topics_lock);
+
+    if (topic->state != TOPIC_ACTIVE)
+        goto fail;
+
+    dbg_printf("     save_topic: saving topic id=%u name=<%s>\n", topic->id, topic->name);
+
+    struct topic_save save;
+
+    memset(&save, 0, sizeof(save));
+
+    save.id = topic->id;
+    memcpy(save.uuid, topic->uuid->val, sizeof(save.uuid));
+    strncpy(save.name, (char *)topic->name, sizeof(save.name) - 1);
+
+    datum key = {
+        .dptr = (char *)topic->uuid->val,
+        .dsize = sizeof(topic->uuid->val),
+    };
+
+    datum content = {
+        .dptr = (char *)&save,
+        .dsize = sizeof(save),
+    };
+
+    if (dbm_store(topic_dbm, key, content, DBM_REPLACE) < 0) {
+        int err = dbm_error(topic_dbm);
+        logger(LOG_WARNING, NULL, "save_topic: dbm_store: %u:%s", err, strerror(err));
+        dbm_clearerr(topic_dbm);
+    }
+
+    pthread_rwlock_unlock(&global_topics_lock);
+    return 0;
+
+fail:
+    pthread_rwlock_unlock(&global_topics_lock);
+    return -1;
 }
 
 /* [MQTT-3.1.3-2] */
@@ -2313,6 +2390,14 @@ static void close_logfile(void)
     }
 }
 
+static void close_databases(void)
+{
+    if (topic_dbm) {
+        dbm_close(topic_dbm);
+        topic_dbm = NULL;
+    }
+}
+
 static void close_all_sockets(void)
 {
     dbg_printf("     close_socket: closing mother_fd %u\n", global_mother_fd);
@@ -2414,7 +2499,7 @@ static struct topic *find_topic(const uint8_t *name)
     return NULL;
 }
 
-[[gnu::nonnull, gnu::warn_unused_result]]
+[[gnu::warn_unused_result]]
 static struct topic *find_or_register_topic(const uint8_t *name)
 {
     struct topic *topic;
@@ -2424,7 +2509,7 @@ static struct topic *find_or_register_topic(const uint8_t *name)
         if ((tmp_name = (void *)strdup((const char *)name)) == NULL)
             goto fail;
 
-        if ((topic = register_topic(tmp_name)) == NULL) {
+        if ((topic = register_topic(tmp_name, NULL)) == NULL) {
             warn("find_or_register_topic: register_topic <%s>", tmp_name);
             goto fail;
         }
@@ -2459,17 +2544,20 @@ static int find_subscription(struct session *session, struct topic *topic)
     return -1;
 }
 
-[[gnu::nonnull, gnu::warn_unused_result]]
-static struct topic *register_topic( const uint8_t *name)
+[[gnu::warn_unused_result]]
+static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[16])
 {
     struct topic *ret;
 
+    assert(name != NULL);
+
     errno = 0;
 
-    if ((ret = alloc_topic(name)) == NULL)
+    if ((ret = alloc_topic(name, uuid)) == NULL)
         return NULL;
 
     ret->state = TOPIC_ACTIVE;
+    save_topic(ret);
 
     pthread_rwlock_wrlock(&global_topics_lock);
     ret->next = global_topic_list;
@@ -6054,6 +6142,47 @@ tick_me:
 #endif
 }
 
+static int open_databases(void)
+{
+    datum tmp_key, tmp_content;
+
+    if ((topic_dbm = dbm_open("topics", O_RDWR|O_CREAT, S_IRUSR|S_IWUSR)) == NULL)
+        goto fail;
+
+    tmp_key = dbm_firstkey(topic_dbm);
+
+    while (tmp_key.dptr)
+    {
+        tmp_content = dbm_fetch(topic_dbm, tmp_key);
+        
+        if (tmp_content.dptr == NULL)
+            continue;
+
+        const struct topic_save *topic_save = (void *)tmp_content.dptr;
+        //dbg_printf("     open_databases: loaded topic <%s>\n", topic_save->name);
+
+        struct topic *topic;
+
+        if ((topic = find_topic((void *)topic_save->name)) != NULL) {
+            logger(LOG_WARNING, NULL, "open_databases: duplicate topic for %s", topic_save->name);
+            goto skip;
+        }
+
+        if ((topic = register_topic((void *)topic_save->name, topic_save->uuid)) == NULL)
+            goto skip;
+
+        logger(LOG_INFO, NULL, "open_databases: registered previously saved topic <%s>", topic->name);
+skip:
+        tmp_key = dbm_nextkey(topic_dbm);
+    }
+
+    return 0;
+
+fail:
+    close_databases();
+    return -1;
+}
+
 /*
  * external functions
  */
@@ -6164,6 +6293,10 @@ shit_usage:
     if (sigaction(SIGALRM, &sa, NULL) == -1)
         err(EXIT_FAILURE, "sigaction(SIGALRM)");
 
+    if (open_databases() == -1)
+        err(EXIT_FAILURE, "open_databases");
+    atexit(close_databases);
+
     atexit(close_all_sockets);
     atexit(free_all_topics_two);
     atexit(free_all_sessions);
@@ -6194,7 +6327,11 @@ shit_usage:
             free((void *)topic_name);
             warn("main: <%s> is not a valid topic filter, skipping", argv[optind]);
             topic_name = NULL;
-        } else if (register_topic((const uint8_t *)topic_name) == NULL) {
+        } else if (find_topic((const uint8_t *)topic_name) != NULL) {
+            logger(LOG_INFO, NULL, "main: topic <%s> already exists", topic_name);
+            free((void *)topic_name);
+            topic_name = NULL;
+        } else if (register_topic((const uint8_t *)topic_name, NULL) == NULL) {
             warn("main: register_topic(<%s>)", topic_name);
             free((void *)topic_name);
             topic_name = NULL;
