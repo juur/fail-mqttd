@@ -34,6 +34,7 @@
 #include <net/if_arp.h>
 #include <linux/if_packet.h>
 #include <ndbm.h>
+#include <sys/stat.h>
 
 #include "mqtt.h"
 
@@ -114,17 +115,20 @@ static _Atomic id_t mds_id          = 1;
  * magic numbers
  */
 
-static const unsigned MAX_PACKETS           = 256;
-static const unsigned MAX_CLIENTS           = 64;
-static const unsigned MAX_TOPICS            = 1024;
-static const unsigned MAX_MESSAGES          = 16384;
-static const unsigned MAX_PACKET_LENGTH     = 0x1000000U;
-static const unsigned MAX_MESSAGES_PER_TICK = 100;
-static const unsigned MAX_PROPERTIES        = 32;
-static const unsigned MAX_RECEIVE_PUBS      = 8;
-static const unsigned MAX_SESSIONS          = 128;
+static const unsigned  MAX_PACKETS           = 256;
+static const unsigned  MAX_CLIENTS           = 64;
+static const unsigned  MAX_TOPICS            = 1024;
+static const unsigned  MAX_MESSAGES          = 16384;
+static const unsigned  MAX_PACKET_LENGTH     = 0x1000000U;
+static const unsigned  MAX_MESSAGES_PER_TICK = 100;
+static const unsigned  MAX_PROPERTIES        = 32;
+static const unsigned  MAX_RECEIVE_PUBS      = 8;
+static const unsigned  MAX_SESSIONS          = 128;
 
-static const uint64_t UUID_EPOCH_OFFSET = 0x01B21DD213814000ULL;
+static const uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
+
+static const char     *const PID_FILE        = RUNSTATEDIR "/fail-mqttd.pid";
+
 
 /*
  * global lists and associated locks & counts
@@ -165,12 +169,16 @@ static DBM *message_dbm = NULL;
 static   FILE       *opt_logfile       = NULL;
 static   bool        opt_logstdout     = true;
 static   in_port_t   opt_port          = 1883;
+static   in_port_t   opt_om_port       = 1773;
 static   int         opt_backlog       = 50;
 static   int         opt_loglevel      = LOG_INFO;
 static   bool        opt_logsyslog     = false;
 static   bool        opt_logfileappend = false;
+static   bool        opt_background    = false;
+static   bool        opt_openmetrics   = false;
 
 static struct in_addr opt_listen;
+static struct in_addr opt_om_listen;
 
 /*
  * forward declarations
@@ -184,8 +192,7 @@ static struct in_addr opt_listen;
         struct message_delivery_state *rem);
 [[gnu::nonnull]] static void free_message_delivery_state(struct message_delivery_state **mds);
 [[gnu::nonnull(3),gnu::format(printf,3,4)]] static void logger(int priority, const struct client *client, const char *format, ...);
-
-static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[16]);
+[[gnu::nonnull(1),gnu::warn_unused_result]] static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE]);
 
 /*
  * command line stuff
@@ -220,13 +227,14 @@ static void show_usage(FILE *fp, const char *name)
             "  -H ADDR        bind to IP address ADDR (default 127.0.0.1)\n"
             "  -l LOGOPTION   comma separated suboptions, described below\n"
             "  -p PORT        bind to TCP port PORT (default 1883)\n"
+            "  -d             daemonize and create a PID file\n"
             "  -V             show version\n"
             "\n"
             "Each LOGOPTION may be:\n"
-            "  syslog     log to syslog\n"
-            "  stdout     log to stdout\n"
-            "  file=PATH  log to given PATH\n"
-            "  append     open PATH in append mode\n"
+            "  syslog         log to syslog as LOG_DAEMON\n"
+            "  [no]stdout     [don't] log to stdout (default yes)\n"
+            "  file=PATH      log to given PATH\n"
+            "  append         open PATH log file in append mode\n"
             "\n"
             "The default is stdout.\n"
             "\n",
@@ -261,9 +269,10 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
 }
 #define log_io_error(m,r,e,d) _log_io_error(m,r,e,d,__FILE__,__func__,__LINE__)
 
-static const char *uuid_to_string(const uint8_t uuid[static 16])
+#ifndef NDEBUG
+static const char *uuid_to_string(const uint8_t uuid[const static UUID_SIZE])
 {
-    static char buf[64];
+    static char buf[37];
 
      snprintf(buf, sizeof(buf), "%02x%02x%02x%02x-"
              "%02x%02x-"
@@ -279,6 +288,7 @@ static const char *uuid_to_string(const uint8_t uuid[static 16])
 
      return buf;
 }
+#endif
 
 [[maybe_unused]]
 static void dump_topics(void)
@@ -317,8 +327,10 @@ static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
     int copy_len;
     const struct sockaddr_ll *sock;
 
-    if (getifaddrs(&ifaddr) == -1)
-        err(EXIT_FAILURE, "getifaddress");
+    if (getifaddrs(&ifaddr) == -1) {
+        logger(LOG_WARNING, NULL, "get_first_hwaddr: getifaddrs: %s", strerror(errno));
+        return -1;
+    }
 
     for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next)
     {
@@ -345,15 +357,14 @@ static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
     return -1;
 }
 
-static struct uuid *generate_uuid(uint8_t hwaddr[static 6])
+static int generate_uuid(uint8_t hwaddr[const static 6], uint8_t out[UUID_SIZE])
 {
     struct uuid_build uuid;
     struct timespec tp;
     uint64_t t = UUID_EPOCH_OFFSET;
-    struct uuid *ret = NULL;
 
     if (clock_gettime(CLOCK_REALTIME, &tp) == -1)
-        return NULL;
+        return -1;
 
     t += (uint64_t)tp.tv_sec * 10000000ULL;
     t += (uint64_t)tp.tv_nsec / 100;
@@ -372,8 +383,6 @@ static struct uuid *generate_uuid(uint8_t hwaddr[static 6])
     uuid.clk_seq_hi_res = (uint8_t)((rnd >> 8) & 0x3f);
     uuid.clk_seq_hi_res |= 0x80; // (variant 10xxxxx)
 
-    uint8_t out[16];
-
     out[0] = (uuid.time_low >> 24) & 0xff;
     out[1] = (uuid.time_low >> 16) & 0xff;
     out[2] = (uuid.time_low >>  8) & 0xff;
@@ -390,11 +399,7 @@ static struct uuid *generate_uuid(uint8_t hwaddr[static 6])
 
     memcpy(&out[10], hwaddr, 6);
 
-    if ((ret = malloc(sizeof(struct uuid))) == NULL)
-        return NULL;
-
-    memcpy(ret->val, out, sizeof(out));
-    return ret;
+    return 0;
 }
 
 /*
@@ -678,9 +683,12 @@ static void logger(int priority, const struct client *client, const char *format
         fprintf(opt_logfile, fmt, timebuf, priority_str[priority], pid, clientbuf, linebuf);
 
     if (opt_logsyslog) {
-        linebuf[strlen(linebuf) - 1] = '\0';
+        linebuf[strlen(linebuf)] = '\0';
         syslog(priority, "%s", linebuf);
     }
+
+    if (priority == LOG_EMERG)
+        exit(EXIT_FAILURE);
 }
 
 /*
@@ -898,11 +906,6 @@ static void free_topic(struct topic *topic)
     if (topic->name) {
         free((void *)topic->name);
         topic->name = NULL;
-    }
-
-    if (topic->uuid) {
-        free((void *)topic->uuid);
-        topic->uuid = NULL;
     }
 
     pthread_rwlock_destroy(&topic->pending_queue_lock);
@@ -1157,11 +1160,6 @@ static void free_message(struct message *msg, bool need_lock)
     /* INC in register_message(), doesn't happen to RETAIN */
     if (msg->sender && GET_REFCNT(&msg->sender->refcnt))
         DEC_REFCNT(&msg->sender->refcnt);
-
-    if (msg->uuid) {
-        free(msg->uuid);
-        msg->uuid = NULL;
-    }
 
     num_messages--;
     free(msg);
@@ -1471,23 +1469,8 @@ fail:
     return NULL;
 }
 
-[[gnu::malloc]]
-static struct uuid *alloc_uuid(const uint8_t uuid[static 16])
-{
-    struct uuid *ret;
-
-    assert(uuid != NULL);
-
-    if ((ret = malloc(sizeof(struct uuid))) == NULL)
-        return NULL;
-
-    memcpy(ret->val, uuid, sizeof(ret->val));
-
-    return ret;
-}
-
 [[gnu::nonnull(1), gnu::malloc, gnu::warn_unused_result]]
-static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[16])
+static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE])
 {
     struct topic *ret = NULL;
 
@@ -1501,13 +1484,10 @@ static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[16])
     if ((ret = calloc(1, sizeof(struct topic))) == NULL)
         return NULL;
 
-    if (uuid == NULL) {
-        if ((ret->uuid = generate_uuid(global_hwaddr)) == NULL)
-            goto fail;
-    } else {
-        if ((ret->uuid = alloc_uuid(uuid)) == NULL)
-            goto fail;
-    }
+    if (uuid == NULL && generate_uuid(global_hwaddr, ret->uuid) == -1)
+        goto fail;
+    else if (uuid != NULL)
+        memcpy(ret->uuid, uuid, UUID_SIZE);
 
     if ((ret->name = (void *)strdup((char *)name)) == NULL)
         goto fail;
@@ -1523,11 +1503,6 @@ static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[16])
     return ret;
 
 fail:
-    if (ret->uuid) {
-        free((void *)ret->uuid);
-        ret->uuid = NULL;
-    }
-
     if (ret)
         free(ret);
 
@@ -1577,9 +1552,9 @@ static struct packet *alloc_packet(struct client *owner)
 }
 
 [[gnu::malloc, gnu::warn_unused_result]]
-static struct message *alloc_message(const uint8_t uuid[16])
+static struct message *alloc_message(const uint8_t uuid[const UUID_SIZE])
 {
-    struct message *msg;
+    struct message *ret = NULL;
 
     if (num_messages >= MAX_MESSAGES) {
         errno = ENOSPC;
@@ -1588,31 +1563,29 @@ static struct message *alloc_message(const uint8_t uuid[16])
 
     errno = 0;
 
-    if ((msg = calloc(1, sizeof(struct message))) == NULL)
+    if ((ret = calloc(1, sizeof(struct message))) == NULL)
         return NULL;
 
-    msg->state = MSG_NEW;
-    if (uuid) {
-        if ((msg->uuid = alloc_uuid(uuid)) == NULL)
-            goto fail;
-    } else {
-        if ((msg->uuid = generate_uuid(global_hwaddr)) == NULL)
-            goto fail;
-    }
+    ret->state = MSG_NEW;
+
+    if (uuid == NULL && generate_uuid(global_hwaddr, ret->uuid) == -1)
+        goto fail;
+    else if (uuid != NULL)
+        memcpy(ret->uuid, uuid, UUID_SIZE);
+
     pthread_rwlock_wrlock(&global_messages_lock);
-    msg->next = global_message_list;
-    global_message_list = msg;
+    ret->next = global_message_list;
+    global_message_list = ret;
     num_messages++;
     pthread_rwlock_unlock(&global_messages_lock);
 
-    msg->id = message_id++;
+    ret->id = message_id++;
 
-    return msg;
+    return ret;
 
 fail:
-
-    if (msg)
-        free(msg);
+    if (ret)
+        free(ret);
 
     return NULL;
 }
@@ -1678,7 +1651,7 @@ static int save_message(const struct message *msg)
         goto fail;
 
     dbg_printf("     save_message: saving message id=%u uuid=%s\n",
-            msg->id, uuid_to_string(msg->uuid->val));
+            msg->id, uuid_to_string(msg->uuid));
 
     size_t size = sizeof(struct message_save) + msg->payload_len;
 
@@ -1692,15 +1665,15 @@ static int save_message(const struct message *msg)
     save->retain = msg->retain;
     save->type = msg->type;
 
-    memcpy(save->uuid, msg->uuid->val, sizeof(save->uuid));
+    memcpy(save->uuid, msg->uuid, UUID_SIZE);
     if (msg->topic)
-        memcpy(save->topic_uuid, msg->topic->uuid, sizeof(save->topic_uuid));
+        memcpy(save->topic_uuid, msg->topic->uuid, UUID_SIZE);
     if (msg->payload)
         memcpy(&save->payload, msg->payload, msg->payload_len);
 
     datum key = {
-        .dptr = (char *)msg->uuid->val,
-        .dsize = sizeof(msg->uuid->val),
+        .dptr = (char *)msg->uuid,
+        .dsize = sizeof(msg->uuid),
     };
 
     datum content = {
@@ -1741,24 +1714,24 @@ static int save_topic(const struct topic *topic)
     dbg_printf("     save_topic: saving topic id=%u name=<%s> %s%s\n",
             topic->id, topic->name,
             topic->retained_message ? "retained=" : "",
-            topic->retained_message ? uuid_to_string(topic->retained_message->uuid->val) : ""
+            topic->retained_message ? uuid_to_string(topic->retained_message->uuid) : ""
             );
 
     struct topic_save save;
     memset(&save, 0, sizeof(save));
 
     save.id = topic->id;
-    memcpy(save.uuid, topic->uuid->val, sizeof(save.uuid));
+    memcpy(save.uuid, topic->uuid, UUID_SIZE);
     strncpy(save.name, (char *)topic->name, sizeof(save.name) - 1);
     if (topic->retained_message) {
-        memcpy(save.retained_message_uuid, topic->retained_message->uuid->val, sizeof(save.retained_message_uuid));
+        memcpy(save.retained_message_uuid, topic->retained_message->uuid, UUID_SIZE);
         dbg_printf("     save_topic: set retained_message_uuid to %s\n",
                 uuid_to_string(save.retained_message_uuid));
     }
 
     datum key = {
-        .dptr = (char *)topic->uuid->val,
-        .dsize = sizeof(topic->uuid->val),
+        .dptr = (char *)topic->uuid,
+        .dsize = sizeof(topic->uuid),
     };
 
     datum content = {
@@ -2508,6 +2481,13 @@ static void sh_sigint(int signum, siginfo_t * /*info*/, void * /*stuff*/)
  * atexit() functions
  */
 
+static void clean_pid(void)
+{
+    if (unlink(PID_FILE) == -1)
+        logger(LOG_WARNING, NULL, "unable to unlink PID file: %s",
+                strerror(errno));
+}
+
 static void close_logfile(void)
 {
     if (opt_logfile) {
@@ -2620,16 +2600,14 @@ static void free_all_topics(void)
  */
 
 [[gnu::nonnull, gnu::warn_unused_result]]
-static struct message *find_message_by_uuid(const uint8_t uuid[static 16])
+static struct message *find_message_by_uuid(const uint8_t uuid[static const UUID_SIZE])
 {
     errno = 0;
-    //dbg_printf("     find_message_by_uuid: looking for %s\n", uuid_to_string(uuid));
 
     pthread_rwlock_rdlock(&global_messages_lock);
     for (struct message *msg = global_message_list; msg; msg = msg->next)
     {
-        if (!memcmp(msg->uuid->val, uuid, 16)) {
-            //dbg_printf("     find_message_by_uuid: match\n");
+        if (!memcmp(msg->uuid, uuid, UUID_SIZE)) {
             pthread_rwlock_unlock(&global_messages_lock);
             return msg;
         }
@@ -2637,7 +2615,6 @@ static struct message *find_message_by_uuid(const uint8_t uuid[static 16])
     pthread_rwlock_unlock(&global_messages_lock);
 
     errno = ENOENT;
-    //dbg_printf("     find_message_by_uuid: no match\n");
     return NULL;
 }
 
@@ -2659,7 +2636,7 @@ static struct topic *find_topic(const uint8_t *name)
     return NULL;
 }
 
-[[gnu::warn_unused_result]]
+[[gnu::nonnull(1), gnu::warn_unused_result]]
 static struct topic *find_or_register_topic(const uint8_t *name)
 {
     struct topic *topic;
@@ -2707,8 +2684,8 @@ static int find_subscription(struct session *session, struct topic *topic)
     return -1;
 }
 
-[[gnu::warn_unused_result]]
-static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[16])
+[[gnu::nonnull(1), gnu::warn_unused_result]]
+static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE])
 {
     struct topic *ret;
 
@@ -6148,8 +6125,8 @@ static RETURN_TYPE main_loop(void *start_args)
 {
     bool has_clients;
     fd_set fds_in, fds_out, fds_exc;
-    const int mother_fd = ((const struct start_args *)start_args)->fd;
-    const int om_fd = ((const struct start_args *)start_args)->om_fd;
+    int mother_fd = ((const struct start_args *)start_args)->fd;
+    int om_fd = ((const struct start_args *)start_args)->om_fd;
 
     while (running)
     {
@@ -6353,7 +6330,7 @@ static int load_message(datum /* key */, datum content)
     msg->state = MSG_ACTIVE;
 
     dbg_printf("     open_databases: loaded saved message with uuid=%s\n",
-            uuid_to_string(msg->uuid->val));
+            uuid_to_string(msg->uuid));
 
     return 0;
 fail:
@@ -6364,7 +6341,7 @@ fail:
     return -1;
 }
 
-static bool is_null_uuid(const uint8_t uuid[static 16])
+static bool is_null_uuid(const uint8_t uuid[const static 16])
 {
     for (unsigned idx = 0; idx < 16; idx++)
         if (uuid[idx] != 0)
@@ -6482,6 +6459,8 @@ fail:
 int main(int argc, char *argv[])
 {
     opt_listen.s_addr = htonl(INADDR_LOOPBACK);
+    opt_om_listen.s_addr = htonl(INADDR_LOOPBACK);
+
     char *logfile_name = NULL;
 
     {
@@ -6496,21 +6475,70 @@ int main(int argc, char *argv[])
             LOGGER_NOSTDOUT,
         };
 
-        char *const token[] = {
+        char *const logger_token[] = {
             [LOGGER_SYSLOG] = "syslog",
             [LOGGER_FILE] = "file",
             [LOGGER_STDOUT] = "stdout",
             [LOGGER_NOSTDOUT] = "nostdout",
+            NULL
         };
 
-        while ((opt = getopt(argc, argv, "hVp:H:l:")) != -1)
+        enum {
+            OM_ENABLE = 0,
+            OM_DISABLE,
+            OM_PORT,
+            OM_BIND,
+        };
+
+        char *const om_token[] = {
+            [OM_ENABLE] = "enable",
+            [OM_DISABLE] = "disable",
+            [OM_PORT] = "port",
+            [OM_BIND] = "bind",
+            NULL,
+        };
+
+        while ((opt = getopt(argc, argv, "hVp:H:l:do:")) != -1)
         {
             switch (opt)
             {
+                case 'd':
+                    opt_background = true;
+                    break;
+                case 'o':
+                    subopts = optarg;
+                    while (*subopts != '\0') {
+                        switch(getsubopt(&subopts, om_token, &value))
+                        {
+                            case OM_ENABLE:
+                                opt_openmetrics = true;
+                                break;
+                            case OM_DISABLE:
+                                opt_openmetrics = false;
+                                break;
+                            case OM_PORT:
+                                if (value == NULL)
+                                    goto shit_usage;
+                                int tmp = atoi(value);
+                                if (tmp == 0 || tmp > USHRT_MAX)
+                                    goto shit_usage;
+                                opt_om_port = tmp;
+                                break;
+                            case OM_BIND:
+                                if (value == NULL)
+                                    goto shit_usage;
+                                if (inet_pton(AF_INET, value, &opt_om_listen) == -1)
+                                    goto shit_usage;
+                                break;
+                            default:
+                                goto shit_usage;
+                        }
+                    }
+                    break;
                 case 'l':
                     subopts = optarg;
                     while (*subopts != '\0') {
-                        switch(getsubopt(&subopts, token, &value))
+                        switch(getsubopt(&subopts, logger_token, &value))
                         {
                             case LOGGER_SYSLOG:
                                 opt_logsyslog = true;
@@ -6559,15 +6587,95 @@ shit_usage:
         }
     }
 
-    setvbuf(stdin, NULL, _IONBF, 0);
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
-
     if (logfile_name) {
         if ((opt_logfile = fopen(logfile_name,
                         opt_logfileappend ? "a" : "w")) == NULL)
             errx(EXIT_FAILURE, "fopen(%s)", logfile_name);
+        setvbuf(opt_logfile, NULL, _IONBF, 0);
         atexit(close_logfile);
+    }
+
+    if (opt_background && opt_logstdout)
+        errx(EXIT_FAILURE, "cannot log to stdout when a daemon");
+
+    if (opt_logsyslog)
+        openlog("fail-mqttd", LOG_PID, LOG_DAEMON);
+
+    setvbuf(stdin, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    if (opt_background) {
+        pid_t child1, child2;
+        int filedes[2];
+        char buf;
+        int child_pipe_fd, parent_pipe_fd;
+
+        /* Parent Process */
+        if (pipe(filedes) == -1)
+            logger(LOG_EMERG, NULL, "main: pipe: %s", strerror(errno));
+
+        parent_pipe_fd = filedes[0];
+        child_pipe_fd = filedes[1];
+
+        if ((child1 = fork()) == 0) {
+            /* Parent Process */
+            close(child_pipe_fd);
+
+            if ((read(parent_pipe_fd, &buf, 1)) == -1)
+                logger(LOG_EMERG, NULL, "main: pipe read: %s", strerror(errno));
+
+            close(parent_pipe_fd);
+            exit(EXIT_SUCCESS);
+        }
+
+        if (child1 == -1)
+            logger(LOG_EMERG, NULL, "main: fork1: %s", strerror(errno));
+
+        /* Child 1 Process */
+        setsid();
+
+        if ((child2 = fork()) > 0) {
+            /* Child 1 Process */
+            exit(EXIT_SUCCESS);
+        } else if (child2 == -1) {
+            logger(LOG_EMERG, NULL, "main: fork2: %s", strerror(errno));
+        }
+
+        /* Child 2 Process */
+        fclose(stdout);
+        fclose(stdin);
+        fclose(stderr);
+
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+        close(parent_pipe_fd);
+
+        open("/dev/null", O_RDONLY);
+        open("/dev/null", O_WRONLY);
+        open("/dev/null", O_WRONLY);
+
+        umask(0022);
+        atexit(clean_pid);
+
+        FILE *pid_file;
+        if ((pid_file = fopen(PID_FILE, "w")) != NULL) {
+            fprintf(pid_file, "%u", getpid());
+            fclose(pid_file);
+            logger(LOG_NOTICE, NULL, "main: created PID file <%s>", PID_FILE);
+        } else {
+            logger(LOG_WARNING, NULL, "main: cannot open PID file <%s>: %s",
+                    PID_FILE,
+                    strerror(errno));
+        }
+
+        buf = 'X';
+        if (write(child_pipe_fd, &buf, 1) == -1)
+            logger(LOG_EMERG, NULL, "main: pipe write: %s", strerror(errno));
+        close(child_pipe_fd);
+
+        logger(LOG_INFO, NULL, "main: successfully daemonised");
     }
 
     struct sigaction sa = {
@@ -6576,18 +6684,18 @@ shit_usage:
     };
 
     if (sigaction(SIGINT, &sa, NULL) == -1)
-        err(EXIT_FAILURE, "sigaction(SIGINT)");
+        logger(LOG_EMERG, NULL, "sigaction(SIGINT): %s", strerror(errno));
     if (sigaction(SIGQUIT, &sa, NULL) == -1)
-        err(EXIT_FAILURE, "sigaction(SIGQUIT)");
+        logger(LOG_EMERG, NULL, "sigaction(SIGQUIT): %s", strerror(errno));
     if (sigaction(SIGTERM, &sa, NULL) == -1)
-        err(EXIT_FAILURE, "sigaction(SIGTERM)");
+        logger(LOG_EMERG, NULL, "sigaction(SIGTERM): %s", strerror(errno));
     if (sigaction(SIGHUP, &sa, NULL) == -1)
-        err(EXIT_FAILURE, "sigaction(SIGHUP)");
+        logger(LOG_EMERG, NULL, "sigaction(SIGHUP): %s", strerror(errno));
     if (sigaction(SIGALRM, &sa, NULL) == -1)
-        err(EXIT_FAILURE, "sigaction(SIGALRM)");
+        logger(LOG_EMERG, NULL, "sigaction(SIGALRM): %s", strerror(errno));
 
     if (open_databases() == -1)
-        err(EXIT_FAILURE, "open_databases");
+        logger(LOG_EMERG, NULL, "open_databases: %s", strerror(errno));
     atexit(close_databases);
 
     atexit(close_all_sockets);
@@ -6602,7 +6710,7 @@ shit_usage:
     atexit(save_all_topics);
 
     if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
-        err(EXIT_FAILURE, "get_first_hwaddr");
+        logger(LOG_EMERG, NULL, "main: cannot find MAC address");
 
     logger(LOG_INFO, NULL,
             "main: using hardware address %02x:%02x:%02x:%02x:%02x:%02x",
@@ -6610,29 +6718,26 @@ shit_usage:
             global_hwaddr[3], global_hwaddr[4], global_hwaddr[5]
           );
 
-    const char *topic_name;
     while (optind < argc)
     {
-        if ((topic_name = strdup(argv[optind])) == NULL)
-            err(EXIT_FAILURE, "main: strdup(argv[])");
-
-        if (is_valid_topic_filter((const uint8_t *)topic_name) == -1) {
-            warn("main: <%s> is not a valid topic filter, skipping", argv[optind]);
-        } else if (find_topic((const uint8_t *)topic_name) != NULL) {
-            logger(LOG_INFO, NULL, "main: topic <%s> already exists", topic_name);
-        } else if (register_topic((const uint8_t *)topic_name, NULL) == NULL) {
-            warn("main: register_topic(<%s>)", topic_name);
+        if (is_valid_topic_filter((const uint8_t *)argv[optind]) == -1) {
+            logger(LOG_WARNING, NULL, "main: command line topic creation: <%s> is not a valid topic filter, skipping", argv[optind]);
+        } else if (find_topic((const uint8_t *)argv[optind]) != NULL) {
+            logger(LOG_WARNING, NULL, "main: command line topic creation: topic <%s> already exists, skipping", argv[optind]);
+        } else if (register_topic((const uint8_t *)argv[optind], NULL) == NULL) {
+            logger(LOG_WARNING, NULL, "main: command line topic creation: register_topic<%s> failed, skipping: %s", argv[optind], strerror(errno));
+        } else {
+            logger(LOG_INFO, NULL, "main: command line topic creation: topic <%s> created", argv[optind]);
         }
-        free((void *)topic_name);
-        topic_name = NULL;
         optind++;
     }
 
     if ((global_mother_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
-        err(EXIT_FAILURE, "socket");
+        logger(LOG_EMERG, NULL, "socket(mother): %s", strerror(errno));
 
-    if ((global_om_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
-        err(EXIT_FAILURE, "socket(openmetrics)");
+    if (opt_openmetrics)
+        if ((global_om_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
+            logger(LOG_EMERG, NULL, "socket(om): %s", strerror(errno));
 
     struct linger linger = {
         .l_onoff = 0,
@@ -6641,48 +6746,54 @@ shit_usage:
 
     if (setsockopt(global_mother_fd, SOL_SOCKET, SO_LINGER, &linger,
                 sizeof(linger)) == -1)
-        warn("setsockopt(SO_LINGER)");
+        warn("setsockopt(SO_LINGER, mother)");
 
-    if (setsockopt(global_om_fd, SOL_SOCKET, SO_LINGER, &linger,
-                sizeof(linger)) == -1)
-        warn("setsockopt(SO_LINGER, openmetrics)");
+    if (opt_openmetrics)
+        if (setsockopt(global_om_fd, SOL_SOCKET, SO_LINGER, &linger,
+                    sizeof(linger)) == -1)
+            warn("setsockopt(SO_LINGER, openmetrics)");
 
     int reuse = 1;
 
     if (setsockopt(global_mother_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
                 sizeof(reuse)) == -1)
-        warn("setsockopt(SO_REUSEADDR)");
+        warn("setsockopt(SO_REUSEADDR, mother)");
 
-    if (setsockopt(global_om_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
-                sizeof(reuse)) == -1)
-        warn("setsockopt(SO_REUSEADDR, openmetrics)");
+    if (opt_openmetrics)
+        if (setsockopt(global_om_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                    sizeof(reuse)) == -1)
+            warn("setsockopt(SO_REUSEADDR, openmetrics)");
 
     struct sockaddr_in sin = {0};
+    char bind_addr[INET_ADDRSTRLEN];
 
+    /* Mother FD */
     sin.sin_family = AF_INET;
     sin.sin_port = htons(opt_port);
     sin.sin_addr.s_addr = opt_listen.s_addr;
-
-    char bind_addr[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &sin.sin_addr, bind_addr, sizeof(bind_addr));
-
-    if (bind(global_mother_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
-        err(EXIT_FAILURE, "bind");
-
-    if (listen(global_mother_fd, opt_backlog) == -1)
-        err(EXIT_FAILURE, "listen");
-
     logger(LOG_NOTICE, NULL, "main: binding to %s:%u", bind_addr, opt_port);
 
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(1337);
-    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(global_mother_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
+        logger(LOG_EMERG, NULL, "bind(mother): %s", strerror(errno));
 
-    if (bind(global_om_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
-        err(EXIT_FAILURE, "bind(openmetrics)");
+    if (listen(global_mother_fd, opt_backlog) == -1)
+        logger(LOG_EMERG, NULL, "listen(mother): %s", strerror(errno));
 
-    if (listen(global_om_fd, 5) == -1)
-        err(EXIT_FAILURE, "listen(openmetrics)");
+    /* Openmetrics FD */
+    if (opt_openmetrics) {
+        sin.sin_family = AF_INET;
+        sin.sin_port = htons(opt_om_port);
+        sin.sin_addr.s_addr = opt_om_listen.s_addr;
+        inet_ntop(AF_INET, &sin.sin_addr, bind_addr, sizeof(bind_addr));
+        logger(LOG_NOTICE, NULL, "main: openmetrics binding to %s:%u", bind_addr, opt_om_port);
+
+        if (bind(global_om_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
+            logger(LOG_EMERG, NULL, "bind(om): %s", strerror(errno));
+
+        if (listen(global_om_fd, 5) == -1)
+            logger(LOG_EMERG, NULL, "listen(om): %s", strerror(errno));
+    }
 
 #ifdef WITH_THREADS
     struct start_args start_args = {
@@ -6692,12 +6803,12 @@ shit_usage:
 
     struct start_args start_args_om = {
         .fd = -1,
-        .om_fd = global_om_fd,
+        .om_fd = opt_openmetrics ? global_om_fd : 0,
     };
 #else
     struct start_args start_args = {
         .fd = global_mother_fd,
-        .om_fd = global_om_fd,
+        .om_fd = opt_openmetrics ? global_om_fd : 0,
     };
 #endif
 
@@ -6705,7 +6816,9 @@ shit_usage:
 
 #ifdef WITH_THREADS
     pthread_t main_thread, tick_thread, om_thread;
-    if (pthread_create(&om_thread, NULL, om_loop, &start_args_om) == -1)
+
+    if (opt_openmetrics &&
+            pthread_create(&om_thread, NULL, om_loop, &start_args_om) == -1)
         err(EXIT_FAILURE, "pthread_create: om_loop");
 
     if (pthread_create(&main_thread, NULL, main_loop, &start_args) == -1)
@@ -6716,10 +6829,11 @@ shit_usage:
 
     pthread_join(main_thread, NULL);
     pthread_join(tick_thread, NULL);
-    pthread_join(om_thread, NULL);
+    if (opt_openmetrics)
+        pthread_join(om_thread, NULL);
 #else
     if (main_loop(&start_args) == -1)
-        exit(EXIT_FAILURE);
+        logger(LOG_EMERG, NULL, "main_loop returned an error: %s", strerror(errno));
 #endif
 
     exit(EXIT_SUCCESS);

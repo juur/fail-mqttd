@@ -102,6 +102,8 @@ typedef enum {
 #define GET_QOS(x) ( ((x) & MQTT_FLAG_PUBLISH_QOS_MASK) >> 1U)
 #define SET_QOS(x,y) ( (x) | (((y) & 0x3) <<1U) )
 
+#define UUID_SIZE 16
+
 typedef enum {
     MQTT_TYPE_UNDEFINED = 0,
     MQTT_TYPE_BYTE = 1,
@@ -255,10 +257,6 @@ typedef enum {
     READ_STATE_MAX
 } read_state_t;
 
-struct uuid {
-    uint8_t val[16];
-};
-
 struct property {
     property_ident_t ident;
     union {
@@ -325,8 +323,8 @@ struct message_delivery_state {
 
 struct message_save {
     uint64_t id;
-    uint8_t uuid[16];
-    uint8_t topic_uuid[16];
+    uint8_t uuid[UUID_SIZE];
+    uint8_t topic_uuid[UUID_SIZE];
     uint8_t format;
     uint8_t retain;
     uint8_t qos;
@@ -349,7 +347,7 @@ struct message {
     message_state_t state;
     message_type_t type;
     bool retain;
-    struct uuid *uuid;
+    uint8_t uuid[UUID_SIZE];
 
     unsigned num_message_delivery_states;
     struct message_delivery_state **delivery_states;
@@ -472,15 +470,15 @@ struct client {
 
 struct topic_save {
     id_t id;
-    uint8_t uuid[16];
+    uint8_t uuid[UUID_SIZE];
     char name[128];
-    uint8_t retained_message_uuid[16];
+    uint8_t retained_message_uuid[UUID_SIZE];
 } __attribute__((packed));
 
 struct topic {
     struct topic *next;
     id_t id;
-    const struct uuid *uuid;
+    uint8_t uuid[UUID_SIZE];
     const uint8_t *name;
     unsigned num_subscribers;
     struct subscription *(*subscribers)[];
