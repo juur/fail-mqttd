@@ -193,6 +193,8 @@ static struct in_addr opt_om_listen;
 [[gnu::nonnull]] static void free_message_delivery_state(struct message_delivery_state **mds);
 [[gnu::nonnull(3),gnu::format(printf,3,4)]] static void logger(int priority, const struct client *client, const char *format, ...);
 [[gnu::nonnull(1),gnu::warn_unused_result]] static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE]);
+[[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe_from_topics(struct session *session, const struct topic_sub_request *request);
+static int unsubscribe_session_from_all(struct session *session);
 
 /*
  * command line stuff
@@ -819,7 +821,7 @@ static void free_topic(struct topic *topic)
     topic->state = TOPIC_DEAD;
 
     /* TODO check if we should have a wrlock here,
-     * not inside unsubscribe_from_topic */
+     * not inside unsubscribe_from_topics */
     if (topic->subscribers) {
         dbg_printf("     free_topic: subscribers=%p num_subscribers=%u\n",
                 (void *)topic->subscribers, topic->num_subscribers);
@@ -1325,6 +1327,8 @@ static void free_session(struct session *session, bool need_lock)
 
     pthread_rwlock_wrlock(&session->subscriptions_lock);
     if (session->subscriptions) {
+        unsubscribe_session_from_all(session);
+#if 0
         while (session->num_subscriptions)
             for (unsigned idx = 0; idx < session->num_subscriptions; idx++) {
                 if (session->subscriptions[idx] == NULL)
@@ -1332,6 +1336,7 @@ static void free_session(struct session *session, bool need_lock)
                 unsubscribe(session->subscriptions[idx]);
                 //(*session->subscriptions)[idx] = NULL;
             }
+#endif
         free(session->subscriptions);
         session->subscriptions = NULL;
         session->num_subscriptions = 0;
@@ -3136,7 +3141,7 @@ static int unsubscribe(struct subscription *sub)
     pthread_rwlock_wrlock(&topic->subscribers_lock);
     for (unsigned idx = 0; idx < topic->num_subscribers; idx++)
     {
-        if ( topic->subscribers[idx] == sub) {
+        if (topic->subscribers[idx] == sub) {
             topic->subscribers[idx] = NULL;
             break;
         }
@@ -3261,9 +3266,37 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull, gnu::warn_unused_result]]
+static int unsubscribe_session_from_all(struct session *session)
+{
+    int rc = 0;
+
+    if (session->subscriptions == NULL || session->num_subscriptions == 0)
+        return 0;
+
+    const struct topic_sub_request req = {
+        .topic_refs = malloc(sizeof(struct topic *) * session->num_subscriptions),
+        .num_topics = session->num_subscriptions,
+        .id = (id_t)-1,
+    };
+
+    if (req.topic_refs != NULL) {
+        for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
+            req.topic_refs[idx] = session->subscriptions[idx]->topic;
+        
+        if (unsubscribe_from_topics(session, &req) == -1) {
+            rc = -1;
+            warn("free_session: unsubscribe_from_topics");
+        }
+        free(req.topic_refs);
+    } else
+        rc = -1;
+
+    return rc;
+}
+
+    [[gnu::nonnull, gnu::warn_unused_result]]
 static int unsubscribe_from_topics(struct session *session,
-        struct topic_sub_request *request)
+        const struct topic_sub_request *request)
 {
     struct subscription *sub;
     int sub_idx;
@@ -3277,31 +3310,52 @@ static int unsubscribe_from_topics(struct session *session,
 
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
-        if ((request->topic_refs[idx] = find_topic(request->topics[idx])) == NULL) {
-            request->reason_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
-            continue;
-        }
+        if (request->topic_refs[idx] == NULL)
+            if ((request->topic_refs[idx] = find_topic(request->topics[idx])) == NULL) {
+                if (request->reason_codes)
+                    request->reason_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
+                continue;
+            }
 
         if ((sub_idx = find_subscription(session, request->topic_refs[idx])) == -1) {
-            if (errno == ENOENT)
-                request->reason_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
-            else
-                request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
+            if (request->reason_codes) {
+                if (errno == ENOENT)
+                    request->reason_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
+                else
+                    request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
+            }
             continue;
         }
 
         sub = request->topic_refs[idx]->subscribers[sub_idx];
-        if (unsubscribe(sub) == -1) {
-            request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
-            continue;
+        switch (sub->type)
+        {
+            case SUB_SHARED:
+                if (request->reason_codes)
+                    request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
+                warn("unsubscribe_from_topics: SUB_SHARED not implemented");
+                continue;
+
+            case SUB_NON_SHARED:
+                if (unsubscribe(sub) == -1) {
+                    if (request->reason_codes)
+                        request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
+                    continue;
+                }
+                break;
+
+            default:
+                warn("unsubscribe_from_topics: unknown subscription type");
+                break;
         }
 
-        request->reason_codes[idx] = MQTT_SUCCESS;
+        if (request->reason_codes)
+            request->reason_codes[idx] = MQTT_SUCCESS;
     }
     return 0;
 }
 
-[[gnu::nonnull, gnu::warn_unused_result]]
+    [[gnu::nonnull, gnu::warn_unused_result]]
 static int subscribe_to_topics(struct session *session,
         struct topic_sub_request *request)
 {
@@ -6038,9 +6092,13 @@ static void session_tick(void)
             if (GET_REFCNT(&session->refcnt) > 0) {
                 /* as the session is SESSION_DELETE, check we're unsubscribed
                  * which should resolve the refcnt to be 0 */
+                /* TODO replace this with a unsubscribe_from_topics() */
+                unsubscribe_session_from_all(session);
+#if 0
                 while(session->subscriptions && session->subscriptions[0])
                     if (unsubscribe(session->subscriptions[0]) == -1)
                         warn("session_tick: unsubscribe");
+#endif
             } else if (session->will_at) {
                 dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
                         session->id);
