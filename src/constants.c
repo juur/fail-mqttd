@@ -3,7 +3,6 @@
 #include <syslog.h>
 
 #include "mqtt.h"
-#include "config.h"
 
 const payload_required_t packet_to_payload[MQTT_CP_MAX] = {
     [MQTT_CP_CONNECT]     = MQTT_PAYLOAD_REQUIRED,
@@ -180,6 +179,11 @@ const char *const read_state_str[READ_STATE_MAX] = {
     [READ_STATE_HEADER]      = "HEADER",
     [READ_STATE_MORE_HEADER] = "MORE_HEADER",
     [READ_STATE_BODY]        = "BODY",
+};
+
+const char *const subscription_type_str[SUB_TYPE_MAX] = {
+    [SUB_NON_SHARED] = "NON_SHARED",
+    [SUB_SHARED]     = "SHARED",
 };
 
 const char *const priority_str[] = {

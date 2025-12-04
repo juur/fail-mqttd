@@ -257,6 +257,12 @@ typedef enum {
     READ_STATE_MAX
 } read_state_t;
 
+typedef enum {
+    SUB_NON_SHARED = 0,
+    SUB_SHARED,
+    SUB_TYPE_MAX,
+} subscription_type_t;
+
 struct property {
     property_ident_t ident;
     union {
@@ -376,9 +382,14 @@ struct topic_sub_request {
 
 struct subscription {
     id_t id;
-    struct session *session;
+    union {
+        struct session *session;
+        struct session **sessions;
+    };
+    unsigned num_sessions;
     struct topic *topic;
     uint8_t option;
+    subscription_type_t type;
 };
 
 struct session {
@@ -387,7 +398,7 @@ struct session {
     struct client *client;
 
     pthread_rwlock_t subscriptions_lock;
-    struct subscription *(*subscriptions)[];
+    struct subscription **subscriptions;
     unsigned num_subscriptions;
 
     unsigned num_message_delivery_states;
@@ -481,7 +492,7 @@ struct topic {
     uint8_t uuid[UUID_SIZE];
     const uint8_t *name;
     unsigned num_subscribers;
-    struct subscription *(*subscribers)[];
+    struct subscription **subscribers;
     struct message *retained_message;
     struct message *pending_queue;
     pthread_rwlock_t subscribers_lock;
@@ -515,5 +526,6 @@ extern const char *const read_state_str[READ_STATE_MAX];
 extern const char *const priority_str[];
 extern const char *const reason_codes_str[MQTT_REASON_CODE_MAX];
 extern const char *const message_type_str[MSG_TYPE_MAX];
+extern const char *const subscription_type_str[SUB_TYPE_MAX];
 
 #endif
