@@ -1328,15 +1328,6 @@ static void free_session(struct session *session, bool need_lock)
     pthread_rwlock_wrlock(&session->subscriptions_lock);
     if (session->subscriptions) {
         unsubscribe_session_from_all(session);
-#if 0
-        while (session->num_subscriptions)
-            for (unsigned idx = 0; idx < session->num_subscriptions; idx++) {
-                if (session->subscriptions[idx] == NULL)
-                    continue;
-                unsubscribe(session->subscriptions[idx]);
-                //(*session->subscriptions)[idx] = NULL;
-            }
-#endif
         free(session->subscriptions);
         session->subscriptions = NULL;
         session->num_subscriptions = 0;
@@ -6094,11 +6085,6 @@ static void session_tick(void)
                  * which should resolve the refcnt to be 0 */
                 /* TODO replace this with a unsubscribe_from_topics() */
                 unsubscribe_session_from_all(session);
-#if 0
-                while(session->subscriptions && session->subscriptions[0])
-                    if (unsubscribe(session->subscriptions[0]) == -1)
-                        warn("session_tick: unsubscribe");
-#endif
             } else if (session->will_at) {
                 dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
                         session->id);
