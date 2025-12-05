@@ -773,11 +773,9 @@ static void free_subscription(struct subscription *sub)
 {
     struct subscription *tmp;
 
-    dbg_printf("     free_subscription:  id=%u type=%s "/*"topic=%d <%s> "*/"filter=<%s>\n",
+    dbg_printf("     free_subscription:  id=%u type=%s filter=<%s>\n",
             sub->id,
             subscription_type_str[sub->type],
-            //sub->topic ? sub->topic->id : (id_t)-1,
-            //sub->topic ? (const char *)sub->topic->name : "",
             (const char *)sub->topic_filter);
 
     pthread_rwlock_wrlock(&global_subscriptions_lock);
@@ -841,13 +839,6 @@ static void free_topic_subs(struct topic_sub_request *request)
         request->options = NULL;
     }
 
-#if 0
-    if (request->topic_refs) {
-        free(request->topic_refs);
-        request->topic_refs = NULL;
-    }
-#endif
-
     if (request->reason_codes) {
         free(request->reason_codes);
         request->reason_codes = NULL;
@@ -868,41 +859,6 @@ static void free_topic(struct topic *topic)
     /* used in free_all_topics() to allow almost-dead topics to persist due
      * to dangling references in session->will_topic */
     topic->state = TOPIC_DEAD;
-
-    /* TODO check if we should have a wrlock here,
-     * not inside unsubscribe_from_topics */
-#if 0
-    if (topic->subscribers) {
-        dbg_printf("     free_topic: subscribers=%p num_subscribers=%u\n",
-                (void *)topic->subscribers, topic->num_subscribers);
-
-        /* keep going, but restart if we unsubscribe as the array
-         * will be modified */
-        while (topic->num_subscribers && topic->subscribers)
-        {
-            for(unsigned idx = 0; idx < topic->num_subscribers; idx++)
-            {
-                if (topic->subscribers[idx] == NULL)
-                    continue;
-
-                dbg_printf("     free_topic: subscriber[%u] <%s> in <%s>\n",
-                        idx,
-                        topic->subscribers[idx]->session->client_id,
-                        topic->subscribers[idx]->topic->name
-                        );
-
-                /* TODO should we handle the return code ? */
-                (void)unsubscribe(topic->subscribers[idx]);
-            }
-        }
-
-        /* Not sure this locking is useful */
-        pthread_rwlock_wrlock(&topic->subscribers_lock);
-        free(topic->subscribers);
-        topic->subscribers = NULL;
-        pthread_rwlock_unlock(&topic->subscribers_lock);
-    }
-#endif
 
     pthread_rwlock_wrlock(&topic->pending_queue_lock);
     if (topic->pending_queue) {
@@ -973,7 +929,6 @@ static void free_topic(struct topic *topic)
     }
 
     pthread_rwlock_destroy(&topic->pending_queue_lock);
-    //pthread_rwlock_destroy(&topic->subscribers_lock);
 
     num_topics--;
     free(topic);
@@ -1517,14 +1472,8 @@ static struct subscription *alloc_subscription(struct session *session,
             goto fail;
     }
 
-#if 0
-    INC_REFCNT(&topic->refcnt);
-    ret->topic = topic;
-#endif
-
-    dbg_printf(NYEL "     alloc_subscription: id=%u session=%d <%s> filter=%s"/*"topic=%u <%s>"*/CRESET"\n",
-            ret->id, session->id, (char *)session->client_id, topic_filter/*,
-            topic->id, (char *)topic->name*/);
+    dbg_printf(NYEL "     alloc_subscription: id=%u session=%d <%s> filter=%s"CRESET"\n",
+            ret->id, session->id, (char *)session->client_id, topic_filter);
 
     pthread_rwlock_wrlock(&global_subscriptions_lock);
     ret->next = global_subscription_list;
@@ -1616,7 +1565,6 @@ static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[const U
     if ((ret->name = (void *)strdup((char *)name)) == NULL)
         goto fail;
 
-    //pthread_rwlock_init(&ret->subscribers_lock, NULL);
     pthread_rwlock_init(&ret->pending_queue_lock, NULL);
 
     ret->id = topic_id++;
@@ -2528,8 +2476,6 @@ static int parse_properties(
     if (properties_length == 0 && errno)
         return -1;
 
-    //dbg_printf("parse_properties: properties_length=%u\n", properties_length);
-
     if (properties_length == 0)
         return 0;
 
@@ -2914,27 +2860,6 @@ fail:
     return NULL;
 }
 
-#if 0
-[[gnu::nonnull, gnu::warn_unused_result]]
-static int find_subscription(struct session *session, struct topic *topic)
-{
-    pthread_rwlock_rdlock(&topic->subscribers_lock);
-    for (unsigned idx = 0; idx < topic->num_subscribers; idx++)
-    {
-        if (topic->subscribers[idx] == NULL)
-            continue;
-
-        if (topic->subscribers[idx]->session == session) {
-            pthread_rwlock_unlock(&topic->subscribers_lock);
-            return idx;
-        }
-    }
-    pthread_rwlock_unlock(&topic->subscribers_lock);
-    errno = ENOENT;
-    return -1;
-}
-#endif
-
 static struct subscription *find_subscription(const struct session * /* session */, const uint8_t *topic_filter)
 {
     struct subscription *tmp;
@@ -2942,9 +2867,6 @@ static struct subscription *find_subscription(const struct session * /* session 
     pthread_rwlock_rdlock(&global_subscriptions_lock);
     for (tmp = global_subscription_list; tmp; tmp = tmp->next)
     {
-        //dbg_printf("[%2d] find_subscription <%s> == <%s>\n", session->id,
-        //        (const char *)topic_filter, (const char *)tmp->topic_filter);
-
         if (strcmp((const void *)tmp->topic_filter, (const void *)topic_filter))
             continue;
 
@@ -2973,7 +2895,7 @@ static struct subscription *find_subscription(const struct session * /* session 
 static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE])
 {
     struct topic *ret;
-    
+
     errno = 0;
 
     assert(name != NULL);
@@ -3140,11 +3062,9 @@ static int enqueue_message(struct topic *topic, struct message *msg)
     assert(msg->id);
     assert(msg->state == MSG_NEW);
 
-    dbg_printf("[%2d] enqueue_message: topic=%d <%s>"/*" num_subscribers=%u"*/"\n",
+    dbg_printf("[%2d] enqueue_message: topic=%d <%s>\n",
             msg->sender ? msg->sender->id : (id_t)-1,
-            topic->id, topic->name
-            //,topic->num_subscribers
-            );
+            topic->id, topic->name);
 
     errno = 0;
 
@@ -3320,45 +3240,17 @@ fail:
     return NULL;
 }
 
-#if 0
-[[gnu::nonnull]]
-static int add_subscription_to_topic(struct subscription *new_sub)
-{
-    struct subscription **tmp_subs = NULL;
-    struct topic *topic = new_sub->topic;
-
-    errno = 0;
-
-    size_t sub_size = sizeof(struct subscription *) * (topic->num_subscribers + 1);
-    if ((tmp_subs = realloc(topic->subscribers, sub_size)) == NULL)
-        goto fail;
-
-    topic->subscribers = tmp_subs;
-    topic->subscribers[topic->num_subscribers] = new_sub;
-    topic->num_subscribers++;
-    return 0;
-
-fail:
-    if (tmp_subs)
-        free(tmp_subs);
-    return -1;
-}
-#endif
-
 /* TODO locking */
 [[gnu::nonnull, gnu::warn_unused_result]]
 static int unsubscribe(struct subscription *sub)
 {
     struct subscription **tmp_topic = NULL;
     struct subscription **tmp_client = NULL;
-    //size_t topic_sub_size, topic_sub_cnt = 0;
     size_t client_sub_size, client_sub_cnt = 0;
     unsigned old_idx, new_idx;
 
-    //struct topic *topic;
     struct session *session;
 
-    //topic = sub->topic;
     session = sub->session;
 
     errno = 0;
@@ -3366,17 +3258,6 @@ static int unsubscribe(struct subscription *sub)
     /*
      * remove the back references for this subscription
      */
-#if 0
-    pthread_rwlock_wrlock(&topic->subscribers_lock);
-    for (unsigned idx = 0; idx < topic->num_subscribers; idx++)
-    {
-        if (topic->subscribers[idx] == sub) {
-            topic->subscribers[idx] = NULL;
-            break;
-        }
-    }
-    pthread_rwlock_unlock(&topic->subscribers_lock);
-#endif
 
     pthread_rwlock_wrlock(&session->subscriptions_lock);
     for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
@@ -3389,41 +3270,8 @@ static int unsubscribe(struct subscription *sub)
     pthread_rwlock_unlock(&session->subscriptions_lock); /* TODO hold lock until the end */
 
     /*
-     * compact the topic list of subscribers
-     */
-#if 0
-    for (unsigned idx = 0; idx < topic->num_subscribers; idx++)
-    {
-        if (topic->subscribers[idx] == NULL)
-            continue;
-        topic_sub_cnt++;
-    }
-
-    topic_sub_size = topic_sub_cnt * sizeof(struct subscription *);
-
-    if (topic_sub_cnt == 0) {
-        tmp_topic = NULL;
-        goto skip_topic;
-    }
-
-    if ((tmp_topic = calloc(1, topic_sub_size)) == NULL)
-        goto fail;
-
-    for (old_idx = 0, new_idx = 0; old_idx < topic->num_subscribers; old_idx++)
-    {
-        if (topic->subscribers[old_idx] == NULL)
-            continue;
-
-        tmp_topic[new_idx] = topic->subscribers[old_idx];
-        new_idx++;
-    }
-
-skip_topic:
-#endif
-    /*
      * compact the client list of subscriptions
      */
-
     pthread_rwlock_wrlock(&session->subscriptions_lock); /* HOLD lock from start to finish */
     for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
     {
@@ -3462,25 +3310,9 @@ skip_client:
         free(session->subscriptions);
         session->subscriptions = NULL;
     }
-#if 0
-    if (topic->subscribers) {
-        free(topic->subscribers);
-        topic->subscribers = NULL;
-    }
 
-    topic->subscribers = tmp_topic;
-#endif
     session->subscriptions = tmp_client;
-
-    //topic->num_subscribers = topic_sub_cnt;
     session->num_subscriptions = client_sub_cnt;
-
-    //dbg_printf("     unsubscribe_from_topic: client_sub_cnt now %lu\n", client_sub_cnt);
-
-#if 0
-    DEC_REFCNT(&sub->topic->refcnt);
-    sub->topic = NULL;
-#endif
 
     DEC_REFCNT(&sub->session->refcnt); /* alloc_subscription */
     sub->session = NULL;
@@ -3512,24 +3344,20 @@ static int unsubscribe_session_from_all(struct session *session)
 
     const struct topic_sub_request req = {
         .topics = malloc(sizeof(struct uint8_t *) * session->num_subscriptions),
-        //.topic_refs = malloc(sizeof(struct topic *) * session->num_subscriptions),
         .num_topics = session->num_subscriptions,
         .id = (id_t)-1,
     };
 
-    //if (req.topic_refs == NULL)
     if (req.topics == NULL)
         return -1;
 
     for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
         req.topics[idx] = session->subscriptions[idx]->topic_filter;
-        //req.topic_refs[idx] = session->subscriptions[idx]->topic;
 
     if (unsubscribe_from_topics(session, &req) == -1) {
         rc = -1;
         warn("free_session: unsubscribe_from_topics");
     }
-    //free(req.topic_refs);
     free(req.topics);
 
     return rc;
@@ -3540,30 +3368,13 @@ static int unsubscribe_from_topics(struct session *session,
         const struct topic_sub_request *request)
 {
     struct subscription *sub;
-    //int sub_idx;
     errno = 0;
 
     dbg_printf("[%2d] unsubscribe_from_topics: num_topics=%d\n",
             session->id, request->num_topics);
 
-#if 0
-    if (request->topic_refs == NULL) {
-        warnx("unsubscribe_from_topics: topic_refs is NULL");
-        errno = EINVAL;
-        return -1;
-    }
-#endif
-
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
-#if 0
-        if (request->topic_refs[idx] == NULL)
-            if ((request->topic_refs[idx] = find_topic(request->topics[idx])) == NULL) {
-                if (request->reason_codes)
-                    request->reason_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
-                continue;
-            }
-#endif
 
         if ((sub = find_subscription(session, /*request->topic_refs[idx]*/ request->topics[idx])) == NULL) {
             if (request->reason_codes) {
@@ -3575,7 +3386,6 @@ static int unsubscribe_from_topics(struct session *session,
             continue;
         }
 
-        //sub = session->subscriptions[sub_idx]; // request->topic_refs[idx]->subscribers[sub_idx];
         switch (sub->type)
         {
             case SUB_SHARED:
@@ -3608,7 +3418,6 @@ static int subscribe_to_topics(struct session *session,
         struct topic_sub_request *request)
 {
     struct subscription **tmp_subs = NULL;
-    //struct topic *tmp_topic = NULL;
 
     errno = 0;
 
@@ -3647,17 +3456,6 @@ static int subscribe_to_topics(struct session *session,
             /* TODO */
         }
 
-#if 0
-        if ((tmp_topic = find_or_register_topic(request->topics[idx])) == NULL) {
-            /* TODO somehow ensure reply does a fail for this one? */
-            dbg_printf("[%2d] subscribe_to_topics: failed to find_or_register_topic(<%s>)\n",
-                    session->id,
-                    (char *)request->topics[idx]);
-            request->reason_codes[idx] = MQTT_TOPIC_NAME_INVALID;
-            continue;
-        }
-#endif
-
         struct subscription *existing_sub;
         struct subscription *new_sub;
 
@@ -3667,17 +3465,6 @@ static int subscribe_to_topics(struct session *session,
                             request->topics[idx])) == NULL)
                 goto fail;
             new_sub->option = request->options[idx];
-
-#if 0
-            if (add_subscription_to_topic(new_sub) == -1) {
-                warn("subscribe_to_topics: add_subscription_to_topic <%s>",
-                        tmp_topic->name);
-                request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
-                free_subscription(new_sub);
-                new_sub = NULL;
-                continue;
-            }
-#endif
 
             /* TODO refactor to add_subscription_to_session() */
             session->subscriptions[session->num_subscriptions + idx] = new_sub;
@@ -3690,14 +3477,12 @@ static int subscribe_to_topics(struct session *session,
             dbg_printf("[%2d] subscribe_to_topics: updating existing subscription\n",
                     session->id);
             abort(); /* TODO! */
-            //tmp_topic->subscribers[existing_idx]->option = request->options[idx];
         }
 
         free((void *)request->topics[idx]); /* TODO ensure callers strdup() */
         request->topics[idx] = NULL;
 
         request->options[idx] = 0;
-        //request->topic_refs[idx] = tmp_topic;
 
         if (existing_sub == NULL)
             session->num_subscriptions++;
@@ -5025,18 +4810,8 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
 
         if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
-#if 0
-        if ((tmp = realloc(request->topic_refs,
-                        sizeof(struct topic *) * (request->num_topics + 1))) == NULL) {
-            reason_code = MQTT_UNSPECIFIED_ERROR;
-            goto fail;
-        }
-        request->topic_refs = tmp;
-        request->topic_refs[request->num_topics] = NULL;
-#endif
 
         request->reason_codes[request->num_topics] = MQTT_SUCCESS;
-
         request->num_topics++;
     }
 
@@ -5132,16 +4907,6 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
         }
         request->reason_codes = tmp;
 
-#if 0
-        if ((tmp = realloc(request->topic_refs,
-                        sizeof(struct topic *) * (request->num_topics + 1))) == NULL) {
-            reason_code = MQTT_UNSPECIFIED_ERROR;
-            goto fail;
-        }
-        request->topic_refs = tmp;
-        request->topic_refs[request->num_topics] = NULL;
-#endif
-
         if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
 
@@ -5197,10 +4962,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
         for (unsigned idx = 0; idx < request->num_topics; idx++)
         {
             if (request->topics[idx] == NULL)
-            //if (request->topic_refs[idx] == NULL)
                 continue;
-
-     //       struct message *msg;
 
             warnx(BRED"check for retained message is broken!"CRESET"\n");
 
@@ -5390,7 +5152,6 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     if (protocol_version != 5) {
 version_fail:
         logger(LOG_WARNING, client, "handle_cp_connect: unsupported protocol version %d", protocol_version);
-        //warnx("handle_cp_connect: version %d is not supported", protocol_version);
         if (protocol_version < 5)
             reason_code = 0x1; /* Connection Refused, unacceptable protocol version */
         else
@@ -6182,9 +5943,6 @@ static void tick_msg(struct message *msg)
         packet = NULL;
         /* TODO async END */
     }
-
-    //dbg_printf(NGRN"     tick_msg: num_sent=%u num_message_delivery_states=%u"CRESET"\n",
-    //        num_sent, msg->num_message_delivery_states);
 
     /* We have now sent everything */
     if (num_sent == num_to_send /*msg->num_message_delivery_states*/) {
