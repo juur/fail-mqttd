@@ -381,12 +381,14 @@ struct topic_sub_request {
 };
 
 struct subscription {
+    struct subscription *next;
     id_t id;
     union {
         struct session *session;
         struct session **sessions;
     };
     unsigned num_sessions;
+    const uint8_t *topic_filter;
     struct topic *topic;
     uint8_t option;
     subscription_type_t type;

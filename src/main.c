@@ -96,8 +96,8 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 
 static int global_mother_fd = -1;
 static int global_om_fd = -1;
-static _Atomic bool running;
 static uint8_t global_hwaddr[8];
+static _Atomic bool running;
 
 /*
  * unique ids
@@ -134,12 +134,13 @@ static const char     *const PID_FILE        = RUNSTATEDIR "/fail-mqttd.pid";
  * global lists and associated locks & counts
  */
 
-static pthread_rwlock_t global_clients_lock  = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_sessions_lock = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_messages_lock = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_packets_lock  = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_topics_lock   = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t global_mds_lock      = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_clients_lock       = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_sessions_lock      = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_messages_lock      = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_packets_lock       = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_topics_lock        = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_mds_lock           = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t global_subscriptions_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static struct client *global_client_list              = NULL;
 static struct message *global_message_list            = NULL;
@@ -147,13 +148,15 @@ static struct packet *global_packet_list              = NULL;
 static struct topic *global_topic_list                = NULL;
 static struct session *global_session_list            = NULL;
 static struct message_delivery_state *global_mds_list = NULL;
+static struct subscription *global_subscription_list  = NULL;
 
-static unsigned num_clients  = 0;
-static unsigned num_messages = 0;
-static unsigned num_packets  = 0;
-static unsigned num_topics   = 0;
-static unsigned num_sessions = 0;
-static unsigned num_mds      = 0;
+static unsigned num_clients       = 0;
+static unsigned num_messages      = 0;
+static unsigned num_packets       = 0;
+static unsigned num_topics        = 0;
+static unsigned num_sessions      = 0;
+static unsigned num_mds           = 0;
+static unsigned num_subscriptions = 0;
 
 /*
  * databases
@@ -754,11 +757,26 @@ static void close_socket(int *fd)
 [[gnu::nonnull]]
 static void free_subscription(struct subscription *sub)
 {
-    dbg_printf("     free_subscription:  id=%u type=%s topic=%d <%s>\n",
+    struct subscription *tmp;
+
+    dbg_printf("     free_subscription:  id=%u type=%s topic=%d <%s> filter=<%s>\n",
             sub->id,
             subscription_type_str[sub->type],
             sub->topic ? sub->topic->id : (id_t)-1,
-            sub->topic ? (char *)sub->topic->name : "");
+            sub->topic ? (const char *)sub->topic->name : "",
+            (const char *)sub->topic_filter);
+
+    pthread_rwlock_wrlock(&global_subscriptions_lock);
+    if (global_subscription_list == sub) {
+        global_subscription_list = sub->next;
+    } else for (tmp = global_subscription_list; tmp; tmp = tmp->next) {
+        if (tmp->next == sub) {
+            tmp->next = sub->next;
+            break;
+        }
+    }
+    sub->next = NULL;
+    pthread_rwlock_unlock(&global_subscriptions_lock);
 
     switch (sub->type)
     {
@@ -771,6 +789,13 @@ static void free_subscription(struct subscription *sub)
         default:
             break;
     }
+
+    if (sub->topic_filter) {
+        free((void *)sub->topic_filter);
+        sub->topic_filter = NULL;
+    }
+
+    num_subscriptions++;
     free(sub);
 }
 
@@ -1313,6 +1338,8 @@ static void free_session(struct session *session, bool need_lock)
                 break;
             }
         }
+        session->next = NULL;
+
         if (session->client) {
             warn("free_session: freeing session with connected client!");
             session->client->state = CS_CLOSED;
@@ -1418,7 +1445,7 @@ static int add_session_to_shared_sub(struct subscription *sub,
     if ((tmp = realloc(sub->sessions, new_size)) == NULL)
         goto fail;
     sub->sessions = tmp;
-    
+
     INC_REFCNT(&session->refcnt);
     sub->sessions[sub->num_sessions] = session;
     sub->num_sessions++;
@@ -1431,7 +1458,7 @@ fail:
 
 [[gnu::malloc, gnu::warn_unused_result, gnu::nonnull]]
 static struct subscription *alloc_subscription(struct session *session,
-        struct topic *topic, subscription_type_t type)
+        struct topic *topic, subscription_type_t type, const uint8_t *topic_filter)
 {
     struct subscription *ret = NULL;
 
@@ -1440,6 +1467,9 @@ static struct subscription *alloc_subscription(struct session *session,
 
     ret->id = subscription_id++;
     ret->type = type;
+
+    if ((ret->topic_filter = (void *)strdup((const void *)topic_filter)) == NULL)
+        goto fail;
 
     switch (type)
     {
@@ -1464,9 +1494,19 @@ static struct subscription *alloc_subscription(struct session *session,
     dbg_printf("     alloc_subscription: id=%u session=%d <%s> topic=%u <%s>\n",
             ret->id, session->id, (char *)session->client_id,
             topic->id, (char *)topic->name);
+
+    pthread_rwlock_wrlock(&global_subscriptions_lock);
+    ret->next = global_subscription_list;
+    global_subscription_list = ret;
+    num_subscriptions++;
+    pthread_rwlock_unlock(&global_subscriptions_lock);
+
     return ret;
 
 fail:
+    if (ret->topic_filter)
+        free((void *)ret->topic_filter);
+
     if (ret)
         free(ret);
 
@@ -1887,6 +1927,7 @@ static int is_valid_topic_name(const uint8_t *name)
     errno = EINVAL;
     ptr = name;
 
+    /* [MQTT-4.7.3-1] */
     if (!*ptr)
         return -1;
 
@@ -1910,6 +1951,7 @@ static int is_valid_topic_filter(const uint8_t *name)
     errno = EINVAL;
     ptr = name;
 
+    /* [MQTT-4.7.3-1] */
     if (!*ptr)
         return -1;
 
@@ -1944,6 +1986,93 @@ static int is_valid_topic_filter(const uint8_t *name)
     errno = 0;
     return 0;
 }
+
+/* assumes name and filter are is_valid_topic_name() and is_valid_topic_filter() */
+[[gnu::nonnull]]
+static bool topic_match(const uint8_t *const name, const uint8_t *const filter)
+{
+    const uint8_t *name_ptr, *tmp_name_ptr;
+    const uint8_t *filter_ptr, *tmp_filter_ptr;
+    uint8_t tmpnamebuf[BUFSIZ];
+    uint8_t tmpfilterbuf[BUFSIZ];
+    bool multi_match = false;
+    size_t len = 0;
+
+    errno = 0;
+
+    name_ptr = name;
+    filter_ptr = filter;
+
+    while (*name_ptr && *filter_ptr)
+    {
+        tmp_name_ptr = name_ptr;
+
+        while (*tmp_name_ptr && *tmp_name_ptr != '/')
+            tmp_name_ptr++;
+
+        memcpy(tmpnamebuf, name_ptr, tmp_name_ptr - name_ptr);
+        tmpnamebuf[tmp_name_ptr - name_ptr] = '\0';
+
+        if (*tmp_name_ptr == '/')
+            tmp_name_ptr++;
+
+        name_ptr = tmp_name_ptr;
+
+        if (multi_match) {
+            multi_match = false;
+            goto skip_multi;
+        }
+
+        tmp_filter_ptr = filter_ptr;
+
+        while (*tmp_filter_ptr && *tmp_filter_ptr != '/')
+            tmp_filter_ptr++;
+
+        memcpy(tmpfilterbuf, filter_ptr, tmp_filter_ptr - filter_ptr);
+        tmpfilterbuf[tmp_filter_ptr - filter_ptr] = '\0';
+
+        if (*tmp_filter_ptr == '/')
+            tmp_filter_ptr++;
+
+        filter_ptr = tmp_filter_ptr;
+        len = strlen((const void *)tmpfilterbuf);
+
+        if (len == 1 && tmpfilterbuf[0] == '#')
+            filter_ptr--;
+
+skip_multi:
+        if (!strcmp((const void *)tmpfilterbuf, (const void *)tmpnamebuf))
+            goto next;
+
+        if (len == 1 && tmpfilterbuf[0] == '+')
+            goto next;
+
+        if (len == 1 && tmpfilterbuf[0] == '#') {
+            multi_match = true;
+            goto next;
+        }
+
+        return false;
+next:
+    }
+
+    /* handle the corner-case where the last filter is a '#' but only if
+     * it's not after a full path match.
+     * e.g. a/b/c a/+/+/# should fail, a/# and a/+/# and # should pass
+     */
+    if (*name_ptr ||                        /* we have name left, fail       */
+            /* OR                            */
+            (*filter_ptr &&                 /* we have filter left, fail     */
+             !(multi_match &&               /* .. UNLESS we have: 0 #match   */
+                 *filter_ptr == '#' &&      /* ... AND this is a # match     */
+                 *(filter_ptr+1) == '\0')   /* ... AND the # is last (not needed as this would be invalid filter?) */
+            )
+       )
+        return false;
+
+    return true;
+}
+
 
 [[gnu::nonnull, gnu::warn_unused_result]]
 static int encode_var_byte(uint32_t value, uint8_t out[static 4])
@@ -2574,9 +2703,12 @@ static void close_all_sockets(void)
     dbg_printf("     close_socket: closing mother_fd %u\n", global_mother_fd);
     if (global_mother_fd != -1)
         close_socket(&global_mother_fd);
-    dbg_printf("     close_socket: closing openmetrics_fd %u\n", global_om_fd);
-    if (global_om_fd != -1)
-        close_socket(&global_om_fd);
+
+    if (opt_openmetrics) {
+        dbg_printf("     close_socket: closing openmetrics_fd %u\n", global_om_fd);
+        if (global_om_fd != -1)
+            close_socket(&global_om_fd);
+    }
 }
 
 static void save_all_topics(void)
@@ -2627,6 +2759,7 @@ static void free_all_topics_two(void)
     dbg_printf("     "BYEL"free_all_topics_two"CRESET"\n");
     while (global_topic_list)
         free_topic(global_topic_list);
+    assert(global_subscription_list == NULL);
 }
 
 static void free_all_topics(void)
@@ -2695,6 +2828,28 @@ static struct topic *find_topic(const uint8_t *name)
 
     return NULL;
 }
+
+[[gnu::nonnull, gnu::warn_unused_result]]
+static struct subscription *find_matching_subscription(const uint8_t *name, struct subscription **start)
+{
+    struct subscription *tmp;
+
+    for (tmp = *start; tmp; tmp = tmp->next)
+    {
+        dbg_printf("     find_matching_subscription: comparing <%s> to <%s>\n",
+                name, tmp->topic_filter);
+
+        if (topic_match(name, tmp->topic_filter)) {
+            *start = tmp->next;
+            return tmp;
+        }
+    }
+
+    *start = NULL;
+
+    return NULL;
+}
+
 
 [[gnu::nonnull(1), gnu::warn_unused_result]]
 static struct topic *find_or_register_topic(const uint8_t *name)
@@ -2868,11 +3023,46 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull, gnu::warn_unused_result]]
-static int enqueue_message(struct topic *topic, struct message *msg)
+static int enqueue_one_mds(struct message *msg, struct session *session)
 {
     struct message_delivery_state *mds;
 
+    /* TODO lock the subscriber? */
+
+    if ((mds = alloc_message_delivery_state(msg, session)) == NULL) {
+        warn("enqueue_message: alloc_message_delivery_state");
+        /* TODO ???? */
+        return -1;
+    }
+
+    if (add_to_delivery_state(
+                &msg->delivery_states,
+                &msg->num_message_delivery_states,
+                &msg->delivery_states_lock,
+                mds) == -1) {
+        warn("enqueue_message: add_to_delivery_state(msg)");
+        mds_detach_and_free(mds, true, true);
+        mds = NULL;
+        return -1;
+    }
+
+    if (add_to_delivery_state(
+                &session->delivery_states,
+                &session->num_message_delivery_states,
+                &session->delivery_states_lock,
+                mds) == -1) {
+        warn("enqueue_message: add_to_delivery_state(session)");
+        mds_detach_and_free(mds, true, true);
+        mds = NULL;
+        return -1;
+    }
+
+    return 0;
+}
+
+[[gnu::nonnull, gnu::warn_unused_result]]
+static int enqueue_message(struct topic *topic, struct message *msg)
+{
     assert(topic->id);
     assert(msg->id);
     assert(msg->state == MSG_NEW);
@@ -2884,12 +3074,39 @@ static int enqueue_message(struct topic *topic, struct message *msg)
 
     errno = 0;
 
+    struct subscription *save_sub = global_subscription_list;
+    struct subscription *matched_sub;
+    bool found = false;
+
+    pthread_rwlock_rdlock(&global_subscriptions_lock);
+
+    while ((matched_sub = find_matching_subscription(topic->name, &save_sub)) != NULL)
+    {
+        dbg_printf("     enqueue_message: matched sub with filter <%s> [save_sub=%p]\n",
+                matched_sub->topic_filter, save_sub);
+        switch(matched_sub->type)
+        {
+            case SUB_NON_SHARED:
+                if (matched_sub->session == msg->sender) /* TODO echo y/n ? */
+                    continue;
+                enqueue_one_mds(msg, matched_sub->session);
+                found = true;
+                break;
+
+            default:
+                logger(LOG_WARNING, NULL, "enqueue_message: unsupported subscription type");
+                continue;
+        }
+    }
+
+    pthread_rwlock_unlock(&global_subscriptions_lock);
+
+#if 0
     /* TODO check the specification to see if empty topic handling is conformant */
     if (topic->num_subscribers == 0)
         goto no_subscribers;
 
     pthread_rwlock_rdlock(&topic->subscribers_lock);
-    bool found = false;
     for (unsigned src_idx = 0; src_idx < topic->num_subscribers; src_idx++)
     {
         if (topic->subscribers[src_idx] == NULL)
@@ -2906,43 +3123,15 @@ static int enqueue_message(struct topic *topic, struct message *msg)
 
         found = true;
 
-
-        /* TODO lock the subscriber? */
-
-        if ((mds = alloc_message_delivery_state(msg, session)) == NULL) {
-            warn("enqueue_message: alloc_message_delivery_state");
-            /* TODO ???? */
+        if (enqueue_one_mds(msg, session) == -1)
             continue;
-        }
-
-        if (add_to_delivery_state(
-                    &msg->delivery_states,
-                    &msg->num_message_delivery_states,
-                    &msg->delivery_states_lock,
-                    mds) == -1) {
-            warn("enqueue_message: add_to_delivery_state(msg)");
-            mds_detach_and_free(mds, true, true);
-            mds = NULL;
-            continue;
-        }
-
-        if (add_to_delivery_state(
-                    &session->delivery_states,
-                    &session->num_message_delivery_states,
-                    &session->delivery_states_lock,
-                    mds) == -1) {
-            warn("enqueue_message: add_to_delivery_state(session)");
-            mds_detach_and_free(mds, true, true);
-            mds = NULL;
-            continue;
-        }
     }
     pthread_rwlock_unlock(&topic->subscribers_lock);
-
+#endif
     if (found == false) {
         warnx("enqueue_message: failed to add to subscribers!");
     }
-no_subscribers:
+//no_subscribers:
 
     INC_REFCNT(&topic->refcnt);
     msg->topic = topic;
@@ -3404,7 +3593,8 @@ static int subscribe_to_topics(struct session *session,
 
         if ((existing_idx = find_subscription(session, tmp_topic)) == -1 && errno == ENOENT) {
 
-            if ((new_sub = alloc_subscription(session, tmp_topic, type)) == NULL)
+            if ((new_sub = alloc_subscription(session, tmp_topic, type,
+                            request->topics[idx])) == NULL)
                 goto fail;
             new_sub->option = request->options[idx];
 
@@ -4943,6 +5133,10 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
             dbg_printf("[%2d] handle_cp_subscribe: handling retain message\n",
                     client->session->id);
 
+            if (enqueue_one_mds(msg, client->session) == -1)
+                continue;
+
+#if 0
             struct message_delivery_state *mds;
 
             if ((mds = alloc_message_delivery_state(msg, client->session)) == NULL) {
@@ -4969,6 +5163,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                 mds = NULL;
                 continue;
             }
+#endif
 
             dbg_printf("[%2d] handle_cp_subscribe: added retained message\n", client->session->id);
             msg->next_queue = msg->topic->pending_queue;
