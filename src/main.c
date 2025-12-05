@@ -3270,17 +3270,17 @@ static int unsubscribe_session_from_all(struct session *session)
         .id = (id_t)-1,
     };
 
-    if (req.topic_refs != NULL) {
-        for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
-            req.topic_refs[idx] = session->subscriptions[idx]->topic;
-        
-        if (unsubscribe_from_topics(session, &req) == -1) {
-            rc = -1;
-            warn("free_session: unsubscribe_from_topics");
-        }
-        free(req.topic_refs);
-    } else
+    if (req.topic_refs == NULL)
+        return -1;
+
+    for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
+        req.topic_refs[idx] = session->subscriptions[idx]->topic;
+
+    if (unsubscribe_from_topics(session, &req) == -1) {
         rc = -1;
+        warn("free_session: unsubscribe_from_topics");
+    }
+    free(req.topic_refs);
 
     return rc;
 }
