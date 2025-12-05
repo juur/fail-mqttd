@@ -374,7 +374,7 @@ struct message {
 struct topic_sub_request {
     id_t id;
     const uint8_t **topics;
-    struct topic **topic_refs;
+    //struct topic **topic_refs;
     uint8_t *options;
     uint8_t *reason_codes;
     unsigned num_topics;
@@ -389,7 +389,7 @@ struct subscription {
     };
     unsigned num_sessions;
     const uint8_t *topic_filter;
-    struct topic *topic;
+    //struct topic *topic;
     uint8_t option;
     subscription_type_t type;
 };
@@ -493,11 +493,11 @@ struct topic {
     id_t id;
     uint8_t uuid[UUID_SIZE];
     const uint8_t *name;
-    unsigned num_subscribers;
-    struct subscription **subscribers;
+    //unsigned num_subscribers;
+    //struct subscription **subscribers;
     struct message *retained_message;
     struct message *pending_queue;
-    pthread_rwlock_t subscribers_lock;
+    //pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;
     topic_state_t state;
     _Atomic unsigned refcnt;

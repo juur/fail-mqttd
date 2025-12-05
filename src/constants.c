@@ -1,5 +1,6 @@
 #define _XOPEN_SOURCE 800
 
+#include <stdlib.h>
 #include <syslog.h>
 
 #include "mqtt.h"
@@ -195,9 +196,10 @@ const char *const priority_str[] = {
     [LOG_NOTICE]  = "NOTICE",
     [LOG_INFO]    = "INFO",
     [LOG_DEBUG]   = "DEBUG",
+    NULL,
 };
 
-const char *const reason_codes_str[MQTT_REASON_CODE_MAX] = 
+const char *const reason_codes_str[MQTT_REASON_CODE_MAX] =
 {
     [MQTT_SUCCESS] = "SUCCESS/NORMAL_DISCONNECTION/GRANTED_QOS_0",
     [MQTT_GRANTED_QOS_1] = "GRANTED_QOS_1",
