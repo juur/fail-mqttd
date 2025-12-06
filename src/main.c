@@ -3567,7 +3567,9 @@ not_shared:
                     session->id);
 
 force_existing:
-            new_sub->option = request->options[idx];
+            /* At this point existing_sub = new_sub|existing_sub */
+            existing_sub->option = request->options[idx];
+
             /* TODO what if non-QoS options have changed ? */
 
             switch(type)
@@ -5073,6 +5075,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
             request->reason_codes[request->num_topics] = MQTT_SHARED_SUBSCRIPTIONS_NOT_SUPPORTED;
             free((void *)request->topics[request->num_topics]);
             request->topics[request->num_topics] = NULL;
+            goto next;
         }
 
         if (is_valid_topic_filter(request->topics[request->num_topics]) == -1) {
@@ -5089,6 +5092,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
 
         /* TODO do something with the RETAIN flag */
 
+next:
         request->options[request->num_topics] = *ptr++;
         bytes_left--;
 
