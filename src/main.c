@@ -1340,7 +1340,7 @@ static void free_client(struct client *client, bool needs_lock)
         free((void *)client->svr_topic_aliases);
         client->svr_topic_aliases = NULL;
     }
-    
+
     if (client->clnt_topic_aliases) {
         free((void *)client->clnt_topic_aliases);
         client->clnt_topic_aliases = NULL;
@@ -4921,7 +4921,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
 
     if (get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_TOPIC_ALIAS, &prop) == 0) {
-        
+
         /* Server -> Client so clnt_topic_aliases */
 
         if (prop->byte2 == 0) {
@@ -5004,7 +5004,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
 
 fail:
     dbg_printf("\n");
-    
+
     dbg_printf("      handle_cp_publish: fail with reason code %s\n",
             (const char *)reason_codes_str[reason_code]);
 
