@@ -725,7 +725,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds, bool session_
     if (mds->message) {
         if (message_lock)
             pthread_rwlock_wrlock(&mds->message->delivery_states_lock);
-
+        
         if (remove_delivery_state(&mds->message->delivery_states,
                     &mds->message->num_message_delivery_states, mds) == -1) {
             warn("free_topic: remove_delivery_state(message)");
@@ -740,9 +740,10 @@ static int mds_detach_and_free(struct message_delivery_state *mds, bool session_
     }
 
     if (mds->session) {
+
         if (session_lock)
             pthread_rwlock_wrlock(&mds->session->delivery_states_lock);
-
+        
         if (remove_delivery_state(&mds->session->delivery_states,
                     &mds->session->num_message_delivery_states, mds) == -1) {
             warn("free_topic: remove_delivery_state(session)");
@@ -1703,6 +1704,7 @@ static struct client *alloc_client(void)
     client->fd = -1;
     client->parse_state = READ_STATE_NEW;
     client->is_auth = false;
+    client->send_quota = MAX_RECEIVE_PUBS; /* [MQTT-4.9.0-1] */
 
     if (pthread_rwlock_init(&client->active_packets_lock, NULL) == -1)
         goto fail;
@@ -3366,6 +3368,7 @@ fail:
     return -1;
 }
 
+[[gnu::nonnull]]
 static int unsubscribe_session_from_all(struct session *session)
 {
     int rc = 0;
@@ -3376,6 +3379,7 @@ static int unsubscribe_session_from_all(struct session *session)
     if (session->subscriptions == NULL || session->num_subscriptions == 0)
         return 0;
 
+    /* construct the topic_sub_request */
     const struct topic_sub_request req = {
         .topics = malloc(sizeof(uint8_t *) * session->num_subscriptions),
         .num_topics = session->num_subscriptions,
@@ -3388,10 +3392,9 @@ static int unsubscribe_session_from_all(struct session *session)
     for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
         req.topics[idx] = session->subscriptions[idx]->topic_filter;
 
-    if (unsubscribe_from_topics(session, &req) == -1) {
-        rc = -1;
+    if ((rc = unsubscribe_from_topics(session, &req)) == -1)
         warn("free_session: unsubscribe_from_topics");
-    }
+
     free(req.topics);
 
     return rc;
@@ -3409,8 +3412,7 @@ static int unsubscribe_from_topics(struct session *session,
 
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
-
-        if ((sub = find_subscription(session, /*request->topic_refs[idx]*/ request->topics[idx])) == NULL) {
+        if ((sub = find_subscription(session, request->topics[idx])) == NULL) {
             if (request->reason_codes) {
                 if (errno == ENOENT)
                     request->reason_codes[idx] = MQTT_NO_SUBSCRIPTION_EXISTED;
@@ -3448,6 +3450,133 @@ static int unsubscribe_from_topics(struct session *session,
 }
 
 /**
+ * caller must hold session->subscriptions_lock
+ */
+static int subscripe_to_one_topic(struct session *session,
+        uint8_t *reason_code,
+        const uint8_t *topic_filter,
+        uint32_t subscription_identifier,
+        uint8_t options,
+        unsigned sub_idx)
+{
+    struct subscription *existing_sub = NULL;
+    struct subscription *new_sub = NULL;
+    const uint8_t *ptr = NULL;
+    const uint8_t *share_name = NULL;
+    subscription_type_t type = SUB_NON_SHARED;
+
+    errno = 0;
+
+    if (*reason_code > MQTT_GRANTED_QOS_2) {
+        dbg_printf("[%d] subscribe_to_topics: reason code is %u\n",
+                session->id, *reason_code);
+        goto done;
+    }
+
+    dbg_printf("[%2d] subscribe_to_topics: subscribing to <%s>\n",
+            session->id, (const char *)topic_filter);
+
+    if (is_shared_subscription(topic_filter)) {
+        ptr = topic_filter + SHARED_PREFIX_LENGTH;
+
+        while (*ptr && *ptr != '/')
+            ptr++;
+
+        /* need to check the spec if "$shared/share" without the
+         * trailing /, should be considered a normal filter or not
+         */
+        if (*ptr == '\0')
+            goto not_shared;
+
+        ptr++;
+
+        if (is_valid_topic_filter(ptr) == -1) {
+            *reason_code = MQTT_TOPIC_FILTER_INVALID;
+            goto done;
+        }
+
+        if ((share_name = (void *)strdup((const char *)ptr)) == NULL)
+            goto fail;
+
+        type = SUB_SHARED;
+not_shared:
+    }
+
+    existing_sub = find_subscription(session, topic_filter);
+
+    /* no existing subscription, create one */
+    if ((existing_sub == NULL) && errno == ENOENT) {
+
+        if ((new_sub = alloc_subscription(session, type, topic_filter,
+                        subscription_identifier)) == NULL)
+            goto fail;
+
+        switch (type)
+        {
+            case SUB_SHARED:
+                new_sub->shared.share_name = share_name;
+                share_name = NULL;
+                break;
+
+            default:
+                break;
+        }
+
+        /* TODO refactor to add_subscription_to_session() */
+        session->subscriptions[sub_idx] = new_sub;
+        existing_sub = new_sub;
+        session->num_subscriptions++;
+
+        goto force_existing;
+
+    } else if (existing_sub == NULL) {
+        /* error inside find_subscription, fail */
+
+        warn("subscribe_to_topics: find_subscription");
+        *reason_code = MQTT_UNSPECIFIED_ERROR;
+        goto done;
+    }
+    /* else: Update the existing subscription's options (e.g. QoS) */
+
+    dbg_printf("[%2d] subscribe_to_topics: updating existing subscription\n",
+            session->id);
+
+force_existing:
+    /* At this point existing_sub = new_sub|existing_sub */
+    existing_sub->option = options;
+
+    /* TODO what if non-QoS options have changed ? */
+
+    switch(type)
+    {
+        case SUB_NON_SHARED:
+            break;
+
+        case SUB_SHARED:
+            add_session_to_shared_sub(existing_sub, session,
+                    (options & MQTT_SUBOPT_QOS_MASK));
+            break;
+
+        default:
+            logger(LOG_WARNING, NULL, "subscribe_to_topics: invalid type");
+            *reason_code = MQTT_UNSPECIFIED_ERROR;
+            goto done;
+    }
+
+done:
+    if (share_name)
+        free((void *)share_name);
+
+    return 0;
+
+fail:
+    if (share_name)
+        free((void *)share_name);
+
+    return -1;
+}
+
+/**
  * request should be freed by the caller using free_topic_subs()
  */
 [[gnu::nonnull, gnu::warn_unused_result]]
@@ -3455,11 +3584,7 @@ static int subscribe_to_topics(struct session *session,
         struct topic_sub_request *request)
 {
     struct subscription **tmp_subs = NULL;
-    uint8_t *share_name = NULL;
-    struct subscription *existing_sub = NULL;
-    struct subscription *new_sub = NULL;
     size_t sub_size;
-    const uint8_t *ptr;
 
     errno = 0;
 
@@ -3468,7 +3593,8 @@ static int subscribe_to_topics(struct session *session,
     /* Grow the session subscription array by the number of new subscriptions */
     /* TODO if any of the requests are _updates_ this leaves holes in the
      * subscriptions[] array of the session */
-    sub_size = sizeof(struct subscription *) * (session->num_subscriptions + request->num_topics);
+    sub_size = sizeof(struct subscription *) * (session->num_subscriptions +
+            request->num_topics);
 
     if ((tmp_subs = realloc(session->subscriptions, sub_size)) == NULL) {
         for (unsigned idx = 0; idx < request->num_topics; idx++)
@@ -3481,119 +3607,13 @@ static int subscribe_to_topics(struct session *session,
     /* Iterate over each requested subscription */
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
-        subscription_type_t type = SUB_NON_SHARED;
-
-        if (share_name) {
-            free(share_name);
-            share_name = NULL;
-        }
-
         session->subscriptions[session->num_subscriptions + idx] = NULL;
-
-        if (request->reason_codes[idx] > MQTT_GRANTED_QOS_2) {
-            dbg_printf("[%d] subscribe_to_topics: response code is %u\n",
-                    session->id, request->reason_codes[idx]);
-            continue;
-        }
-
-        dbg_printf("[%2d] subscribe_to_topics: subscribing to <%s>\n",
-                session->id, (char *)request->topics[idx]);
-
-        if (is_shared_subscription(request->topics[idx])) {
-
-            ptr = request->topics[idx] + SHARED_PREFIX_LENGTH;
-
-            while (*ptr && *ptr != '/')
-                ptr++;
-
-            /* need to check the spec if "$shared/share" without the
-             * trailing /, should be considered a normal filter or not
-             */
-            if (*ptr == '\0')
-                goto not_shared;
-
-            ptr++;
-
-            if (is_valid_topic_filter(ptr) == -1) {
-                request->reason_codes[idx] = MQTT_TOPIC_FILTER_INVALID;
-                continue;
-            }
-
-            if ((share_name = (void *)strdup((const char *)ptr)) == NULL)
-                goto fail;
-
-            type = SUB_SHARED;
-        }
-not_shared:
-
-        existing_sub = find_subscription(session, request->topics[idx]);
-
-        if ((existing_sub == NULL) && errno == ENOENT) {
-            /* no existing subscription, create one */
-
-            if ((new_sub = alloc_subscription(session, type,
-                            request->topics[idx],
-                            request->subscription_identifier)) == NULL)
-                goto fail;
-
-            switch (type)
-            {
-                case SUB_SHARED:
-                    new_sub->shared.share_name = share_name;
-                    share_name = NULL;
-                    break;
-
-                default:
-                    break;
-            }
-
-            /* TODO refactor to add_subscription_to_session() */
-            session->subscriptions[session->num_subscriptions + idx] = new_sub;
-            existing_sub = new_sub;
-            session->num_subscriptions++;
-
-            goto force_existing;
-
-        } else if (existing_sub == NULL) {
-            /* error inside find_subscription, fail */
-
-            warn("subscribe_to_topics: find_subscription");
-            request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
-            continue;
-        } else {
-            /* Update the existing subscription's options (e.g. QoS) */
-
-            dbg_printf("[%2d] subscribe_to_topics: updating existing subscription\n",
-                    session->id);
-
-force_existing:
-            /* At this point existing_sub = new_sub|existing_sub */
-            existing_sub->option = request->options[idx];
-
-            /* TODO what if non-QoS options have changed ? */
-
-            switch(type)
-            {
-                case SUB_NON_SHARED:
-                    break;
-
-                case SUB_SHARED:
-                    add_session_to_shared_sub(existing_sub, session,
-                            (request->options[idx] & MQTT_SUBOPT_QOS_MASK));
-                    break;
-
-                default:
-                    logger(LOG_WARNING, NULL, "subscribe_to_topics: invalid type");
-                    request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
-                    continue;
-            }
-
-        }
-    }
-
-    if (share_name) {
-        free(share_name);
-        share_name = NULL;
+        if (subscripe_to_one_topic(session, &request->reason_codes[idx],
+                    request->topics[idx],
+                    request->subscription_identifier,
+                    request->options[idx],
+                    session->num_subscriptions + idx) == -1)
+            goto fail;
     }
 
     dbg_printf("[%2d] subscribe_to_topics: num_subscriptions now %u [+%u]\n",
@@ -3603,18 +3623,14 @@ force_existing:
     return 0;
 
 fail:
-    if (share_name) {
-        free(share_name);
-        share_name = NULL;
-    }
-
     pthread_rwlock_unlock(&session->subscriptions_lock);
     return -1;
 }
 
 [[gnu::nonnull]]
 static int mark_one_mds(struct message_delivery_state *mds,
-        control_packet_t type, reason_code_t client_reason)
+        control_packet_t type, reason_code_t client_reason,
+        struct client *client)
 {
     assert(mds->packet_identifier != 0);
 
@@ -3629,6 +3645,8 @@ static int mark_one_mds(struct message_delivery_state *mds,
             mds->released_at = now;
             mds->completed_at = now;
             mds->client_reason = client_reason;
+            if (client->send_quota < MAX_RECEIVE_PUBS)
+                client->send_quota++;
             break;
 
         case MQTT_CP_PUBREC: /* QoS=2 */
@@ -3636,6 +3654,8 @@ static int mark_one_mds(struct message_delivery_state *mds,
                 warnx("mark_message: duplicate acknowledgment");
             mds->acknowledged_at = now;
             mds->client_reason = client_reason;
+            if (client->send_quota < MAX_RECEIVE_PUBS && client_reason >= 0x80)
+                client->send_quota++;
             break;
 
         case MQTT_CP_PUBREL: /* QoS=2 */
@@ -3648,6 +3668,8 @@ static int mark_one_mds(struct message_delivery_state *mds,
             if (mds->completed_at)
                 warnx("mark_message: duplicate completed");
             mds->completed_at = now;
+            if (client->send_quota < MAX_RECEIVE_PUBS)
+                client->send_quota++;
             break;
 
         default:
@@ -3665,24 +3687,27 @@ fail:
 
 [[gnu::nonnull, gnu::warn_unused_result]]
 static int mark_message(control_packet_t type, uint16_t packet_identifier,
-        reason_code_t client_reason, struct session *session, role_t role)
+        reason_code_t client_reason, struct client *client, role_t role)
 {
     int rc;
     struct message_delivery_state *mds;
+    struct session *session;
 
     assert(packet_identifier != 0);
+
+    session = client->session;
 
     if (role == ROLE_RECV)
         goto do_recv;
 
     pthread_rwlock_wrlock(&global_messages_lock);
-    for (struct message *message = global_message_list; message; message = message->next)
+    for (struct message *msg = global_message_list; msg; msg = msg->next)
     {
-        if (message->sender != session)
+        if (msg->sender != session)
             continue;
 
-        if (message->sender_status.packet_identifier == packet_identifier) {
-            rc = mark_one_mds(&message->sender_status, type, client_reason);
+        if (msg->sender_status.packet_identifier == packet_identifier) {
+            rc = mark_one_mds(&msg->sender_status, type, client_reason, client);
 
             if (rc == -1)
                 goto fail;
@@ -3711,7 +3736,7 @@ do_recv:
         if (mds->packet_identifier != packet_identifier)
             continue;
 
-        rc = mark_one_mds(mds, type, client_reason);
+        rc = mark_one_mds(mds, type, client_reason, client);
 
         if (rc == -1)
             goto fail;
@@ -3751,12 +3776,11 @@ static int send_cp_publish(struct packet *pkt)
 {
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
-
     uint8_t proplen[4], remlen[4];
     int proplen_len, remlen_len, prop_len;
-
     uint16_t tmp, topic_len;
     const struct message *msg;
+    reason_code_t reason_code = MQTT_SUCCESS;
 
     errno = 0;
 
@@ -3845,6 +3869,12 @@ static int send_cp_publish(struct packet *pkt)
     if (pkt->owner->maximum_packet_size && length > pkt->owner->maximum_packet_size)
         goto skip_write;
 
+    /* [MQTT-4.9.0-2] */
+    if (msg->qos && --pkt->owner->send_quota == 0) {
+        reason_code = MQTT_RECEIVE_MAXIMUM_EXCEEDED;
+        goto fail;
+    }
+
     /* Now send the packet */
     if ((wr_len = write(pkt->owner->fd, packet, length)) != length) {
         free(packet);
@@ -3858,6 +3888,10 @@ skip_write:
 fail:
     if (packet)
         free(packet);
+
+    if (disconnect_if_malformed(pkt->owner, reason_code))
+        return -1;
+
     return -1;
 }
 
@@ -3961,9 +3995,9 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
         { .ident = MQTT_PROP_MAXIMUM_PACKET_SIZE               , .byte4 = MAX_PACKET_LENGTH } ,
         { .ident = MQTT_PROP_RECEIVE_MAXIMUM                   , .byte2 = MAX_RECEIVE_PUBS  } ,
         { .ident = MQTT_PROP_RETAIN_AVAILABLE                  , .byte  = 1                 } ,
-        { .ident = MQTT_PROP_WILDCARD_SUBSCRIPTION_AVAILABLE   , .byte  = 0                 } ,
-        { .ident = MQTT_PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE , .byte  = 0                 } ,
-        { .ident = MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE     , .byte  = 0                 } ,
+        { .ident = MQTT_PROP_WILDCARD_SUBSCRIPTION_AVAILABLE   , .byte  = 1                 } ,
+        { .ident = MQTT_PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE , .byte  = 1                 } ,
+        { .ident = MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE     , .byte  = 1                 } ,
     };
     const unsigned num_props = sizeof(props) / sizeof(struct property);
 
@@ -4148,6 +4182,8 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
             mds->completed_at = time(0);
             break;
         }
+
+        /* TODO check the logic here is right, that packet_id != packet_id */
 
         if (mds->message->retain && mds->message->sender) {
             /* Now we've COMP, we can forget the sender */
@@ -4499,7 +4535,7 @@ skip_props:
             packet->packet_identifier, pubrel_reason_code);
 
     if (mark_message(MQTT_CP_PUBREL, packet->packet_identifier,
-                pubrel_reason_code, client->session, ROLE_SEND) == -1) {
+                pubrel_reason_code, client, ROLE_SEND) == -1) {
         if (errno == ENOENT)
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
         else
@@ -4569,7 +4605,7 @@ skip_property_length:
             puback_reason_code, packet->packet_identifier);
 
     if (mark_message(MQTT_CP_PUBACK, packet->packet_identifier,
-                puback_reason_code, client->session, ROLE_RECV) == -1) {
+                puback_reason_code, client, ROLE_RECV) == -1) {
         if (errno == ENOENT)
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
         else
@@ -4632,7 +4668,7 @@ skip_props:
             pubcomp_reason_code);
 
     if (mark_message(MQTT_CP_PUBCOMP, packet->packet_identifier,
-                pubcomp_reason_code, client->session, ROLE_RECV) == -1) {
+                pubcomp_reason_code, client, ROLE_RECV) == -1) {
         if (errno == ENOENT)
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
         else
@@ -4696,7 +4732,7 @@ skip_props:
             client->session->id, packet_identifier);
 
     if (mark_message(MQTT_CP_PUBREC, packet_identifier, pubrec_reason_code,
-                client->session, ROLE_RECV) == -1) {
+                client, ROLE_RECV) == -1) {
         if (errno == ENOENT) {
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
             goto normal;
@@ -4708,7 +4744,7 @@ skip_props:
     /* TODO what if the above succeeds, but the below fails? */
 
     if (mark_message(MQTT_CP_PUBREL, packet_identifier, MQTT_SUCCESS,
-                client->session, ROLE_RECV) == -1) {
+                client, ROLE_RECV) == -1) {
         if (errno == ENOENT) {
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
             goto normal; /* PUBREL only supports this error */
@@ -5854,6 +5890,8 @@ exec_control:
                 if (control_functions[client->new_packet->type].func(client,
                             client->new_packet, client->packet_buf) == -1) {
                     warn("control_function");
+                    if (client->disconnect_reason)
+                        reason_code = client->disconnect_reason;
                     goto fail;
                 }
             client->last_keep_alive = time(NULL);

@@ -471,6 +471,7 @@ struct client {
     uint32_t maximum_packet_size;
     bool is_auth;
     bool write_ok;
+    unsigned send_quota;
 
     /* used by parse_incoming() */
     uint8_t *packet_buf;

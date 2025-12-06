@@ -14,17 +14,18 @@ There are various things it might do, hopefully:
 - Retained Message
 - Session Expiry, reconnection and Clean Start
 - UTF-8 validation
-- property parsing
+- Property parsing
+- Topic Filters and topic 'hierarchy'
+- Non-shared Subscriptions
 
 ## TODO
 
 There are various things it doesn't at all:
 
-- *persistence*: nothing is stored anywhere but in memory.
+- *persistence*: only topics and retained messages are stored to disk.
 - *availability*: there is no active-active or active-passive fail-over, etc.
 - *security*: there is no (useful) authentication, authorisation, confidentiality or integrity.
 - server initiated keep-alive
-- proper topic handling
-- Topic Filter (wildcard character support)
 - multi-threaded operation (partial support)
 - few properties are implemented
+- Shared Subscriptions
