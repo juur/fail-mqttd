@@ -378,20 +378,28 @@ struct topic_sub_request {
     uint8_t *options;
     uint8_t *reason_codes;
     unsigned num_topics;
+    uint32_t subscription_identifier;
 };
 
 struct subscription {
     struct subscription *next;
     id_t id;
     union {
-        struct session *session;
-        struct session **sessions;
+        struct {
+            struct session *session;
+        } non_shared;
+        struct {
+            const uint8_t *share_name;
+            struct session **sessions;
+            uint8_t *qos_levels;
+            unsigned num_sessions;
+        } shared;
     };
-    unsigned num_sessions;
     const uint8_t *topic_filter;
     //struct topic *topic;
     uint8_t option;
     subscription_type_t type;
+    uint32_t subscription_identifier;
 };
 
 struct session {
