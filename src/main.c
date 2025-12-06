@@ -725,7 +725,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds, bool session_
     if (mds->message) {
         if (message_lock)
             pthread_rwlock_wrlock(&mds->message->delivery_states_lock);
-        
+
         if (remove_delivery_state(&mds->message->delivery_states,
                     &mds->message->num_message_delivery_states, mds) == -1) {
             warn("free_topic: remove_delivery_state(message)");
@@ -743,7 +743,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds, bool session_
 
         if (session_lock)
             pthread_rwlock_wrlock(&mds->session->delivery_states_lock);
-        
+
         if (remove_delivery_state(&mds->session->delivery_states,
                     &mds->session->num_message_delivery_states, mds) == -1) {
             warn("free_topic: remove_delivery_state(session)");
@@ -862,10 +862,11 @@ static void free_topic_subs(struct topic_sub_request *request)
 [[gnu::nonnull]]
 static void free_topic(struct topic *topic)
 {
-    dbg_printf("     free_topic: id=%u <%s> refcnt=%u\n",
+    dbg_printf("     free_topic: id=%u <%s> refcnt=%u [%p]\n",
             topic->id,
             (topic->name == NULL) ? "" : (char *)topic->name,
-            GET_REFCNT(&topic->refcnt)
+            GET_REFCNT(&topic->refcnt),
+            topic
             );
 
     /* used in free_all_topics() to allow almost-dead topics to persist due
@@ -889,8 +890,10 @@ static void free_topic(struct topic *topic)
     pthread_rwlock_unlock(&topic->pending_queue_lock);
 
     if (topic->retained_message) {
-        dbg_printf("     free_topic: freeing retained_message\n");
         struct message *msg = topic->retained_message;
+        dbg_printf("     free_topic: freeing retained_message id=%d\n", msg->id);
+
+        msg->state = MSG_DEAD;
 
         pthread_rwlock_wrlock(&msg->delivery_states_lock);
         for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
@@ -1132,13 +1135,19 @@ static void free_message(struct message *msg, bool need_lock)
     struct message *tmp;
     unsigned lck;
 
-    dbg_printf("     free_message: id=%u [%s] lock=%s topic=%u <%s> type=%s refcnt=%u\n",
+    assert(msg != NULL);
+
+    dbg_printf("     free_message: id=%u [%s] lock=%s type=%s refcnt=%u topic=%p",
             msg->id, message_state_str[msg->state],
             need_lock ? "yes" : "no",
-            msg->topic ? msg->topic->id : 0,
-            msg->topic ? (char *)msg->topic->name : "",
             message_type_str[msg->type],
-            GET_REFCNT(&msg->refcnt)
+            GET_REFCNT(&msg->refcnt),
+            msg->topic
+            );
+
+    dbg_printf(" topic=%u <%s>\n",
+            msg->topic ? msg->topic->id : 0,
+            msg->topic ? (char *)msg->topic->name : ""
             );
 
     if ((lck = GET_REFCNT(&msg->refcnt)) > 0) {
@@ -2851,6 +2860,7 @@ static struct subscription *find_matching_subscription(const uint8_t *name, stru
 
     *start = NULL;
 
+    dbg_printf("     find_matching_subscription: no match\n");
     return NULL;
 }
 
@@ -2884,6 +2894,7 @@ fail:
     return NULL;
 }
 
+[[gnu::nonnull]]
 static struct subscription *find_subscription(const struct session * /* session */, const uint8_t *topic_filter)
 {
     struct subscription *tmp;
@@ -3151,6 +3162,8 @@ static int dequeue_message(struct message *msg)
 
     assert(msg->topic != NULL);
 
+    dbg_printf("     dequeue_message: id=%d", msg->id);
+
     if (msg->topic == NULL) {
         warnx("dequeue_message: attempt to dequeue_message with topic NULL\n");
         errno = EINVAL;
@@ -3182,7 +3195,9 @@ done:
     if (!msg->retain || msg->topic->retained_message != msg) {
         DEC_REFCNT(&msg->topic->refcnt);
         msg->topic = NULL;
-    }
+    } else
+        dbg_printf("    dequeue_message: id=%d retained message (topic=%d)\n",
+                msg->id, msg->topic->id);
     return 0;
 }
 
@@ -3226,6 +3241,8 @@ static struct message *register_message(const uint8_t *topic_name, int format,
         if (topic->retained_message) {
             DEC_REFCNT(&topic->retained_message->refcnt);
             DEC_REFCNT(&topic->refcnt);
+            topic->retained_message->retain = false;
+            topic->retained_message->topic = NULL;
             topic->retained_message->state = MSG_DEAD;
             topic->retained_message = NULL;
         }
@@ -3452,6 +3469,7 @@ static int unsubscribe_from_topics(struct session *session,
 /**
  * caller must hold session->subscriptions_lock
  */
+[[gnu::nonnull]]
 static int subscripe_to_one_topic(struct session *session,
         uint8_t *reason_code,
         const uint8_t *topic_filter,
@@ -3714,7 +3732,6 @@ static int mark_message(control_packet_t type, uint16_t packet_identifier,
 
             pthread_rwlock_unlock(&global_messages_lock);
             return 0;
-
         }
     }
     pthread_rwlock_unlock(&global_messages_lock);
