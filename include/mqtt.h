@@ -487,6 +487,11 @@ struct client {
 
     _Atomic unsigned refcnt;
 
+    uint16_t topic_alias_maximum; /* Client, Server is MAX_TOPIC_ALIAS */
+
+    const uint8_t **clnt_topic_aliases;
+    const uint8_t **svr_topic_aliases;
+
     char hostname[INET_ADDRSTRLEN];
 };
 

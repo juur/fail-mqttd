@@ -124,6 +124,7 @@ static const unsigned  MAX_MESSAGES_PER_TICK = 100;
 static const unsigned  MAX_PROPERTIES        = 32;
 static const unsigned  MAX_RECEIVE_PUBS      = 8;
 static const unsigned  MAX_SESSIONS          = 128;
+static const unsigned  MAX_TOPIC_ALIAS       = 32;
 
 static const uint32_t  MAX_SUB_IDENTIFIER    = 0xfffffff;
 static const uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
@@ -180,8 +181,10 @@ static   int         opt_backlog       = 50;
 static   int         opt_loglevel      = LOG_INFO;
 static   bool        opt_logsyslog     = false;
 static   bool        opt_logfileappend = false;
+static   bool        opt_logfilesync   = false;
 static   bool        opt_background    = false;
 static   bool        opt_openmetrics   = false;
+static   bool        opt_database      = true;
 
 static struct in_addr opt_listen;
 static struct in_addr opt_om_listen;
@@ -225,7 +228,7 @@ static void show_version(FILE *fp)
 static void show_usage(FILE *fp, const char *name)
 {
     fprintf(fp, "fail-mqttd -- a terrible implementation of MQTT\n" "\n"
-            "Usage: %s [-hV] [-H ADDR] [-p PORT] [-l LOGOPTION,[LOGOPTION..]] [TOPIC..]\n"
+            "Usage: %s [-hdVn] [-H ADDR] [-p PORT] [-l LOGOPTION,[LOGOPTION..]] [-o OMOPTION,[OMOPTION..]] [TOPIC..]\n"
             "Provides a MQTT broker, "
             "pre-creating topics per additional command line arguments, "
             "if provided.\n"
@@ -233,21 +236,37 @@ static void show_usage(FILE *fp, const char *name)
             "Options:\n"
             "  -h             show help\n"
             "  -H ADDR        bind to IP address ADDR (default 127.0.0.1)\n"
-            "  -l LOGOPTION   comma separated suboptions, described below\n"
+            "  -l LOGOPTION   comma separated suboptions, described below, for logging\n"
             "  -p PORT        bind to TCP port PORT (default 1883)\n"
+            "  -o OMOPTION    comma separated suboptions, described below, for openmetrics\n"
             "  -d             daemonize and create a PID file\n"
             "  -V             show version\n"
+            "  -n             disable saving/loading\n"
+            "\n"
+            "The PID file will be created at %s.\n"
             "\n"
             "Each LOGOPTION may be:\n"
             "  syslog         log to syslog as LOG_DAEMON\n"
-            "  [no]stdout     [don't] log to stdout (default yes)\n"
-            "  file=PATH      log to given PATH\n"
+            "  [no]stdout     [don't] log to stdout\n"
+            "  file=PATH      log to the given PATH\n"
             "  append         open PATH log file in append mode\n"
+            "  sync           open PATH with no buffering\n"
             "  level=LEVEL    set the log min. priority to LEVEL, pass ? to see options\n"
             "\n"
-            "The default is stdout.\n"
-            "\n",
-            name);
+            "The default is stdout, with priority filter set to INFO.\n"
+            "\n"
+            "Each OMOPTION may be:\n"
+            "  enable         enable openmetrics\n"
+            "  disable        disable openmetrics\n"
+            "  port=PORT      bind to TCP port PORT (default 1337)\n"
+            "  bind=ADDR      bind to IP address ADDR (default 127.0.0.1)\n"
+            "\n"
+            "The default is disabled.\n"
+            "\n"
+            ,
+        name,
+        PID_FILE
+            );
 }
 
 /*
@@ -337,7 +356,8 @@ static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
     const struct sockaddr_ll *sock;
 
     if (getifaddrs(&ifaddr) == -1) {
-        logger(LOG_WARNING, NULL, "get_first_hwaddr: getifaddrs: %s", strerror(errno));
+        logger(LOG_WARNING, NULL, "get_first_hwaddr: getifaddrs: %s",
+                strerror(errno));
         return -1;
     }
 
@@ -464,12 +484,14 @@ static int openmetrics_export(int fd)
     sin_len = sizeof(sin);
 
     if (getpeername(fd, (struct sockaddr *)&sin, &sin_len) == -1) {
-        logger(LOG_WARNING, NULL, "openmetrics_export: getpeername: %s", strerror(errno));
+        logger(LOG_WARNING, NULL, "openmetrics_export: getpeername: %s",
+                strerror(errno));
         return -1;
     }
 
     inet_ntop(AF_INET, &sin.sin_addr, remote_addr, sizeof(remote_addr));
-    logger(LOG_INFO, NULL, "openmetrics_export connection from %s:%u", remote_addr, htons(sin.sin_port));
+    logger(LOG_INFO, NULL, "openmetrics_export connection from %s:%u",
+            remote_addr, htons(sin.sin_port));
 
     if ((in = fdopen(fd, "r+b")) == NULL)
         goto fail;
@@ -490,7 +512,8 @@ static int openmetrics_export(int fd)
             break;
 
         if (num_lines == 0) {
-            rc = sscanf(line, "%m[A-Z] %ms HTTP/%m[0-9.]", &http_method, &http_uri, &http_version);
+            rc = sscanf(line, "%m[A-Z] %ms HTTP/%m[0-9.]", &http_method,
+                    &http_uri, &http_version);
 
             if (rc != 3) {
                 http_error(in, 400);
@@ -552,7 +575,9 @@ static int openmetrics_export(int fd)
         "\r\n";
 
     if ((mem = open_memstream(&buffer, &size)) == NULL) {
-        logger(LOG_WARNING, NULL, "openmetrics_export: unable to open_memstream: %s", strerror(errno));
+        logger(LOG_WARNING, NULL,
+                "openmetrics_export: unable to open_memstream: %s",
+                strerror(errno));
         goto fail;
     }
 
@@ -653,7 +678,9 @@ static void dump_all(void)
     dbg_printf("]}\n");
 }
 
-static void logger(int priority, const struct client *client, const char *format, ...)
+[[gnu::nonnull(3)]]
+static void logger(int priority, const struct client *client,
+        const char *format, ...)
 {
     static const char *fmt = "%s %s [%d]: <%s> %s\n";
 
@@ -688,10 +715,12 @@ static void logger(int priority, const struct client *client, const char *format
     pid = getpid();
 
     if (opt_logstdout)
-        fprintf(stdout, fmt, timebuf, priority_str[priority], pid, clientbuf, linebuf);
+        fprintf(stdout, fmt, timebuf, priority_str[priority], pid, clientbuf,
+                linebuf);
 
     if (opt_logfile != NULL)
-        fprintf(opt_logfile, fmt, timebuf, priority_str[priority], pid, clientbuf, linebuf);
+        fprintf(opt_logfile, fmt, timebuf, priority_str[priority], pid,
+                clientbuf, linebuf);
 
     if (opt_logsyslog) {
         linebuf[strlen(linebuf)] = '\0';
@@ -718,7 +747,8 @@ static int find_str(const char *const *lookup, const char *value, int max)
  */
 
 [[gnu::nonnull]]
-static int mds_detach_and_free(struct message_delivery_state *mds, bool session_lock, bool message_lock)
+static int mds_detach_and_free(struct message_delivery_state *mds,
+        bool session_lock, bool message_lock)
 {
     int rc = 0;
 
@@ -818,7 +848,8 @@ static void free_subscription(struct subscription *sub)
             break;
 
         default:
-            logger(LOG_WARNING, NULL, "free_subscription: invalid subscription type");
+            logger(LOG_WARNING, NULL,
+                    "free_subscription: invalid subscription type");
             break;
     }
 
@@ -1027,7 +1058,8 @@ static void free_message_delivery_state(struct message_delivery_state **mds)
 }
 
 [[gnu::nonnull]]
-static void free_delivery_states(pthread_rwlock_t *lock, unsigned *num, struct message_delivery_state ***msgs)
+static void free_delivery_states(pthread_rwlock_t *lock, unsigned *num,
+        struct message_delivery_state ***msgs)
 {
     if (*msgs == NULL)
         return;
@@ -1304,6 +1336,16 @@ static void free_client(struct client *client, bool needs_lock)
         client->session = NULL;
     }
 
+    if (client->svr_topic_aliases) {
+        free((void *)client->svr_topic_aliases);
+        client->svr_topic_aliases = NULL;
+    }
+    
+    if (client->clnt_topic_aliases) {
+        free((void *)client->clnt_topic_aliases);
+        client->clnt_topic_aliases = NULL;
+    }
+
     pthread_rwlock_destroy(&client->active_packets_lock);
 
     num_clients--;
@@ -1502,10 +1544,9 @@ static struct subscription *alloc_subscription(struct session *session,
             goto fail;
     }
 
-    dbg_printf(NYEL "     alloc_subscription: %s id=%u session=%d <%s> filter=%s [%p,session=%p]"CRESET"\n",
+    dbg_printf(NYEL "     alloc_subscription: %s id=%u session=%d <%s> filter=%s"CRESET"\n",
             subscription_type_str[type],
-            ret->id, session->id, (char *)session->client_id, topic_filter,
-            ret, ret->non_shared.session);
+            ret->id, session->id, (char *)session->client_id, topic_filter);
 
     pthread_rwlock_wrlock(&global_subscriptions_lock);
     ret->next = global_subscription_list;
@@ -1709,6 +1750,10 @@ static struct client *alloc_client(void)
     if ((client = calloc(1, sizeof(struct client))) == NULL)
         return NULL;
 
+    if ((client->svr_topic_aliases = calloc(1,
+                    sizeof(uint8_t *) * MAX_TOPIC_ALIAS)) == NULL)
+        goto fail;
+
     client->state = CS_NEW;
     client->fd = -1;
     client->parse_state = READ_STATE_NEW;
@@ -1731,6 +1776,8 @@ static struct client *alloc_client(void)
     return client;
 
 fail:
+    if (client->svr_topic_aliases)
+        free(client->svr_topic_aliases);
     if (client)
         free(client);
 
@@ -2726,8 +2773,10 @@ static void close_all_sockets(void)
 
 static void save_all_topics(void)
 {
+    const struct topic *topic;
+
     dbg_printf("     "BYEL"save_all_topics"CRESET"\n");
-    for (const struct topic *topic = global_topic_list; topic; topic = topic->next)
+    for (topic = global_topic_list; topic; topic = topic->next)
         save_topic(topic);
 }
 
@@ -2843,7 +2892,8 @@ static struct topic *find_topic(const uint8_t *name)
 }
 
 [[gnu::nonnull, gnu::warn_unused_result]]
-static struct subscription *find_matching_subscription(const uint8_t *name, struct subscription **start)
+static struct subscription *find_matching_subscription(const uint8_t *name,
+        struct subscription **start)
 {
     struct subscription *tmp;
 
@@ -2881,7 +2931,8 @@ static struct topic *find_or_register_topic(const uint8_t *name)
         }
 
         free((void *)tmp_name);
-        save_topic(topic);
+        if (opt_database)
+            save_topic(topic);
     }
 
     return topic;
@@ -2895,7 +2946,8 @@ fail:
 }
 
 [[gnu::nonnull]]
-static struct subscription *find_subscription(const struct session * /* session */, const uint8_t *topic_filter)
+static struct subscription *find_subscription(const struct session * /* session */,
+        const uint8_t *topic_filter)
 {
     struct subscription *tmp;
 
@@ -2911,7 +2963,8 @@ static struct subscription *find_subscription(const struct session * /* session 
                 break;
 
             default:
-                logger(LOG_WARNING, NULL, "find_subscription: unsupported subscription type");
+                logger(LOG_WARNING, NULL,
+                        "find_subscription: unsupported subscription type");
                 errno = EINVAL;
                 return NULL;
         }
@@ -2927,7 +2980,8 @@ static struct subscription *find_subscription(const struct session * /* session 
 }
 
 [[gnu::nonnull(1), gnu::warn_unused_result]]
-static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE])
+static struct topic *register_topic(const uint8_t *name,
+        const uint8_t uuid[const UUID_SIZE])
 {
     struct topic *ret;
 
@@ -2986,9 +3040,9 @@ static int remove_delivery_state(
         goto fail;
 
     bool found = false;
-    unsigned new_idx, old_idx;
+    unsigned new_idx = 0, old_idx = 0;
 
-    for (new_idx = 0, old_idx = 0; new_idx < new_length && old_idx < old_length; old_idx++)
+    for (; new_idx < new_length && old_idx < old_length; old_idx++)
     {
         dbg_printf("     remove_delivery_state: new_idx=%u old_idx=%u\n",
                 new_idx, old_idx);
@@ -3124,14 +3178,16 @@ static int enqueue_message(struct topic *topic, struct message *msg)
                 if (matched_sub->non_shared.session == msg->sender) /* TODO echo y/n ? */
                     continue;
 
-                dbg_printf("     enqueue_message: session=%p\n", matched_sub->non_shared.session);
+                dbg_printf("     enqueue_message: session=%p\n",
+                        matched_sub->non_shared.session);
                 enqueue_one_mds(msg, matched_sub->non_shared.session);
 
                 found = true;
                 break;
 
             default:
-                logger(LOG_WARNING, NULL, "enqueue_message: unsupported subscription type");
+                logger(LOG_WARNING, NULL,
+                        "enqueue_message: unsupported subscription type");
                 continue;
         }
     }
@@ -3139,7 +3195,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
     pthread_rwlock_unlock(&global_subscriptions_lock);
 
     if (found == false) {
-        warnx("enqueue_message: failed to add to subscribers!");
+        //warnx("enqueue_message: failed to add to subscribers!");
     }
 
     INC_REFCNT(&topic->refcnt);
@@ -3202,7 +3258,8 @@ done:
 }
 
 /**
- * refcnt for non-retained messages should only be touched in enqueue_message or dequeue_message
+ * refcnt for non-retained messages should only be touched in enqueue_message
+ * or dequeue_message
  */
 [[gnu::nonnull]]
 static struct message *register_message(const uint8_t *topic_name, int format,
@@ -3304,13 +3361,9 @@ static int unsubscribe(struct subscription *sub)
 
     /* TODO handle SUB_SHARED */
     session = sub->non_shared.session;
-
     errno = 0;
 
-    /*
-     * remove the back references for this subscription
-     */
-
+    /* remove the back references for this subscription */
     pthread_rwlock_wrlock(&session->subscriptions_lock);
     for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
     {
@@ -3319,12 +3372,8 @@ static int unsubscribe(struct subscription *sub)
             break;
         }
     }
-    pthread_rwlock_unlock(&session->subscriptions_lock); /* TODO hold lock until the end */
 
-    /*
-     * compact the client list of subscriptions
-     */
-    pthread_rwlock_wrlock(&session->subscriptions_lock); /* HOLD lock from start to finish */
+    /* compact the client list of subscriptions */
     for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
     {
         if (session->subscriptions[idx] == NULL)
@@ -3352,12 +3401,9 @@ static int unsubscribe(struct subscription *sub)
         new_idx++;
     }
 
-    /*
-     * free the old ones and replace
-     */
-
 skip_client:
 
+    /* free the old ones and replace */
     if (session->subscriptions) {
         free(session->subscriptions);
         session->subscriptions = NULL;
@@ -3995,31 +4041,35 @@ static int send_cp_pingresp(struct client *client)
     return 0;
 }
 
-[[gnu::nonnull, gnu::warn_unused_result]]
-static int send_cp_connack(struct client *client, reason_code_t reason_code)
-{
-    ssize_t length, wr_len;
-    uint8_t *packet, *ptr;
-
-    uint8_t proplen[4], remlen[4];
-    int proplen_len, remlen_len, prop_len;
-
-    errno = 0;
-
-    /* Populate Properties */
-
-    const struct property props[] = {
+static const struct property connack_props[] = {
         { .ident = MQTT_PROP_MAXIMUM_PACKET_SIZE               , .byte4 = MAX_PACKET_LENGTH } ,
         { .ident = MQTT_PROP_RECEIVE_MAXIMUM                   , .byte2 = MAX_RECEIVE_PUBS  } ,
         { .ident = MQTT_PROP_RETAIN_AVAILABLE                  , .byte  = 1                 } ,
         { .ident = MQTT_PROP_WILDCARD_SUBSCRIPTION_AVAILABLE   , .byte  = 1                 } ,
         { .ident = MQTT_PROP_SUBSCRIPTION_IDENTIFIER_AVAILABLE , .byte  = 1                 } ,
         { .ident = MQTT_PROP_SHARED_SUBSCRIPTION_AVAILABLE     , .byte  = 1                 } ,
+        { .ident = MQTT_PROP_TOPIC_ALIAS_MAXIMUM               , .byte  = MAX_TOPIC_ALIAS   } ,
     };
-    const unsigned num_props = sizeof(props) / sizeof(struct property);
+static const unsigned num_connack_props = sizeof(connack_props) / sizeof(struct property);
+
+[[gnu::nonnull, gnu::warn_unused_result]]
+static int send_cp_connack(struct client *client, reason_code_t reason_code)
+{
+    /* Populate Properties */
+
+    ssize_t length, wr_len;
+    uint8_t *packet = NULL, *ptr = NULL;
+
+    uint8_t proplen[4], remlen[4];
+    int proplen_len, remlen_len, prop_len;
+
+    errno = 0;
+
+    dbg_printf("     send_cp_connack: %s to client <%s>\n",
+            reason_codes_str[reason_code], (const char *)client->client_id);
 
     /* Calculate the Property[] Length */
-    if ((prop_len = get_properties_size(&props, num_props)) == -1)
+    if ((prop_len = get_properties_size(&connack_props, num_connack_props)) == -1)
         return -1;
 
     /* Calculate the length of Property Length */
@@ -4042,6 +4092,8 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     if ((ptr = packet = calloc(1, length)) == NULL)
         return -1;
 
+    dbg_printf("     send_cp_connack: allocated %lub\n", length);
+
     /* Now build the packet */
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_CONNACK;
     ptr++;
@@ -4058,7 +4110,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     memcpy(ptr, proplen, proplen_len);
     ptr += proplen_len;
 
-    if (build_properties(&props, num_props, &ptr) == -1)
+    if (build_properties(&connack_props, num_connack_props, &ptr) == -1)
         goto fail;
 
     /* Now send the packet */
@@ -4276,7 +4328,9 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
     uint16_t tmp;
     uint8_t remlen[4]; int remlen_len;
 
-    dbg_printf("[%2d] send_cp_puback: packet_id=%u reason_code=%d <%s> client.id=%d\n", client->session ? client->session->id : (id_t)-1, packet_id, reason_code, reason_codes_str[reason_code], client->id);
+    dbg_printf("[%2d] send_cp_puback: packet_id=%u reason_code=%d <%s> client.id=%d\n",
+            client->session ? client->session->id : (id_t)-1, packet_id,
+            reason_code, reason_codes_str[reason_code], client->id);
     errno = 0;
 
     length = 0;
@@ -4795,6 +4849,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     unsigned qos = 0;
     const struct property *prop;
     bool flag_retain;
+    size_t topic_name_length;
     [[maybe_unused]] bool flag_dup; /* TODO use this somehow! */
 
     errno = 0;
@@ -4802,9 +4857,14 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     if ((topic_name = read_utf8(&ptr, &bytes_left)) == NULL)
         goto fail;
 
-    if (is_valid_topic_name(topic_name) == -1) {
+    topic_name_length = strlen((const char *)topic_name);
+
+    if (topic_name_length && is_valid_topic_name(topic_name) == -1) {
         reason_code = MQTT_TOPIC_NAME_INVALID;
         goto fail;
+    } else if (topic_name_length == 0) {
+        free((void *)topic_name);
+        topic_name = NULL;
     }
 
     dbg_printf("[%2d] handle_cp_publish: topic=<%s> ",
@@ -4859,9 +4919,48 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         }
     }
 
+    if (get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_TOPIC_ALIAS, &prop) == 0) {
+        
+        /* Server -> Client so clnt_topic_aliases */
+
+        if (prop->byte2 == 0) {
+            dbg_printf("     handle_cp_publish: topic_alias is 0\n");
+            reason_code = MQTT_TOPIC_ALIAS_INVALID;
+            goto fail;
+        }
+
+        if (prop->byte2 > MAX_TOPIC_ALIAS ||
+                ((!topic_name_length) && client->clnt_topic_aliases[prop->byte2] == NULL)) {
+            dbg_printf("     handle_cp_publish: topic_alias is 0\n");
+            reason_code = MQTT_TOPIC_ALIAS_INVALID;
+            goto fail;
+        }
+
+        if (topic_name_length) {
+            if (client->clnt_topic_aliases[prop->byte2])
+                free((void *)client->clnt_topic_aliases[prop->byte2]);
+
+            if ((client->clnt_topic_aliases[prop->byte2] = (void *)
+                        strdup((const char *)topic_name)) == NULL) {
+                reason_code = MQTT_UNSPECIFIED_ERROR;
+                goto fail;
+            }
+        } else {
+            topic_name = (void *)strdup((const char *)client->clnt_topic_aliases[prop->byte2]);
+            if (topic_name == NULL)
+                goto fail;
+        }
+
+    } else if (!topic_name_length) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
+
     struct message *msg;
     if ((msg = register_message(topic_name, payload_format, packet->payload_len,
-                    packet->payload, qos, client->session, flag_retain, MSG_NORMAL)) == NULL) {
+                    packet->payload, qos, client->session, flag_retain,
+                    MSG_NORMAL)) == NULL) {
         warn("handle_cp_publish: register_message");
         goto fail;
     }
@@ -4905,6 +5004,9 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
 
 fail:
     dbg_printf("\n");
+    
+    dbg_printf("      handle_cp_publish: fail with reason code %s\n",
+            (const char *)reason_codes_str[reason_code]);
 
     if (topic_name)
         free(topic_name);
@@ -4987,7 +5089,8 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
         }
         request->reason_codes = tmp;
 
-        if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
+        if ((request->topics[request->num_topics] = read_utf8(&ptr,
+                        &bytes_left)) == NULL)
             goto fail;
 
         request->reason_codes[request->num_topics] = MQTT_SUCCESS;
@@ -5008,6 +5111,7 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
     return rc;
 
 fail:
+
     if (request)
         free_topic_subs(request);
 
@@ -5101,7 +5205,8 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
         }
         request->reason_codes = tmp;
 
-        if ((request->topics[request->num_topics] = read_utf8(&ptr, &bytes_left)) == NULL)
+        if ((request->topics[request->num_topics] = read_utf8(&ptr,
+                        &bytes_left)) == NULL)
             goto fail;
 
         if (bytes_left < 1)
@@ -5168,7 +5273,8 @@ next:
      * TODO handle SUB_SHARED properly */
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
-        dbg_printf("[%2d] handle_cp_subscribe: retain check <%s>\n", client->session->id, request->topics[idx]);
+        dbg_printf("[%2d] handle_cp_subscribe: retain check <%s>\n",
+                client->session->id, request->topics[idx]);
         if (request->topics[idx] == NULL)
             continue;
 
@@ -5176,7 +5282,8 @@ next:
         for (struct topic *topic = global_topic_list; topic; topic = topic->next)
         {
             struct message *msg;
-            dbg_printf("[%2d] handle_cp_subscribe: retain check: topic=<%s>\n", client->session->id, topic->name);
+            dbg_printf("[%2d] handle_cp_subscribe: retain check: topic=<%s>\n",
+                    client->session->id, topic->name);
 
             if ((msg = topic->retained_message) == NULL)
                 continue;
@@ -5193,7 +5300,8 @@ next:
             if (enqueue_one_mds(msg, client->session) == -1)
                 continue;
 
-            dbg_printf("[%2d] handle_cp_subscribe: added retained message\n", client->session->id);
+            dbg_printf("[%2d] handle_cp_subscribe: added retained message\n",
+                    client->session->id);
             pthread_rwlock_wrlock(&msg->topic->pending_queue_lock);
             msg->next_queue = msg->topic->pending_queue;
             msg->topic->pending_queue = msg;
@@ -5215,7 +5323,8 @@ next:
     if (enqueue_one_mds(msg, client->session) == -1)
         continue;
 
-    dbg_printf("[%2d] handle_cp_subscribe: added retained message\n", client->session->id);
+    dbg_printf("[%2d] handle_cp_subscribe: added retained message\n",
+            client->session->id);
     msg->next_queue = msg->topic->pending_queue;
     msg->topic->pending_queue = msg;
 
@@ -5266,7 +5375,8 @@ static int handle_cp_disconnect(struct client *client, struct packet *packet,
 
     } else {
 skip:
-        dbg_printf("[%2d] handle_cp_disconnect: no reason\n", client->session->id);
+        dbg_printf("[%2d] handle_cp_disconnect: no reason\n",
+                client->session->id);
         logger(LOG_INFO, client, "handle_cp_disconnect: disconnect request with no reason");
     }
 
@@ -5285,7 +5395,8 @@ skip:
                 client->session->will_topic = NULL;
             }
             if (client->session->will_props) {
-                free_properties(client->session->will_props, client->session->num_will_props);
+                free_properties(client->session->will_props,
+                        client->session->num_will_props);
                 client->session->num_will_props = 0;
                 client->session->will_props = NULL;
             }
@@ -5387,7 +5498,8 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 
     if (protocol_version != 5) {
 version_fail:
-        logger(LOG_WARNING, client, "handle_cp_connect: unsupported protocol version %d", protocol_version);
+        logger(LOG_WARNING, client, "handle_cp_connect: unsupported protocol version %d",
+                protocol_version);
         if (protocol_version < 5)
             reason_code = 0x1; /* Connection Refused, unacceptable protocol version */
         else
@@ -5575,20 +5687,27 @@ create_new_session:
         client->session->will_payload_format = payload_format;
         client->session->will_props          = will_props;
         client->session->num_will_props      = num_will_props;
-        dbg_printf(BBLU "[%2d] handle_cp_connect: setting session will_message"CRESET"\n", client->session->id);
+        dbg_printf(BBLU "[%2d] handle_cp_connect: setting session will_message"CRESET"\n",
+                client->session->id);
     }
 
     if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_SESSION_EXPIRY_INTERVAL, &prop) == 0)
+                MQTT_PROP_SESSION_EXPIRY_INTERVAL, &prop) == 0) {
         client->session->expiry_interval = prop->byte4;
+        dbg_printf("[%2d] handle_cp_connect: SESSION_EXPIRY_INTERVAL=%u\n", client->session->id, prop->byte4);
+    }
 
     if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_REQUEST_RESPONSE_INFORMATION, &prop) == 0)
+                MQTT_PROP_REQUEST_RESPONSE_INFORMATION, &prop) == 0) {
         client->session->request_response_information = prop->byte;
+        dbg_printf("[%2d] handle_cp_connect: REQUEST_RESPONSE_INFORMATION=%u\n", client->session->id, prop->byte);
+    }
 
     if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_REQUEST_PROBLEM_INFORMATION, &prop) == 0)
+                MQTT_PROP_REQUEST_PROBLEM_INFORMATION, &prop) == 0) {
         client->session->request_problem_information = prop->byte;
+        dbg_printf("[%2d] handle_cp_connect: REQUEST_PROBLEM_INFORMATION=%u\n", client->session->id, prop->byte);
+    }
 
     if (get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_AUTHENTICATION_METHOD, &prop) == 0) {
@@ -5605,6 +5724,29 @@ create_new_session:
     if (get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_MAXIMUM_PACKET_SIZE, &prop) == 0) {
         client->maximum_packet_size = prop->byte4;
+        dbg_printf("[%2d] handle_cp_connect: MAXIMUM_PACKET_SIZE=%u\n", client->session->id, prop->byte4);
+    }
+
+    if (get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_TOPIC_ALIAS_MAXIMUM, &prop) == 0) {
+        dbg_printf("[%2d] handle_cp_connect: TOPIC_ALIAS_MAXIMUM=%u\n", client->session->id, prop->byte2);
+        if (prop->byte2 == 0) {
+            reason_code = MQTT_PROTOCOL_ERROR;
+            goto fail;
+        }
+
+        if (prop->byte2 > MAX_TOPIC_ALIAS) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
+            goto fail;
+        }
+
+        if ((client->clnt_topic_aliases = calloc(1,
+                        sizeof(uint8_t *) * prop->byte2)) == NULL) {
+            reason_code = MQTT_UNSPECIFIED_ERROR;
+            goto fail;
+        }
+
+        client->topic_alias_maximum = prop->byte2;
     }
 
     if (send_cp_connack(client, MQTT_SUCCESS) == -1) {
@@ -5615,9 +5757,10 @@ create_new_session:
 
     client->session->state = SESSION_ACTIVE;
 
-    logger(LOG_INFO, client, "handle_cp_connect: session established%s%s",
+    logger(LOG_INFO, client, "handle_cp_connect: session established%s%s%s",
             reconnect ? " (reconnect)" : "",
-            clean ? " (clean_start)" : "");
+            clean ? " (clean_start)" : "",
+            (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) ? " (will)" : "");
 
     return 0;
 
@@ -6833,6 +6976,8 @@ int main(int argc, char *argv[])
             LOGGER_STDOUT,
             LOGGER_NOSTDOUT,
             LOGGER_LEVEL,
+            LOGGER_APPEND,
+            LOGGER_SYNC,
         };
 
         char *const logger_token[] = {
@@ -6841,6 +6986,8 @@ int main(int argc, char *argv[])
             [LOGGER_STDOUT] = "stdout",
             [LOGGER_NOSTDOUT] = "nostdout",
             [LOGGER_LEVEL] = "level",
+            [LOGGER_APPEND] = "append",
+            [LOGGER_SYNC] = "sync",
             NULL
         };
 
@@ -6859,10 +7006,13 @@ int main(int argc, char *argv[])
             NULL,
         };
 
-        while ((opt = getopt(argc, argv, "hVp:H:l:do:")) != -1)
+        while ((opt = getopt(argc, argv, "hVp:H:l:do:n")) != -1)
         {
             switch (opt)
             {
+                case 'n':
+                    opt_database = false;
+                    break;
                 case 'd':
                     opt_background = true;
                     break;
@@ -6926,6 +7076,12 @@ int main(int argc, char *argv[])
                                 if ((opt_loglevel = find_str(priority_str, value, 0)) == -1)
                                     goto shit_usage;
                                 break;
+                            case LOGGER_SYNC:
+                                opt_logfilesync = true;
+                                break;
+                            case LOGGER_APPEND:
+                                opt_logfileappend = true;
+                                break;
                             default:
                                 goto shit_usage;
                         }
@@ -6963,8 +7119,12 @@ shit_usage:
         if ((opt_logfile = fopen(logfile_name,
                         opt_logfileappend ? "a" : "w")) == NULL)
             errx(EXIT_FAILURE, "fopen(%s)", logfile_name);
-        setvbuf(opt_logfile, NULL, _IONBF, 0);
+        if (opt_logfilesync)
+            setvbuf(opt_logfile, NULL, _IONBF, 0);
         atexit(close_logfile);
+    } else if (opt_logfilesync || opt_logfileappend) {
+        warnx("Invalid options without -l file=FILE provided");
+        goto shit_usage;
     }
 
     if (opt_background && opt_logstdout)
@@ -7066,9 +7226,11 @@ shit_usage:
     if (sigaction(SIGALRM, &sa, NULL) == -1)
         logger(LOG_EMERG, NULL, "sigaction(SIGALRM): %s", strerror(errno));
 
-    if (open_databases() == -1)
-        logger(LOG_EMERG, NULL, "open_databases: %s", strerror(errno));
-    atexit(close_databases);
+    if (opt_database) {
+        if (open_databases() == -1)
+            logger(LOG_EMERG, NULL, "open_databases: %s", strerror(errno));
+        atexit(close_databases);
+    }
 
     atexit(close_all_sockets);
     atexit(free_all_topics_two);
@@ -7079,27 +7241,38 @@ shit_usage:
     atexit(free_all_packets);
     atexit(free_all_clients);
 
-    atexit(save_all_topics);
+    if (opt_database)
+        atexit(save_all_topics);
 
-    if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
-        logger(LOG_EMERG, NULL, "main: cannot find MAC address");
+    if (opt_database) {
+        if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
+            logger(LOG_EMERG, NULL, "main: cannot find MAC address");
 
-    logger(LOG_INFO, NULL,
-            "main: using hardware address %02x:%02x:%02x:%02x:%02x:%02x",
-            global_hwaddr[0], global_hwaddr[1], global_hwaddr[2],
-            global_hwaddr[3], global_hwaddr[4], global_hwaddr[5]
-          );
+        logger(LOG_INFO, NULL,
+                "main: using hardware address %02x:%02x:%02x:%02x:%02x:%02x",
+                global_hwaddr[0], global_hwaddr[1], global_hwaddr[2],
+                global_hwaddr[3], global_hwaddr[4], global_hwaddr[5]
+              );
+    }
 
     while (optind < argc)
     {
         if (is_valid_topic_filter((const uint8_t *)argv[optind]) == -1) {
-            logger(LOG_WARNING, NULL, "main: command line topic creation: <%s> is not a valid topic filter, skipping", argv[optind]);
+            logger(LOG_WARNING, NULL,
+                    "main: command line topic creation: <%s> is not a valid topic filter, skipping",
+                    argv[optind]);
         } else if (find_topic((const uint8_t *)argv[optind]) != NULL) {
-            logger(LOG_WARNING, NULL, "main: command line topic creation: topic <%s> already exists, skipping", argv[optind]);
+            logger(LOG_WARNING, NULL,
+                    "main: command line topic creation: topic <%s> already exists, skipping",
+                    argv[optind]);
         } else if (register_topic((const uint8_t *)argv[optind], NULL) == NULL) {
-            logger(LOG_WARNING, NULL, "main: command line topic creation: register_topic<%s> failed, skipping: %s", argv[optind], strerror(errno));
+            logger(LOG_WARNING, NULL,
+                    "main: command line topic creation: register_topic<%s> failed, skipping: %s",
+                    argv[optind], strerror(errno));
         } else {
-            logger(LOG_INFO, NULL, "main: command line topic creation: topic <%s> created", argv[optind]);
+            logger(LOG_INFO, NULL,
+                    "main: command line topic creation: topic <%s> created",
+                    argv[optind]);
         }
         optind++;
     }
@@ -7158,7 +7331,8 @@ shit_usage:
         sin.sin_port = htons(opt_om_port);
         sin.sin_addr.s_addr = opt_om_listen.s_addr;
         inet_ntop(AF_INET, &sin.sin_addr, bind_addr, sizeof(bind_addr));
-        logger(LOG_NOTICE, NULL, "main: openmetrics binding to %s:%u", bind_addr, opt_om_port);
+        logger(LOG_NOTICE, NULL, "main: openmetrics binding to %s:%u",
+                bind_addr, opt_om_port);
 
         if (bind(global_om_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
             logger(LOG_EMERG, NULL, "bind(om): %s", strerror(errno));
@@ -7205,7 +7379,8 @@ shit_usage:
         pthread_join(om_thread, NULL);
 #else
     if (main_loop(&start_args) == -1)
-        logger(LOG_EMERG, NULL, "main_loop returned an error: %s", strerror(errno));
+        logger(LOG_EMERG, NULL, "main_loop returned an error: %s",
+                strerror(errno));
 #endif
 
     exit(EXIT_SUCCESS);
