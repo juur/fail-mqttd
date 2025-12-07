@@ -55,6 +55,7 @@
 # define NYEL "\x1b[0;33m"
 # define BBLU "\x1b[1;34m"
 # define BMAG "\x1b[1;35m"
+# define NMAG "\x1b[0;35m"
 # define BCYN "\x1b[1;36m"
 # define NCYN "\x1b[1;36m"
 # define BWHT "\x1b[1;37m"
@@ -193,6 +194,7 @@ static struct in_addr opt_om_listen;
  * forward declarations
  */
 
+[[gnu::nonnull]] static void close_session(struct session *session);
 [[gnu::nonnull]] static int unsubscribe(struct subscription *sub);
 [[gnu::nonnull]] static int dequeue_message(struct message *msg);
 [[gnu::nonnull]] static void free_message(struct message *msg, bool need_lock);
@@ -594,13 +596,16 @@ static int openmetrics_export(int fd)
             "num_mds %u\n"
             "# TYPE num_packets gauge\n"
             "num_packets %u\n"
+            "# TYPE num_subscriptions gauge\n"
+            "num_subscriptions %u\n"
             ,
             num_sessions,
             num_clients,
             num_messages,
             num_topics,
             num_mds,
-            num_packets
+            num_packets,
+            num_subscriptions
            );
 
 #if 0
@@ -758,14 +763,17 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
 
         if (remove_delivery_state(&mds->message->delivery_states,
                     &mds->message->num_message_delivery_states, mds) == -1) {
-            warn("free_topic: remove_delivery_state(message)");
+            warn("mds_detach_and_free: remove_delivery_state(message)");
             rc = -1;
         }
 
         if (message_lock)
             pthread_rwlock_unlock(&mds->message->delivery_states_lock);
 
-        DEC_REFCNT(&mds->message->refcnt); /* alloc_message_delivery_state */
+        if (GET_REFCNT(&mds->message->refcnt) > 0) {
+            DEC_REFCNT(&mds->message->refcnt); /* alloc_message_delivery_state */
+            dbg_printf("     mds_detach_and_free: DEC_REFCNT on message.id=%d refcnt=%u\n", mds->message->id, mds->message->refcnt);
+        }
         mds->message = NULL;
     }
 
@@ -776,14 +784,17 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
 
         if (remove_delivery_state(&mds->session->delivery_states,
                     &mds->session->num_message_delivery_states, mds) == -1) {
-            warn("free_topic: remove_delivery_state(session)");
-            rc = -1;
+            if (errno != ENOENT) {
+                warn("mds_detach_and_free: remove_delivery_state(session)");
+                rc = -1;
+            }
         }
 
         if (session_lock)
             pthread_rwlock_unlock(&mds->session->delivery_states_lock);
 
-        DEC_REFCNT(&mds->session->refcnt); /* alloc_message_delivery_state */
+        if (GET_REFCNT(&mds->session->refcnt) > 0)
+            DEC_REFCNT(&mds->session->refcnt); /* alloc_message_delivery_state */
         mds->session = NULL;
     }
 
@@ -807,7 +818,7 @@ static void free_subscription(struct subscription *sub)
 {
     struct subscription *tmp;
 
-    dbg_printf(NYEL "     free_subscription:  id=%u type=%s filter=<%s>"CRESET"\n",
+    dbg_printf(NYEL "     free_subscription:  id=%d type=%s filter=<%s>"CRESET"\n",
             sub->id,
             subscription_type_str[sub->type],
             (const char *)sub->topic_filter);
@@ -893,7 +904,7 @@ static void free_topic_subs(struct topic_sub_request *request)
 [[gnu::nonnull]]
 static void free_topic(struct topic *topic)
 {
-    dbg_printf("     free_topic: id=%u <%s> refcnt=%u [%p]\n",
+    dbg_printf("     free_topic: id=%d <%s> refcnt=%u [%p]\n",
             topic->id,
             (topic->name == NULL) ? "" : (char *)topic->name,
             GET_REFCNT(&topic->refcnt),
@@ -1032,7 +1043,7 @@ static void free_message_delivery_state(struct message_delivery_state **mds)
 {
     assert(*mds != NULL);
 
-    dbg_printf("     free_message_delivery_state: id=%u\n",
+    dbg_printf("     free_message_delivery_state: id=%d\n",
             (*mds)->id);
 
     pthread_rwlock_wrlock(&global_mds_lock);
@@ -1065,12 +1076,8 @@ static void free_delivery_states(pthread_rwlock_t *lock, unsigned *num,
         return;
 
     pthread_rwlock_wrlock(lock);
-    for (unsigned idx = 0; idx < *num; idx++) {
-        if (*msgs[idx] == NULL)
-            continue;
-        mds_detach_and_free(*msgs[idx], false, false);
-        *msgs[idx] = NULL;
-    }
+    while (*num)
+        mds_detach_and_free(**msgs, false, false);
     pthread_rwlock_unlock(lock);
 
     free(*msgs);
@@ -1084,13 +1091,14 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
     struct packet *tmp;
     unsigned lck;
 
-    dbg_printf("     free_packet: id=%u owner=%u <%s> owner.session=%d <%s> refcnt=%u\n",
+    dbg_printf("     free_packet: id=%d owner=%u <%s> owner.session=%d <%s> refcnt=%u message=%d\n",
             pck->id,
             pck->owner ? pck->owner->id : 0,
             pck->owner ? (char *)pck->owner->client_id : "",
             (pck->owner && pck->owner->session) ? pck->owner->session->id : 0,
             (pck->owner && pck->owner->session) ? (char *)pck->owner->session->client_id : "",
-            GET_REFCNT(&pck->refcnt)
+            GET_REFCNT(&pck->refcnt),
+            pck->message ? pck->message->id : (id_t)-1
             );
 
     if ((lck = GET_REFCNT(&pck->refcnt)) > 0) {
@@ -1154,6 +1162,7 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
 
     if (pck->message) {
         DEC_REFCNT(&pck->message->refcnt);
+        dbg_printf("     free_packet: DEC_REFCNT on message.id=%d refcnt=%u\n", pck->message->id, pck->message->refcnt);
         pck->message = NULL;
     }
 
@@ -1169,16 +1178,15 @@ static void free_message(struct message *msg, bool need_lock)
 
     assert(msg != NULL);
 
-    dbg_printf("     free_message: id=%u [%s] lock=%s type=%s refcnt=%u topic=%p",
+    dbg_printf("     free_message: id=%d [%s] lock=%s type=%s refcnt=%u",
             msg->id, message_state_str[msg->state],
             need_lock ? "yes" : "no",
             message_type_str[msg->type],
-            GET_REFCNT(&msg->refcnt),
-            msg->topic
+            GET_REFCNT(&msg->refcnt)
             );
 
-    dbg_printf(" topic=%u <%s>\n",
-            msg->topic ? msg->topic->id : 0,
+    dbg_printf(" topic=%d <%s>\n",
+            msg->topic ? msg->topic->id : (id_t)-1,
             msg->topic ? (char *)msg->topic->name : ""
             );
 
@@ -1242,7 +1250,7 @@ static void free_client(struct client *client, bool needs_lock)
 {
     struct client *tmp;
 
-    dbg_printf("     free_client: id=%u [%s] lock=%s client_id=%s session=%d %s refcnt=%u\n",
+    dbg_printf("     free_client: id=%d [%s] lock=%s client_id=%s session=%d %s refcnt=%u\n",
             client->id, client_state_str[client->state],
             needs_lock ? "yes" : "no",
             (char *)client->client_id,
@@ -1342,6 +1350,11 @@ static void free_client(struct client *client, bool needs_lock)
     }
 
     if (client->clnt_topic_aliases) {
+        for (unsigned idx = 0; idx < client->topic_alias_maximum; idx++)
+            if (client->clnt_topic_aliases[idx]) {
+                free((void *)client->clnt_topic_aliases[idx]);
+                client->clnt_topic_aliases[idx] = NULL;
+            }
         free((void *)client->clnt_topic_aliases);
         client->clnt_topic_aliases = NULL;
     }
@@ -1374,37 +1387,6 @@ static void free_session(struct session *session, bool need_lock)
     }
     pthread_rwlock_unlock(&session->subscriptions_lock);
 
-    if (GET_REFCNT(&session->refcnt) > 0) {
-        warn("free_session: attempt to free session with refcnt=%d", session->refcnt);
-        abort();
-        return;
-    }
-
-    if (need_lock)
-        pthread_rwlock_wrlock(&global_sessions_lock);
-    {
-        if (global_session_list == session) {
-            global_session_list = session->next;
-        } else for (tmp = global_session_list; tmp; tmp = tmp->next) {
-            if (tmp->next == session) {
-                tmp->next = session->next;
-                break;
-            }
-        }
-        session->next = NULL;
-
-        if (session->client) {
-            warn("free_session: freeing session with connected client!");
-            session->client->state = CS_CLOSED;
-            close_socket(&session->client->fd);
-            session->client->session = NULL;
-            //DEC_REFCNT(&session->client->refcnt); // TODO add INC_REFCNTs everywhere for client->session
-            session->client = NULL;
-        }
-    }
-    if (need_lock)
-        pthread_rwlock_unlock(&global_sessions_lock);
-
     /* TODO do this properly */
     if (session->delivery_states && session->num_message_delivery_states) {
         dbg_printf("     free_session: num_mds=%u\n", session->num_message_delivery_states);
@@ -1413,11 +1395,12 @@ static void free_session(struct session *session, bool need_lock)
         session->delivery_states = NULL;
     }
 
-    if (session->client_id) {
-        free((void *)session->client_id);
-        session->client_id = NULL;
+    if (GET_REFCNT(&session->refcnt) > 0) {
+        dbg_printf("     free_session: refcnt != 0\n");
+        return;
     }
 
+    /* Will handling must be after retcnt is 0 */
     if (session->will_payload) {
         free(session->will_payload);
         session->will_payload = NULL;
@@ -1436,6 +1419,36 @@ static void free_session(struct session *session, bool need_lock)
         session->num_will_props = 0;
     }
 
+    if (need_lock)
+        pthread_rwlock_wrlock(&global_sessions_lock);
+    if (global_session_list == session) {
+        global_session_list = session->next;
+    } else for (tmp = global_session_list; tmp; tmp = tmp->next) {
+        if (tmp->next == session) {
+            tmp->next = session->next;
+            break;
+        }
+    }
+    session->next = NULL;
+
+    if (session->client) {
+        warn("free_session: freeing session with connected client!");
+        session->client->state = CS_CLOSED;
+        close_socket(&session->client->fd);
+        session->client->session = NULL;
+        //DEC_REFCNT(&session->client->refcnt); // TODO add INC_REFCNTs everywhere for client->session
+        session->client = NULL;
+    }
+
+    if (need_lock)
+        pthread_rwlock_unlock(&global_sessions_lock);
+
+    if (session->client_id) {
+        free((void *)session->client_id);
+        session->client_id = NULL;
+    }
+
+
     pthread_rwlock_destroy(&session->subscriptions_lock);
     pthread_rwlock_destroy(&session->delivery_states_lock);
 
@@ -1443,7 +1456,7 @@ static void free_session(struct session *session, bool need_lock)
     free(session);
 }
 
-[[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
+    [[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
 static struct message_delivery_state *alloc_message_delivery_state(
         struct message *message, struct session *session)
 {
@@ -1477,7 +1490,7 @@ fail:
     return NULL;
 }
 
-[[gnu::nonnull]]
+    [[gnu::nonnull]]
 static int add_session_to_shared_sub(struct subscription *sub,
         struct session *session, uint8_t qos)
 {
@@ -1544,7 +1557,7 @@ static struct subscription *alloc_subscription(struct session *session,
             goto fail;
     }
 
-    dbg_printf(NYEL "     alloc_subscription: %s id=%u session=%d <%s> filter=%s"CRESET"\n",
+    dbg_printf(NYEL "     alloc_subscription: %s id=%d session=%d <%s> filter=%s"CRESET"\n",
             subscription_type_str[type],
             ret->id, session->id, (char *)session->client_id, topic_filter);
 
@@ -1602,7 +1615,7 @@ static struct session *alloc_session(struct client *client)
 
     ret->id = session_id++;
 
-    dbg_printf("     alloc_session: id=%u client=%u <%s>\n",
+    dbg_printf("     alloc_session: id=%d client=%d <%s>\n",
             ret->id, client ? client->id : 0, client ? (char *)client->client_id : "");
     return ret;
 
@@ -1643,7 +1656,7 @@ static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[const U
     ret->id = topic_id++;
     num_topics++;
 
-    dbg_printf("     alloc_topic: id=%u <%s>\n", ret->id, (char *)name);
+    dbg_printf("     alloc_topic: id=%d <%s>\n", ret->id, (char *)name);
 
     return ret;
 
@@ -1689,8 +1702,9 @@ static struct packet *alloc_packet(struct client *owner)
 
     ret->id = packet_id++;
 
-    dbg_printf("     alloc_packet: id=%u owner=%u <%s>\n",
-            ret->id, owner ? owner->id : 0, owner ? ((char *)owner->client_id) : ""
+    dbg_printf("     alloc_packet: id=%d owner=%d <%s>\n",
+            ret->id, owner ? owner->id : (id_t)-1,
+            (owner && owner->client_id) ? ((const char *)owner->client_id) : ""
           );
 
     return ret;
@@ -1771,7 +1785,7 @@ static struct client *alloc_client(void)
 
     client->id = client_id++;
 
-    dbg_printf("     alloc_client: id=%u\n", client->id);
+    dbg_printf("     alloc_client: id=%d\n", client->id);
 
     return client;
 
@@ -1802,7 +1816,7 @@ static int save_message(const struct message *msg)
     if (msg->state != MSG_ACTIVE)
         goto fail;
 
-    dbg_printf("     save_message: saving message id=%u uuid=%s\n",
+    dbg_printf("     save_message: saving message id=%d uuid=%s\n",
             msg->id, uuid_to_string(msg->uuid));
 
     size_t size = sizeof(struct message_save) + msg->payload_len;
@@ -1863,7 +1877,7 @@ static int save_topic(const struct topic *topic)
     if (topic->state != TOPIC_ACTIVE)
         goto fail;
 
-    dbg_printf("     save_topic: saving topic id=%u name=<%s> %s%s\n",
+    dbg_printf("     save_topic: saving topic id=%d name=<%s> %s%s\n",
             topic->id, topic->name,
             topic->retained_message ? "retained=" : "",
             topic->retained_message ? uuid_to_string(topic->retained_message->uuid) : ""
@@ -1918,6 +1932,9 @@ static struct session *find_session(struct client *client)
     pthread_rwlock_rdlock(&global_sessions_lock);
     for (struct session *tmp = global_session_list; tmp; tmp = tmp->next)
     {
+        if (tmp->state != SESSION_ACTIVE)
+            continue;
+
         if (strcmp((const char *)tmp->client_id,
                     (const char *)client->client_id))
             continue;
@@ -3015,8 +3032,11 @@ static int remove_delivery_state(
     unsigned new_length = *array_length - 1;
     struct message_delivery_state **tmp = NULL;
 
-    dbg_printf("     remove_delivery_state: array_length=%u new_length=%u rem=%u\n",
-            *array_length, new_length, rem->id);
+    dbg_printf("     remove_delivery_state: array_length=%u new_length=%u rem=%u session=%d message=%d\n",
+            *array_length, new_length, rem->id,
+            rem->session ? rem->session->id : (id_t)-1,
+            rem->message ? rem->message->id : (id_t)-1
+            );
 
     errno = 0;
 
@@ -3066,7 +3086,7 @@ static int remove_delivery_state(
         return 0;
     }
 
-    dbg_printf(BYEL"     remove_delivery_state: ENOENT"CRESET"\n");
+    //dbg_printf(BYEL"     remove_delivery_state: ENOENT"CRESET"\n");
 
     errno = ENOENT;
 
@@ -3218,7 +3238,7 @@ static int dequeue_message(struct message *msg)
 
     assert(msg->topic != NULL);
 
-    dbg_printf("     dequeue_message: id=%d", msg->id);
+    dbg_printf("     dequeue_message: id=%d\n", msg->id);
 
     if (msg->topic == NULL) {
         warnx("dequeue_message: attempt to dequeue_message with topic NULL\n");
@@ -3452,8 +3472,12 @@ static int unsubscribe_session_from_all(struct session *session)
     if (req.topics == NULL)
         return -1;
 
-    for (unsigned idx = 0; idx < session->num_subscriptions; idx++)
-        req.topics[idx] = session->subscriptions[idx]->topic_filter;
+    for (unsigned idx = 0; idx < session->num_subscriptions; idx++) {
+        if (session->subscriptions[idx])
+            req.topics[idx] = session->subscriptions[idx]->topic_filter;
+        else
+            req.topics[idx] = NULL;
+    }
 
     if ((rc = unsubscribe_from_topics(session, &req)) == -1)
         warn("free_session: unsubscribe_from_topics");
@@ -3475,6 +3499,9 @@ static int unsubscribe_from_topics(struct session *session,
 
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
+        if (request->topics[idx] == NULL)
+            continue;
+
         if ((sub = find_subscription(session, request->topics[idx])) == NULL) {
             if (request->reason_codes) {
                 if (errno == ENOENT)
@@ -3516,7 +3543,7 @@ static int unsubscribe_from_topics(struct session *session,
  * caller must hold session->subscriptions_lock
  */
 [[gnu::nonnull]]
-static int subscripe_to_one_topic(struct session *session,
+static int subscribe_to_one_topic(struct session *session,
         uint8_t *reason_code,
         const uint8_t *topic_filter,
         uint32_t subscription_identifier,
@@ -3661,6 +3688,7 @@ static int subscribe_to_topics(struct session *session,
             request->num_topics);
 
     if ((tmp_subs = realloc(session->subscriptions, sub_size)) == NULL) {
+        /* Ensure we acknowledged our failures */
         for (unsigned idx = 0; idx < request->num_topics; idx++)
             request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
 
@@ -3672,7 +3700,14 @@ static int subscribe_to_topics(struct session *session,
     for (unsigned idx = 0; idx < request->num_topics; idx++)
     {
         session->subscriptions[session->num_subscriptions + idx] = NULL;
-        if (subscripe_to_one_topic(session, &request->reason_codes[idx],
+
+        /* TODO: this will result in 'gaps' in session->subscriptions[] */
+        if (request->topics[idx] == NULL) {
+            session->subscriptions[session->num_subscriptions + idx] = NULL;
+            continue;
+        }
+
+        if (subscribe_to_one_topic(session, &request->reason_codes[idx],
                     request->topics[idx],
                     request->subscription_identifier,
                     request->options[idx],
@@ -3687,11 +3722,14 @@ static int subscribe_to_topics(struct session *session,
     return 0;
 
 fail:
+    /* TODO set all reason_codes[] to something ? */
     pthread_rwlock_unlock(&session->subscriptions_lock);
     return -1;
 }
 
 [[gnu::nonnull]]
+/* TODO the send_quota logic needs to adjust based on direction
+ * of message */
 static int mark_one_mds(struct message_delivery_state *mds,
         control_packet_t type, reason_code_t client_reason,
         struct client *client)
@@ -4203,8 +4241,11 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
 
     length = 0;
     length +=2; /* Packet Identifier */
-    length +=1; /* Reason Code */
-    length +=1; /* Properties Length */
+
+    if (reason_code > 0) {
+        length +=1; /* Reason Code */
+        length +=1; /* Properties Length */
+    }
 
     if ((remlen_len = encode_var_byte(length, remlen)) == -1)
         return -1;
@@ -4225,11 +4266,13 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     memcpy(ptr, &tmp, 2);
     ptr += 2;
 
+    if (reason_code > 0) {
     *ptr = reason_code;
     ptr++;
 
     *ptr = 0; /* No properties */
     ptr++;
+    }
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
@@ -4273,16 +4316,19 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     ssize_t length, wr_len;
     uint8_t *packet, *ptr;
     uint16_t tmp;
-    uint8_t remlen[4]; int remlen_len;
+    uint8_t remlen[4]; int remlen_len = 0;
 
     dbg_printf("[%2d] send_cp_pubrel: packet_id=%u reason_code=%d <%s> client.id=%d\n", client->session ? client->session->id : (id_t)-1, packet_id, reason_code, reason_codes_str[reason_code], client->id);
 
     errno = 0;
 
     length = 0;
-    length += 3; /* Packet Identifier + Reason Code */
-    length += 1; /* Properties Length */
+    length += 2; /* Packet Identifier */ 
 
+    if (reason_code > 0) {
+        length += 1; /* Reason Code */
+        length += 1; /* Properties Length */
+    }
     remlen_len = encode_var_byte(length, remlen);
 
     length += sizeof(struct mqtt_fixed_header);
@@ -4299,14 +4345,15 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
 
     tmp = htons(packet_id);
     memcpy(ptr, &tmp, 2);
-
     ptr += 2;
 
-    *ptr = reason_code;
-    ptr++;
+    if (reason_code > 0) {
+        *ptr = reason_code;
+        ptr++;
 
-    *ptr = 0; /* Properties Length */
-    ptr++;
+        *ptr = 0; /* Properties Length */
+        ptr++;
+    }
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
@@ -4670,7 +4717,7 @@ skip_reason:
 skip_property_length:
     /* TODO record acknowledgment */
 
-    dbg_printf("[%2d] handle_cp_puback: client=%u <%s> reason_code=%u packet_identifier=%u\n",
+    dbg_printf("[%2d] handle_cp_puback: client=%d <%s> reason_code=%u packet_identifier=%u\n",
             client->session->id,
             client->id, (char *)client->client_id,
             puback_reason_code, packet->packet_identifier);
@@ -4806,7 +4853,7 @@ skip_props:
                 client, ROLE_RECV) == -1) {
         if (errno == ENOENT) {
             reason_code = MQTT_PACKET_IDENTIFIER_NOT_FOUND;
-            goto normal;
+            goto normal; /* PUBREL only supports this error */
         } else
             reason_code = MQTT_UNSPECIFIED_ERROR;
         goto fail;
@@ -4850,6 +4897,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     const struct property *prop;
     bool flag_retain;
     size_t topic_name_length;
+    uint16_t topic_alias = 0;
     [[maybe_unused]] bool flag_dup; /* TODO use this somehow! */
 
     errno = 0;
@@ -4946,6 +4994,8 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
                 reason_code = MQTT_UNSPECIFIED_ERROR;
                 goto fail;
             }
+
+            topic_alias = prop->byte2;
         } else {
             topic_name = (void *)strdup((const char *)client->clnt_topic_aliases[prop->byte2]);
             if (topic_name == NULL)
@@ -5008,8 +5058,15 @@ fail:
     dbg_printf("      handle_cp_publish: fail with reason code %s\n",
             (const char *)reason_codes_str[reason_code]);
 
-    if (topic_name)
+    if (topic_name) {
         free(topic_name);
+        topic_name = NULL;
+    }
+
+    if (topic_alias) {
+        free((void *)client->clnt_topic_aliases[topic_alias]);
+        topic_alias = 0;
+    }
 
     if (packet->payload) {
         free(packet->payload);
@@ -5598,7 +5655,8 @@ version_fail:
     if (will_qos > 2)
         goto fail;
 
-    dbg_printf("will_qos [%u]\n", will_qos);
+    if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG))
+        dbg_printf("will_qos [%u]\n", will_qos);
 
     /* FIXME */
     if (client->username && client->password)
@@ -5652,7 +5710,7 @@ create_new_session:
             /* ... we don't want to re-use it */
             dbg_printf(BWHT"[  ] handle_cp_connect: clean existing session [%d]"CRESET"\n",
                     client->session->id);
-            client->session->state = SESSION_DELETE;
+            close_session(client->session);
             client->session = NULL;
             goto create_new_session;
         }
@@ -5678,7 +5736,7 @@ create_new_session:
         free(will_topic); /* find_or_register_topic duplicates */
         will_topic = NULL;
 
-        INC_REFCNT(&client->session->will_topic->refcnt);
+        INC_REFCNT(&client->session->will_topic->refcnt); /* free_session | handle_cp_disconnect | session_tick  */
 
         client->session->will_retain         = will_retain;
         client->session->will_payload        = will_payload;
@@ -5874,9 +5932,10 @@ static int parse_incoming(struct client *client)
     switch (client->parse_state)
     {
         case READ_STATE_NEW:
-            dbg_printf("\n[%2d] parse_incoming: READ_STATE_NEW client=%u <%s>\n",
+            dbg_printf("\n[%2d] parse_incoming: READ_STATE_NEW client=%d <%s>\n",
                     client->session ? client->session->id : (id_t)-1,
-                    client->id, (char *)client->client_id);
+                    client->id,
+                    client->client_id ? (char *)client->client_id : "");
             client->read_offset = 0;
             client->rl_offset = 0;
             client->rl_multi = 1;
@@ -6052,6 +6111,8 @@ exec_control:
                     warn("control_function");
                     if (client->disconnect_reason)
                         reason_code = client->disconnect_reason;
+                    if (errno == EPIPE)
+                        client->state = CS_CLOSED;
                     goto fail;
                 }
             client->last_keep_alive = time(NULL);
@@ -6155,7 +6216,7 @@ static void client_tick(void)
                     if (clnt->session->expiry_interval == 0) {
                         dbg_printf("[%2d] client_tick: expiring session instantly\n",
                                 clnt->session->id);
-                        clnt->session->state = SESSION_DELETE;
+                        close_session(clnt->session);
                     } else if (clnt->session->expiry_interval == UINT_MAX) {
                         clnt->session->expires_at = LONG_MAX; /* "does not expire" */
                     } else {
@@ -6231,11 +6292,14 @@ static void tick_msg(struct message *msg)
 
     const time_t now = time(NULL);
 
+    /*
     dbg_printf(NGRN "     tick_msg: id=%u sender.id=%d #mds=%u"CRESET"\n",
             msg->id, msg->sender ? msg->sender->id : (id_t)-1,
             msg->num_message_delivery_states);
+            */
 
     pthread_rwlock_wrlock(&msg->delivery_states_lock);
+
     for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
     {
         mds = msg->delivery_states[idx];
@@ -6264,7 +6328,7 @@ static void tick_msg(struct message *msg)
         }
 
         dbg_printf(BGRN
-                "     tick_msg: sending message: id=%u subscriber.id=%d <%s> ackat=%lu lastsent=%lu"
+                "     tick_msg: sending message: id=%d subscriber.id=%d <%s> ackat=%lu lastsent=%lu"
                 CRESET"\n",
                 mds->id, mds->session->id, (char *)mds->session->client_id,
                 mds->acknowledged_at, mds->last_sent);
@@ -6276,8 +6340,8 @@ static void tick_msg(struct message *msg)
         }
 
         /* this code might execute more than once, so avoid a double refcnt */
-        if (mds->last_sent == 0)
-            INC_REFCNT(&msg->refcnt);
+        //if (mds->last_sent == 0)
+        INC_REFCNT(&msg->refcnt);
         packet->message = msg;
 
         packet->type = MQTT_CP_PUBLISH;
@@ -6347,18 +6411,19 @@ again:
                 break;
             }
 
+            /*
             dbg_printf(NGRN"     tick_msg: mds.idx=%u acc=%lu ack=%lu rel=%lu cmp=%lu"CRESET"\n",
                     idx - 1,
                     mds->accepted_at,
                     mds->acknowledged_at,
                     mds->released_at,
-                    mds->completed_at);
+                    mds->completed_at);*/
 
             if (mds->completed_at == 0)
                 goto again;
 
             dbg_printf(NGRN
-                    "     tick_msg: mds.idx=%u unlink mds.id=%u from session %u[%u] and message %u[%u]"
+                    "     tick_msg: mds.idx=%u unlink mds.id=%d from session %u[%u] and message %u[%u]"
                     CRESET"\n",
                     idx - 1,
                     mds->id,
@@ -6453,6 +6518,37 @@ static void message_tick(void)
 
 /* Sessions */
 
+static void close_session(struct session *session)
+{
+    dbg_printf(BMAG "     close_session: id=%d state=%s client=%d client_id=<%s>" CRESET "\n",
+            session->id, session_state_str[session->state],
+            session->client ? session->client->id : (id_t)-1,
+            (const char *)session->client_id);
+
+    time_t now = time(NULL);
+
+    for (struct message_delivery_state *mds = global_mds_list ; mds ; mds = mds->next)
+    {
+        if (mds->session != session)
+            continue;
+
+        dbg_printf(NMAG "     close_session: updating mds.id=%d for message.id=%d\n",
+                mds->id, mds->message->id);
+
+        if (mds->acknowledged_at == 0) mds->acknowledged_at = now;
+        if (mds->last_sent == 0) mds->last_sent = now;
+        if (mds->completed_at == 0) mds->completed_at = now;
+        if (mds->released_at == 0) mds->released_at = now;
+        if (mds->accepted_at == 0) mds->accepted_at = now;
+
+        //mds->session = NULL;
+        //DEC_REFCNT(&session->refcnt);
+    }
+
+    session->state = SESSION_DELETE;
+    //free_session(session, false);
+}
+
 static void session_tick(void)
 {
     const time_t now = time(NULL);
@@ -6468,10 +6564,6 @@ static void session_tick(void)
 
         if (session->state == SESSION_DELETE) {
             if (GET_REFCNT(&session->refcnt) > 0) {
-                /* as the session is SESSION_DELETE, check we're unsubscribed
-                 * which should resolve the refcnt to be 0 */
-                /* TODO replace this with a unsubscribe_from_topics() */
-                unsubscribe_session_from_all(session);
             } else if (session->will_at) {
                 dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
                         session->id);
@@ -6487,18 +6579,26 @@ static void session_tick(void)
             if (session->expires_at == 0 || now > session->expires_at) {
                 dbg_printf("[%2d] session_tick: setting SESSION_DELETE refcnt is %u\n",
                         session->id, GET_REFCNT(&session->refcnt));
-                session->state = SESSION_DELETE;
 
                 if (session->will_at) {
                     dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
                             session->id);
                     goto force_will;
                 }
+
+                close_session(session);
+                session = NULL;
+                continue;
             }
         }
 
         if (session->will_at && (now > session->will_at)) {
 force_will:
+            if (session->will_topic == NULL) {
+                warnx("client_tick: session->will_topic is NULL");
+                goto will_fail;
+            }
+
             struct message *msg;
             /* a) Will Delay Interval or b) Session end is the trigger */
             if ((msg = register_message(session->will_topic->name,
@@ -6518,14 +6618,20 @@ force_will:
             msg->sender_status.last_sent = now;
             msg->sender_status.accepted_at = now;
             msg->sender_status.released_at = now;
-will_fail:
 
+            /* avoid subsequent free in happy-path, as now in msg->payload */
             session->will_payload = NULL;
-            session->will_retain = false;
+will_fail:
+            if (session->will_payload)
+                free(session->will_payload);
+            session->will_payload = NULL;
 
-            DEC_REFCNT(&session->will_topic->refcnt);
+            if (session->will_topic)
+                DEC_REFCNT(&session->will_topic->refcnt);
+
             session->will_topic = NULL;
             session->will_at = 0;
+            session->will_retain = false;
         }
     }
     pthread_rwlock_unlock(&global_sessions_lock);
@@ -7225,6 +7331,12 @@ shit_usage:
         logger(LOG_EMERG, NULL, "sigaction(SIGHUP): %s", strerror(errno));
     if (sigaction(SIGALRM, &sa, NULL) == -1)
         logger(LOG_EMERG, NULL, "sigaction(SIGALRM): %s", strerror(errno));
+
+    sa.sa_flags = 0;
+    sa.sa_handler = SIG_IGN;
+
+    if (sigaction(SIGPIPE, &sa, NULL) == -1)
+        logger(LOG_EMERG, NULL, "sigaction(SIGPIPE): %s", strerror(errno));
 
     if (opt_database) {
         if (open_databases() == -1)
