@@ -1,0 +1,25 @@
+Name: fail-mqttd
+Version: @@VERSION@@
+Release: 1
+Summary: fail-mqttd -- a terrible MQTT version 5.0 broker
+License: MIT
+Source0: %{name}-%{version}.tar.xz
+
+%description
+fail-mqttd is a terrible MQTT version 5.0 broker
+
+%prep
+%autosetup
+
+%build
+%configure
+%make_build
+
+%install
+%make_install
+
+%files
+%doc README.md SECURITY.md
+%license COPYING
+%{_mandir}/man?/*
+%{_sbindir}/*

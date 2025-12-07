@@ -427,10 +427,16 @@ ARGS=$(cat <<- __END
 	s#@@SYSCONFDIR@@#${SYSCONFDIR}#;
 	s#@@YACC@@#${YACC}#;
 	s#@@LEX@@#${LEX}#;
+	s#@@VERSION@@#${VERSION}#;
+	s#@@PACKAGE@@#${PACKAGE}#;
 __END
 )
 
 sed "${ARGS}" <"${SRCDIR}"/Makefile.in >"${OBJDIR}"/Makefile
+
+echo "Creating ${PACKAGE}.spec"
+
+sed "${ARGS}" <"${SRCDIR}"/${PACKAGE}.spec.in > "${OBJDIR}"/"${PACKAGE}".spec
 
 echo "Creating config.status"
 
