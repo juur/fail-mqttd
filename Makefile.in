@@ -88,7 +88,8 @@ dist:
 	pushd $(srcdir) >/dev/null ; \
 	$(TAR) -acf $(objdir)/$(PACKAGE)-$(VERSION).tar.xz \
 		--transform="s,^./,,;s,^,$(PACKAGE)-$(VERSION)/," \
-		README.md COPYING src misc Makefile.in configure include SECURITY.md $(PACKAGE).spec ; \
+		README.md COPYING src misc Makefile.in configure include SECURITY.md \
+		$(PACKAGE).spec{,.in} ; \
 	popd >/dev/null
 
 $(objdir)/%.o: $(srcdir)/src/%.c
