@@ -2180,6 +2180,12 @@ static uint32_t read_var_byte(const uint8_t **const ptr, size_t *bytes_left)
     errno = 0;
 
     do {
+        if (*bytes_left == 0) {
+            errno = ERANGE;
+            warn("read_var_byte: bytes_left is 0");
+            return 0;
+        }
+
         tmp = **ptr;
         *ptr = *ptr + 1;
         *bytes_left = *bytes_left - 1;
@@ -3271,9 +3277,10 @@ done:
     if (!msg->retain || msg->topic->retained_message != msg) {
         DEC_REFCNT(&msg->topic->refcnt);
         msg->topic = NULL;
-    } else
-        dbg_printf("    dequeue_message: id=%d retained message (topic=%d)\n",
+    } else {
+        dbg_printf("     dequeue_message: id=%d retained message (topic=%d)\n",
                 msg->id, msg->topic->id);
+    }
     return 0;
 }
 
@@ -4323,7 +4330,7 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     errno = 0;
 
     length = 0;
-    length += 2; /* Packet Identifier */ 
+    length += 2; /* Packet Identifier */
 
     if (reason_code > 0) {
         length += 1; /* Reason Code */
@@ -4551,8 +4558,8 @@ static int send_cp_suback(struct client *client, uint16_t packet_id,
     ((struct mqtt_fixed_header *)ptr)->type = MQTT_CP_SUBACK;
     ptr++;
 
-    *ptr = length - sizeof(struct mqtt_fixed_header) - 1; /* Remaining Length */
-    ptr++;
+    memcpy(ptr, remlen, remlen_len);
+    ptr += remlen_len;
 
     tmp = htons(packet_id);
     memcpy(ptr, &tmp, 2);
@@ -4894,9 +4901,9 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     uint32_t subscription_identifier = 0;
     reason_code_t reason_code = MQTT_MALFORMED_PACKET;
     unsigned qos = 0;
-    const struct property *prop;
-    bool flag_retain;
-    size_t topic_name_length;
+    const struct property *prop = NULL;
+    bool flag_retain = false;
+    size_t topic_name_length = 0;
     uint16_t topic_alias = 0;
     [[maybe_unused]] bool flag_dup; /* TODO use this somehow! */
 
@@ -4978,9 +4985,9 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
             goto fail;
         }
 
-        if (prop->byte2 > MAX_TOPIC_ALIAS ||
+        if (prop->byte2 >= MAX_TOPIC_ALIAS ||
                 ((!topic_name_length) && client->clnt_topic_aliases[prop->byte2] == NULL)) {
-            dbg_printf("     handle_cp_publish: topic_alias is 0\n");
+            dbg_printf("     handle_cp_publish: topic_alias is too big\n");
             reason_code = MQTT_TOPIC_ALIAS_INVALID;
             goto fail;
         }
@@ -5065,6 +5072,7 @@ fail:
 
     if (topic_alias) {
         free((void *)client->clnt_topic_aliases[topic_alias]);
+        client->clnt_topic_aliases[topic_alias] = NULL;
         topic_alias = 0;
     }
 
@@ -5573,16 +5581,14 @@ version_fail:
         goto fail;
 
     if (client->client_id != NULL) {
+        logger(LOG_ERR, client, "client_id already set");
         errno = EEXIST;
         reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
-        warnx("client_id already set");
         goto fail;
     }
 
     if ((client->client_id = read_utf8(&ptr, &bytes_left)) == NULL)
         goto fail;
-    dbg_printf("[  ] handle_cp_connect: client_id=<%s> ",
-            (char *)client->client_id);
 
     /* [MQTT-3.1.3-5] */
     if (is_valid_connection_id(client->client_id) == -1) {
@@ -5590,6 +5596,9 @@ version_fail:
         reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
         goto fail;
     }
+    
+    dbg_printf("[  ] handle_cp_connect: client_id=<%s> ",
+            (char *)client->client_id);
 
     if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
         dbg_printf("clean_start ");
@@ -5655,8 +5664,9 @@ version_fail:
     if (will_qos > 2)
         goto fail;
 
-    if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG))
+    if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG)) {
         dbg_printf("will_qos [%u]\n", will_qos);
+    }
 
     /* FIXME */
     if (client->username && client->password)
@@ -6314,7 +6324,7 @@ static void tick_msg(struct message *msg)
             continue;
         }
 
-        if (mds->last_sent && (now - mds->last_sent < 5))
+        if (mds->last_sent && (now - mds->last_sent < 2))
             continue;
 
         if (mds->session == NULL || mds->message != msg) {
@@ -6478,7 +6488,7 @@ static void topic_tick(void)
         pthread_rwlock_wrlock(&topic->pending_queue_lock);
         for (struct message *msg = topic->pending_queue, *next; msg; msg = next)
         {
-            if (max_messages-- == 0)
+            if (--max_messages == 0)
                 break;
 
             next = msg->next_queue;
