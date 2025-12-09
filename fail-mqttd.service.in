@@ -1,0 +1,7 @@
+[Unit]
+Description=fail-mqttd
+
+[Service]
+Type=forking
+PIDFile=@@RUNSTATEDIR@@/fail-mqttd.pid
+ExecStart=@@SBINDIR@@/fail-mqttd -n -d -l nostdout,file=@@LOCALSTATEDIR@@/log/fail-mqttd.log

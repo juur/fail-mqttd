@@ -9,13 +9,13 @@ show_help()
 	cat <<EOF
 	Usage: configure [options]
 Configuration:
-  --help                    print this message
+  -h,--help                 print this message
   --version                 show version information
   --quiet                   supress output
   --target=TARGET           cross-compile target
 
 Program names:
-  --program-prefix=[PREFIX]
+  --program-prefix=PREFIX
 
 Directory and file names:
   --bindir=DIR
@@ -29,17 +29,18 @@ Directory and file names:
   --libexecdir=DIR
   --localedir=DIR
   --localstatedir=DIR
+  --runstatedir=DIR
   --mandir=DIR
   --prefix=DIR
   --sbindir=DIR
   --sharedstatedir=DIR
   --sysconfdir=DIR
-  --runstatedir=DIR
 
 Optional features:
+  --enable-dependency-tracking
   --disable-dependency-tracking
-  --enable-inet                   include support for IP-based features (default)
-  --disable-inet                  exclude support for IP-based features
+  --enable-debugging              enable debugging (unset NDEBUG)
+  --disable-debugging             disable debugging (set NDEBUG) (default)
 EOF
 }
 
@@ -52,7 +53,7 @@ EOF
 
 QUIET=0
 DEPS=1
-#FEATURE_INET=1
+FEATURE_DEBUG=0
 SAVED_ARGS="$*"
 
 while :; do
@@ -80,14 +81,14 @@ while :; do
 		--sharedstatedir=?*) SHAREDSTATEDIR=${1#*=} ;;
 		--sysconfdir=?*) SYSCONFDIR=${1#*=} ;;
 # These are added to keep RPM %configure error free
-		--build=?*) BUILD=${1#*=} ;;
-		--host=?*) HOST=${1#*=} ;;
+		--build=?*) ;; # BUILD=${1#*=} ;;
+		--host=?*) ;; # HOST=${1#*=} ;;
 		--program-prefix=?*) PROGPREFIX=${1#*=} ;;
 		--program-prefix=) PROGPREFIX= ;;
 		--disable-dependency-tracking) DEPS=0 ;;
 		--enable-dependency-tracking) DEPS=1 ;;
-#		--enable-inet) FEATURE_INET=1 ;;
-#		--disable-inet) FEATURE_INET=0 ;;
+		--enable-debugging) FEATURE_DEBUG=1 ;;
+		--disable-debugging) FEATURE_DEBUG=0 ;;
 		*) [[ -n "${1-}" ]] && { echo "Unknown argument ${1-}" >&2; exit 1; } ;;
 	esac
 	shift || break
@@ -109,6 +110,7 @@ fi
 
 # Default file locations, or use env provided ones
 
+PROGPREFIX=${PROGPREFIX:-}
 PREFIX=${PREFIX:-/usr/local}
 EXECPREFIX=${EXECPREFIX:-${PREFIX}}
 DATAROOTDIR=${DATAROOTDIR:-${PREFIX}/share}
@@ -233,7 +235,9 @@ check_func()
 check_yacc()
 {
 	local F
-	F=$(mktemp); trap "{ rm -f \"${F}\"; }" EXIT
+	F=$(mktemp)
+	# shellcheck disable=SC2064
+	trap "{ rm -f \"${F}\"; }" EXIT
 
 	# shellcheck disable=SC2086
 	echo -e '%%\nstart: ;\n%%\n' | \
@@ -247,7 +251,9 @@ check_yacc()
 check_lex()
 {
 	local F
-	F=$(mktemp); trap "{ rm -f \"${F}\"; }" EXIT
+	F=$(mktemp)
+	# shellcheck disable=SC2064
+	trap "{ rm -f \"${F}\"; }" EXIT
 
 	# shellcheck disable=SC2086
 	echo -e '%x TEMP\n%option stack bison-bridge reentrant\n%%\n. { ECHO; }\n%%\n' | \
@@ -384,13 +390,17 @@ if [[ "${LEX}" ]]; then
 	fi
 fi
 
-#if [[ FEATURE_INET -eq 1 ]]; then
-#	echo "#define ENABLE_INET 1" >> "${OBJDIR}"/config.h
-#fi
+if [[ "${FEATURE_DEBUG}" -eq 1 ]]; then
+	echo "#undef NDEBUG" >> "${OBJDIR}"/config.h
+fi
 
 # Finish config.h
-echo "#define SYSCONFDIR \"${SYSCONFDIR}\"" >> "${OBJDIR}"/config.h
-echo "#define RUNSTATEDIR \"${RUNSTATEDIR}\"" >> "${OBJDIR}"/config.h 
+{
+	echo "#define SYSCONFDIR \"${SYSCONFDIR}\""
+	echo "#define RUNSTATEDIR \"${RUNSTATEDIR}\""
+	echo "#define LOCALSTATEDIR \"${LOCALSTATEDIR}\"" 
+} >> "${OBJDIR}"/config.h
+
 printf "\n#endif\n" >> "${OBJDIR}"/config.h
 
 # Create Makefile from template
@@ -409,6 +419,7 @@ ARGS=$(cat <<- __END
 	s#@@RANLIB@@#${RANLIB}#;
 	s#@@LFLAGS@@#${LFLAGS}#;
 	s#@@YFLAGS@@#${YFLAGS}#;
+	s#@@RUNSTATEDIR@@#${RUNSTATEDIR}#;
 	s#@@DATADIR@@#${DATADIR}#;
 	s#@@DATAROOTDIR@@#${DATAROOTDIR}#;
 	s#@@EXECPREFIX@@#${EXECPREFIX}#;
@@ -429,6 +440,7 @@ ARGS=$(cat <<- __END
 	s#@@LEX@@#${LEX}#;
 	s#@@VERSION@@#${VERSION}#;
 	s#@@PACKAGE@@#${PACKAGE}#;
+	s#@@PROGPREFIX@@#${PROGPREFIX}#;
 __END
 )
 
@@ -436,7 +448,11 @@ sed "${ARGS}" <"${SRCDIR}"/Makefile.in >"${OBJDIR}"/Makefile
 
 echo "Creating ${PACKAGE}.spec"
 
-sed "${ARGS}" <"${SRCDIR}"/${PACKAGE}.spec.in > "${OBJDIR}"/"${PACKAGE}".spec
+sed "${ARGS}" <"${SRCDIR}"/"${PACKAGE}".spec.in > "${OBJDIR}"/"${PACKAGE}".spec
+
+echo "Creating ${PACKAGE}.service"
+
+sed "${ARGS}" <"${SRCDIR}"/"${PACKAGE}".service.in > "${OBJDIR}"/"${PACKAGE}".service
 
 echo "Creating config.status"
 

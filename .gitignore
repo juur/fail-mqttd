@@ -5,6 +5,12 @@ config.h*
 config.log
 Makefile
 config.status
+*.dir
+*.pag
+*.spec
+*.service
+*.xz
+.vscode/
 .d
 vgcore.*
 .clangd

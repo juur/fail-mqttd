@@ -27,19 +27,23 @@ PACKAGE         := $(shell $(CAT) "$(srcdir)/misc/PACKAGE")
 HELP2MAN		:= help2man
 DEPS			:= @@DEPS@@
 
-prefix      := @@PREFIX@@
-datarootdir := @@DATAROOTDIR@@
-datadir     := @@DATADIR@@
-exec_prefix := @@EXECPREFIX@@
-bindir      := @@BINDIR@@
-sbindir     := @@SBINDIR@@
-libexecdir  := @@LIBEXECDIR@@
-docdir		:= @@DOCDIR@@
-infodir     := @@INFODIR@@
-libdir      := @@LIBDIR@@
-mandir		:= @@MANDIR@@
-localedir	:= @@LOCALEDIR@@
-sysconfdir  := @@SYSCONFDIR@@
+bindir         := @@BINDIR@@
+datadir        := @@DATADIR@@
+datarootdir    := @@DATAROOTDIR@@
+docdir         := @@DOCDIR@@
+exec_prefix    := @@EXECPREFIX@@
+infodir        := @@INFODIR@@
+libdir         := @@LIBDIR@@
+libexecdir     := @@LIBEXECDIR@@
+localedir      := @@LOCALEDIR@@
+localstatedir  := @@LOCALSTATEDIR@@
+mandir         := @@MANDIR@@
+prefix         := @@PREFIX@@
+runstatedir    := @@RUNSTATEDIR@@
+sbindir        := @@SBINDIR@@
+sharedstatedir := @@SHAREDSTATEDIR@@
+sysconfdir     := @@SYSCONFDIR@@
+progprefix     := @@PROGPREFIX@@
 
 all_SRCS     := $(wildcard $(srcdir)/src/*.c)
 all_HEADERS  := $(wildcard $(srcdir)/src/*.h)
@@ -52,15 +56,15 @@ CPPFLAGS += -I$(objdir) -I$(srcdir)/src
 CPPFLAGS += -I$(srcdir)/include
 
 .PHONY: all
-all: $(objdir)/.d $(objdir)/$(PACKAGE) $(objdir)/$(PACKAGE).8
+all: $(objdir)/.d $(objdir)/$(progprefix)$(PACKAGE) $(objdir)/$(PACKAGE).8
 
 $(objdir)/.d:
 	@mkdir -p $(objdir)/.d 2>/dev/null
 
-$(objdir)/$(PACKAGE).8: $(objdir)/$(PACKAGE)
+$(objdir)/$(PACKAGE).8: $(objdir)/$(progprefix)$(PACKAGE)
 	-$(HELP2MAN) -N -s 8 -S 'ZeroDay Linux' --help-option=-h --version-option=-V -o $@ $<
 
-$(objdir)/$(PACKAGE): $(package_OBJS)
+$(objdir)/$(progprefix)$(PACKAGE): $(package_OBJS)
 	$(CC) $(package_OBJS) $(LDFLAGS) -o $@
 
 
@@ -68,8 +72,9 @@ $(objdir)/$(PACKAGE): $(package_OBJS)
 
 install: $(PACKAGE)
 	$(MKDIR) $(DESTDIR)$(sbindir)
+	$(MKDIR) $(DESTDIR)$(localstatedir)/fail-mqttd
 	$(MKDIR) $(DESTDIR)$(mandir)/man8
-	$(CP) $(objdir)/$(PACKAGE) $(DESTDIR)$(sbindir)/
+	$(CP) $(objdir)/$(progprefix)$(PACKAGE) $(DESTDIR)$(sbindir)/
 	$(CP) $(objdir)/$(PACKAGE).8 $(DESTDIR)$(mandir)/man8/
 
 uninstall:
@@ -89,7 +94,7 @@ dist:
 	$(TAR) -acf $(objdir)/$(PACKAGE)-$(VERSION).tar.xz \
 		--transform="s,^./,,;s,^,$(PACKAGE)-$(VERSION)/," \
 		README.md COPYING src misc Makefile.in configure include SECURITY.md \
-		$(PACKAGE).spec{,.in} ; \
+		$(PACKAGE).spec{,.in} $(PACKAGE).service{,.in} ; \
 	popd >/dev/null
 
 $(objdir)/%.o: $(srcdir)/src/%.c

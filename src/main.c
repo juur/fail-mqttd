@@ -131,6 +131,7 @@ static const uint32_t  MAX_SUB_IDENTIFIER    = 0xfffffff;
 static const uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
 
 static const char     *const PID_FILE        = RUNSTATEDIR "/fail-mqttd.pid";
+static const char     *const DEF_DB_PATH     = LOCALSTATEDIR "/fail-mqttd/";
 static const char      SHARED_PREFIX[]       = "$shared/";
 static const size_t    SHARED_PREFIX_LENGTH  = sizeof(SHARED_PREFIX);
 
@@ -186,6 +187,7 @@ static   bool        opt_logfilesync   = false;
 static   bool        opt_background    = false;
 static   bool        opt_openmetrics   = false;
 static   bool        opt_database      = true;
+static   const char *opt_statepath     = NULL;
 
 static struct in_addr opt_listen;
 static struct in_addr opt_om_listen;
@@ -7078,6 +7080,7 @@ int main(int argc, char *argv[])
 {
     opt_listen.s_addr = htonl(INADDR_LOOPBACK);
     opt_om_listen.s_addr = htonl(INADDR_LOOPBACK);
+    opt_statepath = DEF_DB_PATH;
 
     char *logfile_name = NULL;
 
@@ -7122,10 +7125,14 @@ int main(int argc, char *argv[])
             NULL,
         };
 
-        while ((opt = getopt(argc, argv, "hVp:H:l:do:n")) != -1)
+        while ((opt = getopt(argc, argv, "hVp:H:l:do:nD:")) != -1)
         {
             switch (opt)
             {
+                case 'D':
+                    if ((opt_statepath = strdup(optarg)) == NULL)
+                        err(EXIT_FAILURE, "main: strdup(optarg)");
+                    break;
                 case 'n':
                     opt_database = false;
                     break;

@@ -1,9 +1,10 @@
 Name: fail-mqttd
 Version: @@VERSION@@
-Release: 1
+Release: 1%{?dist}
 Summary: fail-mqttd -- a terrible MQTT version 5.0 broker
 License: MIT
 Source0: %{name}-%{version}.tar.xz
+BuildRequires: systemd-rpm-macros
 
 %description
 fail-mqttd is a terrible MQTT version 5.0 broker
@@ -17,9 +18,21 @@ fail-mqttd is a terrible MQTT version 5.0 broker
 
 %install
 %make_install
+install -D -m 644 -D %{name}.service %{buildroot}%{_unitdir}/%{name}.service
+
+%post
+%systemd_post %{name}.service
+
+%preun
+%systemd_preun %{name}.service
+
+%postun
+%systemd_postun_with_restart %{name}.service
 
 %files
 %doc README.md SECURITY.md
 %license COPYING
 %{_mandir}/man?/*
 %{_sbindir}/*
+%{_unitdir}/fail-mqttd.service
+%dir %{_localstatedir}/*

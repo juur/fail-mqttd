@@ -11,6 +11,13 @@
 #include <arpa/inet.h>
 #include <stdbool.h>
 
+#if defined __has_attribute
+# if __has_attribute (counted_by)
+# else
+#  define counted_by(x)
+# endif
+#endif
+
 struct mqtt_fixed_header {
     unsigned flags:4;
     unsigned type:4;
