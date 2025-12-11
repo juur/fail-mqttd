@@ -89,6 +89,8 @@ while :; do
 		--enable-dependency-tracking) DEPS=1 ;;
 		--enable-debugging) FEATURE_DEBUG=1 ;;
 		--disable-debugging) FEATURE_DEBUG=0 ;;
+		--enable-threads) FEATURE_THREADS=1 ;;
+		--disable-threads) FEATURE_THREADS=0 ;;
 		*) [[ -n "${1-}" ]] && { echo "Unknown argument ${1-}" >&2; exit 1; } ;;
 	esac
 	shift || break
@@ -399,6 +401,8 @@ fi
 	echo "#define SYSCONFDIR \"${SYSCONFDIR}\""
 	echo "#define RUNSTATEDIR \"${RUNSTATEDIR}\""
 	echo "#define LOCALSTATEDIR \"${LOCALSTATEDIR}\"" 
+	echo "#define FEATURE_THREADS 1"
+	echo "#define FEATURE_DEBUG 1"
 } >> "${OBJDIR}"/config.h
 
 printf "\n#endif\n" >> "${OBJDIR}"/config.h

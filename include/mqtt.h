@@ -357,7 +357,7 @@ struct message {
     uint8_t format;
     size_t payload_len;
     unsigned qos;
-    message_state_t state;
+    _Atomic message_state_t state;
     message_type_t type;
     bool retain;
     uint8_t uuid[UUID_SIZE];
@@ -431,7 +431,7 @@ struct session {
     bool request_response_information;
     bool request_problem_information;
 
-    session_state_t state;
+    _Atomic session_state_t state;
 
     /* Will Flag handling */
     struct topic *will_topic;
@@ -450,6 +450,7 @@ struct session {
 struct client {
     struct client *next;
     id_t id;
+    pthread_t owner;
     struct session *session;
 
     pthread_rwlock_t active_packets_lock;
@@ -458,7 +459,7 @@ struct client {
     const uint8_t *client_id;
     const uint8_t *username;
     const uint8_t *password;
-    client_state_t state;
+    _Atomic client_state_t state;
     int fd;
 
     /* host byte order */
@@ -483,7 +484,7 @@ struct client {
     /* used by parse_incoming() */
     uint8_t *packet_buf;
     struct packet *new_packet;
-    read_state_t parse_state;
+    _Atomic read_state_t parse_state;
     unsigned packet_offset;
     unsigned read_offset;
     unsigned read_need;
@@ -520,7 +521,7 @@ struct topic {
     struct message *pending_queue;
     //pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;
-    topic_state_t state;
+    _Atomic topic_state_t state;
     _Atomic unsigned refcnt;
 };
 

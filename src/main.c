@@ -46,19 +46,23 @@
 
 #ifndef NDEBUG
 # define CRESET "\x1b[0m"
-# define BBLK "\x1b[1;30m"
-# define BRED "\x1b[1;31m"
-# define NRED "\x1b[0;31m"
-# define BGRN "\x1b[1;32m"
-# define NGRN "\x1b[0;32m"
-# define BYEL "\x1b[1;33m"
-# define NYEL "\x1b[0;33m"
+
 # define BBLU "\x1b[1;34m"
-# define BMAG "\x1b[1;35m"
-# define NMAG "\x1b[0;35m"
 # define BCYN "\x1b[1;36m"
-# define NCYN "\x1b[1;36m"
+# define BGRN "\x1b[1;32m"
+# define BMAG "\x1b[1;35m"
+# define BRED "\x1b[1;31m"
 # define BWHT "\x1b[1;37m"
+# define BYEL "\x1b[1;33m"
+
+# define NBLU "\x1b[0;34m"
+# define NCYN "\x1b[0;36m"
+# define NGRN "\x1b[0;32m"
+# define NMAG "\x1b[0;35m"
+# define NRED "\x1b[0;31m"
+# define NWHT "\x1b[0;37m"
+# define NYEL "\x1b[0;33m"
+
 #endif
 
 #ifdef HAVE_STDATOMIC_H
@@ -83,7 +87,7 @@
 # define INC_REFCNT(x) x++
 #endif /* HAVE_STDATOMIC_H */
 
-#ifdef WITH_THREADS
+#ifdef FEATURE_THREADS
 # define RETURN_TYPE void *
 #else
 # define RETURN_TYPE int
@@ -156,13 +160,20 @@ static struct session *global_session_list            = NULL;
 static struct message_delivery_state *global_mds_list = NULL;
 static struct subscription *global_subscription_list  = NULL;
 
-static unsigned num_clients       = 0;
-static unsigned num_messages      = 0;
-static unsigned num_packets       = 0;
-static unsigned num_topics        = 0;
-static unsigned num_sessions      = 0;
-static unsigned num_mds           = 0;
-static unsigned num_subscriptions = 0;
+static _Atomic unsigned num_clients       = 0;
+static _Atomic unsigned num_messages      = 0;
+static _Atomic unsigned num_packets       = 0;
+static _Atomic unsigned num_topics        = 0;
+static _Atomic unsigned num_sessions      = 0;
+static _Atomic unsigned num_mds           = 0;
+static _Atomic unsigned num_subscriptions = 0;
+
+static _Atomic unsigned long total_messages_accepted_at = 0;
+static _Atomic unsigned long total_messages_acknowledged_at = 0;
+static _Atomic unsigned long total_messages_released_at = 0;
+static _Atomic unsigned long total_messages_completed_at = 0;
+
+static _Atomic bool has_clients = false;
 
 /*
  * databases
@@ -207,7 +218,8 @@ static struct in_addr opt_om_listen;
 [[gnu::nonnull(3),gnu::format(printf,3,4)]] static void logger(int priority, const struct client *client, const char *format, ...);
 [[gnu::nonnull(1),gnu::warn_unused_result]] static struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE]);
 [[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe_from_topics(struct session *session, const struct topic_sub_request *request);
-static int unsubscribe_session_from_all(struct session *session);
+[[gnu::nonnull]] static int unsubscribe_session_from_all(struct session *session);
+[[gnu::nonnull]] static int find_str(const char *const *lookup, const char *value, int max);
 
 /*
  * command line stuff
@@ -273,11 +285,170 @@ static void show_usage(FILE *fp, const char *name)
             );
 }
 
+static char *logfile_name = NULL;
+
+static void parse_cmdline(int argc, char *argv[])
+{
+    int opt;
+    char *subopts;
+    char *value;
+
+    enum {
+        LOGGER_SYSLOG = 0,
+        LOGGER_FILE,
+        LOGGER_STDOUT,
+        LOGGER_NOSTDOUT,
+        LOGGER_LEVEL,
+        LOGGER_APPEND,
+        LOGGER_SYNC,
+    };
+
+    char *const logger_token[] = {
+        [LOGGER_SYSLOG] = "syslog",
+        [LOGGER_FILE] = "file",
+        [LOGGER_STDOUT] = "stdout",
+        [LOGGER_NOSTDOUT] = "nostdout",
+        [LOGGER_LEVEL] = "level",
+        [LOGGER_APPEND] = "append",
+        [LOGGER_SYNC] = "sync",
+        NULL
+    };
+
+    enum {
+        OM_ENABLE = 0,
+        OM_DISABLE,
+        OM_PORT,
+        OM_BIND,
+    };
+
+    char *const om_token[] = {
+        [OM_ENABLE] = "enable",
+        [OM_DISABLE] = "disable",
+        [OM_PORT] = "port",
+        [OM_BIND] = "bind",
+        NULL,
+    };
+
+    while ((opt = getopt(argc, argv, "hVp:H:l:do:nD:")) != -1)
+    {
+        switch (opt)
+        {
+            case 'D':
+                if ((opt_statepath = strdup(optarg)) == NULL)
+                    err(EXIT_FAILURE, "main: strdup(optarg)");
+                break;
+            case 'n':
+                opt_database = false;
+                break;
+            case 'd':
+                opt_background = true;
+                break;
+            case 'o':
+                subopts = optarg;
+                while (*subopts != '\0') {
+                    switch(getsubopt(&subopts, om_token, &value))
+                    {
+                        case OM_ENABLE:
+                            opt_openmetrics = true;
+                            break;
+                        case OM_DISABLE:
+                            opt_openmetrics = false;
+                            break;
+                        case OM_PORT:
+                            if (value == NULL)
+                                goto shit_usage;
+                            int tmp = atoi(value);
+                            if (tmp == 0 || tmp > USHRT_MAX)
+                                goto shit_usage;
+                            opt_om_port = tmp;
+                            break;
+                        case OM_BIND:
+                            if (value == NULL)
+                                goto shit_usage;
+                            if (inet_pton(AF_INET, value, &opt_om_listen) == -1)
+                                goto shit_usage;
+                            break;
+                        default:
+                            goto shit_usage;
+                    }
+                }
+                break;
+            case 'l':
+                subopts = optarg;
+                while (*subopts != '\0') {
+                    switch(getsubopt(&subopts, logger_token, &value))
+                    {
+                        case LOGGER_SYSLOG:
+                            opt_logsyslog = true;
+                            break;
+                        case LOGGER_FILE:
+                            if (value == NULL)
+                                goto shit_usage;
+                            logfile_name = value;
+                            break;
+                        case LOGGER_STDOUT:
+                            opt_logstdout = true;
+                            break;
+                        case LOGGER_NOSTDOUT:
+                            opt_logstdout = false;
+                            break;
+                        case LOGGER_LEVEL:
+                            if (value == NULL)
+                                goto shit_usage;
+                            if (!strcmp(value, "?")) {
+                                for (unsigned idx = 0; priority_str[idx]; idx++)
+                                    printf("%s\n", priority_str[idx]);
+                                exit(EXIT_SUCCESS);
+                            }
+                            if ((opt_loglevel = find_str(priority_str, value, 0)) == -1)
+                                goto shit_usage;
+                            break;
+                        case LOGGER_SYNC:
+                            opt_logfilesync = true;
+                            break;
+                        case LOGGER_APPEND:
+                            opt_logfileappend = true;
+                            break;
+                        default:
+                            goto shit_usage;
+                    }
+                }
+                break;
+            case 'H':
+                if (inet_pton(AF_INET, optarg, &opt_listen) == -1) {
+                    warn("main: inet_pton");
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            case 'p':
+                int tmp = atoi(optarg);
+                if (tmp == 0 || tmp > USHRT_MAX) {
+                    show_usage(stderr, argv[0]);
+                    exit(EXIT_FAILURE);
+                }
+                opt_port = tmp;
+                break;
+            case 'h':
+                show_usage(stdout, argv[0]);
+                exit(EXIT_SUCCESS);
+            case 'V':
+                show_version(stdout);
+                exit(EXIT_SUCCESS);
+            default:
+shit_usage:
+                show_usage(stderr, argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
+}
+
 /*
  * debugging helpers
  */
 
+[[gnu::nonnull(6,7)]]
 static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die,
+        struct client *client,
         const char *file, const char *func, int line)
 {
     static const char *const read_error_fmt = "%s: read error at %s:%u: %s";
@@ -288,6 +459,10 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
             err(EXIT_FAILURE, read_error_fmt, func, file, line, msg ? msg : "");
 
         warn(read_error_fmt, func, file, line, msg ? msg : "");
+
+        if (client)
+            client->state = CS_CLOSED;
+
         return -1;
     }
 
@@ -299,7 +474,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected, bool die
     errno = ERANGE;
     return -1;
 }
-#define log_io_error(m,r,e,d) _log_io_error(m,r,e,d,__FILE__,__func__,__LINE__)
+#define log_io_error(m,r,e,d,c) _log_io_error(m,r,e,d,c,__FILE__,__func__,__LINE__)
 
 #ifndef NDEBUG
 static const char *uuid_to_string(const uint8_t uuid[const static UUID_SIZE])
@@ -347,6 +522,38 @@ static void dump_clients(void)
               );
     }
     pthread_rwlock_unlock(&global_clients_lock);
+}
+
+static void sock_linger(int fd)
+{
+    struct linger linger = {
+        .l_onoff = 0,
+        .l_linger = 0,
+    };
+
+    if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger,
+                sizeof(linger)) == -1)
+        warn("setsockopt(SO_LINGER, mother)");
+}
+
+static void sock_reuse(int fd, int reuse)
+{
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                sizeof(reuse)) == -1)
+        warn("setsockopt(SO_REUSEADDR, mother)");
+}
+
+static void sock_nonblock(int fd)
+{
+    int flags;
+
+    if ((flags = fcntl(fd, F_GETFL)) == -1) {
+        warn("main: fcntl(mother_fd, get)");
+    } else {
+        flags |= O_NONBLOCK;
+        if (fcntl(fd, F_SETFL, flags) == -1)
+            warn("main: fcntl(mother_fd, set)");
+    }
 }
 
 /*
@@ -465,6 +672,7 @@ static void http_error(FILE *out, int error)
            );
 }
 
+[[gnu::warn_unused_result]]
 static int openmetrics_export(int fd)
 {
     FILE *mem = NULL, *in = NULL;
@@ -600,6 +808,14 @@ static int openmetrics_export(int fd)
             "num_packets %u\n"
             "# TYPE num_subscriptions gauge\n"
             "num_subscriptions %u\n"
+            "# TYPE total_messages_accepted_at counter\n"
+            "total_messages_accepted_at %lu\n"
+            "# TYPE total_messages_completed_at counter\n"
+            "total_messages_completed_at %lu\n"
+            "# TYPE total_messages_released_at counter\n"
+            "total_messages_released_at %lu\n"
+            "# TYPE total_messages_accepted_at counter\n"
+            "total_messages_accepted_at %lu\n"
             ,
             num_sessions,
             num_clients,
@@ -607,7 +823,11 @@ static int openmetrics_export(int fd)
             num_topics,
             num_mds,
             num_packets,
-            num_subscriptions
+            num_subscriptions,
+            total_messages_accepted_at,
+            total_messages_completed_at,
+            total_messages_released_at,
+            total_messages_acknowledged_at
            );
 
 #if 0
@@ -765,8 +985,10 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
 
         if (remove_delivery_state(&mds->message->delivery_states,
                     &mds->message->num_message_delivery_states, mds) == -1) {
-            warn("mds_detach_and_free: remove_delivery_state(message)");
-            rc = -1;
+            if (errno != ENOENT) {
+                warn("mds_detach_and_free: remove_delivery_state(message)");
+                rc = -1;
+            }
         }
 
         if (message_lock)
@@ -964,8 +1186,8 @@ static void free_topic(struct topic *topic)
     }
 
     /* Do this hear, as free_message() etc. above may have changed refcnt */
+    pthread_rwlock_wrlock(&global_topics_lock);
     if (GET_REFCNT(&topic->refcnt) == 0) {
-        pthread_rwlock_wrlock(&global_topics_lock);
         if (global_topic_list == topic) {
             global_topic_list = topic->next;
         } else for (struct topic *tmp = global_topic_list; tmp; tmp = tmp->next)
@@ -975,9 +1197,9 @@ static void free_topic(struct topic *topic)
                 break;
             }
         }
-        pthread_rwlock_unlock(&global_topics_lock);
         topic->next = NULL;
     }
+    pthread_rwlock_unlock(&global_topics_lock);
 
     if (GET_REFCNT(&topic->refcnt) > 0)
         return;
@@ -1109,6 +1331,9 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
         return;
     }
 
+    if (need_lock)
+        pthread_rwlock_wrlock(&global_packets_lock);
+
     if (pck->owner) {
         if (need_owner_lock)
             pthread_rwlock_wrlock(&pck->owner->active_packets_lock);
@@ -1128,8 +1353,6 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
         pck->owner = NULL;
     }
 
-    if (need_lock)
-        pthread_rwlock_wrlock(&global_packets_lock);
     if (pck == global_packet_list) {
         global_packet_list = pck->next;
     } else for (tmp = global_packet_list; tmp; tmp = tmp->next)
@@ -1139,9 +1362,10 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
             break;
         }
     }
+    pck->next = NULL;
+    
     if (need_lock)
         pthread_rwlock_unlock(&global_packets_lock);
-    pck->next = NULL;
 
     if (pck->payload) {
         free(pck->payload);
@@ -1193,8 +1417,6 @@ static void free_message(struct message *msg, bool need_lock)
             );
 
     if ((lck = GET_REFCNT(&msg->refcnt)) > 0) {
-        warnx("free_message: attempt to free message with refcnt=%u", lck);
-        abort();
         return;
     }
 
@@ -1227,13 +1449,15 @@ static void free_message(struct message *msg, bool need_lock)
         msg->payload = NULL;
     }
 
-    if (msg->delivery_states) {
-        free_delivery_states(&msg->delivery_states_lock,
-                &msg->num_message_delivery_states, &msg->delivery_states);
-        msg->delivery_states = NULL;
-    }
+    if (running)
+        if (msg->delivery_states) {
+            free_delivery_states(&msg->delivery_states_lock,
+                    &msg->num_message_delivery_states, &msg->delivery_states);
+            msg->delivery_states = NULL;
+        }
 
-    pthread_rwlock_destroy(&msg->delivery_states_lock);
+    if (pthread_rwlock_destroy(&msg->delivery_states_lock) == -1)
+        warn("free_message: pthread_rwlock_destroy");
 
     if (msg->type == MSG_WILL && msg->sender) {
         msg->sender->will_topic = NULL;
@@ -1367,7 +1591,7 @@ static void free_client(struct client *client, bool needs_lock)
     free(client);
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static void free_session(struct session *session, bool need_lock)
 {
     struct session *tmp;
@@ -1390,12 +1614,13 @@ static void free_session(struct session *session, bool need_lock)
     pthread_rwlock_unlock(&session->subscriptions_lock);
 
     /* TODO do this properly */
-    if (session->delivery_states && session->num_message_delivery_states) {
-        dbg_printf("     free_session: num_mds=%u\n", session->num_message_delivery_states);
-        free_delivery_states(&session->delivery_states_lock,
-                &session->num_message_delivery_states, &session->delivery_states);
-        session->delivery_states = NULL;
-    }
+    if (running)
+        if (session->delivery_states && session->num_message_delivery_states) {
+            dbg_printf("     free_session: num_mds=%u\n", session->num_message_delivery_states);
+            free_delivery_states(&session->delivery_states_lock,
+                    &session->num_message_delivery_states, &session->delivery_states);
+            session->delivery_states = NULL;
+        }
 
     if (GET_REFCNT(&session->refcnt) > 0) {
         dbg_printf("     free_session: refcnt != 0\n");
@@ -1450,6 +1675,11 @@ static void free_session(struct session *session, bool need_lock)
         session->client_id = NULL;
     }
 
+    if (session->delivery_states) {
+        free(session->delivery_states);
+        session->delivery_states = NULL;
+    }
+
 
     pthread_rwlock_destroy(&session->subscriptions_lock);
     pthread_rwlock_destroy(&session->delivery_states_lock);
@@ -1458,7 +1688,7 @@ static void free_session(struct session *session, bool need_lock)
     free(session);
 }
 
-    [[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
+[[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
 static struct message_delivery_state *alloc_message_delivery_state(
         struct message *message, struct session *session)
 {
@@ -1492,7 +1722,7 @@ fail:
     return NULL;
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static int add_session_to_shared_sub(struct subscription *sub,
         struct session *session, uint8_t qos)
 {
@@ -1609,7 +1839,10 @@ static struct session *alloc_session(struct client *client)
         ret->client_id = (void *)strdup((const char *)client->client_id);
     }
 
-    pthread_rwlock_wrlock(&global_sessions_lock);
+    if (pthread_rwlock_wrlock(&global_sessions_lock) == -1) {
+        warn("alloc_session: pthread_rwlock_wrlock");
+        goto fail;
+    }
     ret->next = global_session_list;
     global_session_list = ret;
     num_sessions++;
@@ -2807,10 +3040,15 @@ static void save_all_topics(void)
 
 static void free_all_message_delivery_states(void)
 {
+    struct message_delivery_state *mds, *next;
+
     dbg_printf("     "BYEL"free_all_message_delivery_states"CRESET"\n");
     /* don't bother locking this late in tear down */
-    while (global_mds_list)
-        mds_detach_and_free(global_mds_list, false, false);
+    for (mds = global_mds_list; mds; mds = next)
+    {
+        next = mds->next;
+        mds_detach_and_free(mds, false, false);
+    }
 }
 
 static void free_all_sessions(void)
@@ -2818,6 +3056,13 @@ static void free_all_sessions(void)
     dbg_printf("     "BYEL"free_all_sessions"CRESET"\n");
     while (global_session_list)
         free_session(global_session_list, true);
+}
+
+static void free_all_messages_two(void)
+{
+    dbg_printf("     "BYEL"free_all_messages_two"CRESET"\n");
+    while (global_message_list)
+        free_message(global_message_list, true);
 }
 
 static void free_all_messages(void)
@@ -2971,7 +3216,7 @@ fail:
 }
 
 [[gnu::nonnull]]
-static struct subscription *find_subscription(const struct session * /* session */,
+static struct subscription *find_subscription(const struct session *session,
         const uint8_t *topic_filter)
 {
     struct subscription *tmp;
@@ -2985,6 +3230,8 @@ static struct subscription *find_subscription(const struct session * /* session 
         switch(tmp->type)
         {
             case SUB_NON_SHARED:
+                if (session != tmp->non_shared.session)
+                    continue;
                 break;
 
             default:
@@ -3758,6 +4005,7 @@ static int mark_one_mds(struct message_delivery_state *mds,
             mds->client_reason = client_reason;
             if (client->send_quota < MAX_RECEIVE_PUBS)
                 client->send_quota++;
+            total_messages_acknowledged_at++;
             break;
 
         case MQTT_CP_PUBREC: /* QoS=2 */
@@ -3773,6 +4021,7 @@ static int mark_one_mds(struct message_delivery_state *mds,
             if (mds->released_at)
                 warnx("mark_message: duplicate release");
             mds->released_at = now;
+            total_messages_released_at++;
             break;
 
         case MQTT_CP_PUBCOMP: /* QoS=2 */
@@ -3781,6 +4030,7 @@ static int mark_one_mds(struct message_delivery_state *mds,
             mds->completed_at = now;
             if (client->send_quota < MAX_RECEIVE_PUBS)
                 client->send_quota++;
+            total_messages_completed_at++;
             break;
 
         default:
@@ -3906,7 +4156,6 @@ static int send_cp_publish(struct packet *pkt)
     dbg_printf("[%2d] send_cp_publish: owner=<%s>\n",
             pkt->owner->session->id, (char *)pkt->owner->client_id);
 
-    errno = 0;
     packet = NULL;
     msg = pkt->message;
 
@@ -3981,6 +4230,7 @@ static int send_cp_publish(struct packet *pkt)
 
     /* [MQTT-4.9.0-2] */
     if (msg->qos && --pkt->owner->send_quota == 0) {
+        errno = EDQUOT;
         reason_code = MQTT_RECEIVE_MAXIMUM_EXCEEDED;
         goto fail;
     }
@@ -3988,7 +4238,7 @@ static int send_cp_publish(struct packet *pkt)
     /* Now send the packet */
     if ((wr_len = write(pkt->owner->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, pkt->owner);
     }
 
 skip_write:
@@ -4041,7 +4291,7 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     dbg_printf("[%2d] send_cp_disconnect: sent code was %u\n",
@@ -4078,7 +4328,7 @@ static int send_cp_pingresp(struct client *client)
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     /* last_keep_alive is updated in parse_incoming after
@@ -4163,7 +4413,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     /* Now send the packet */
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     free(packet);
@@ -4227,7 +4477,7 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     free(packet);
@@ -4285,7 +4535,7 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     pthread_rwlock_wrlock(&client->session->delivery_states_lock);
@@ -4366,7 +4616,7 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     /* TODO update status thing */
@@ -4417,7 +4667,7 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     free(packet);
@@ -4491,7 +4741,7 @@ static int send_cp_unsuback(struct client *client, uint16_t packet_id,
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     free(packet);
@@ -4579,7 +4829,7 @@ static int send_cp_suback(struct client *client, uint16_t packet_id,
 
     if ((wr_len = write(client->fd, packet, length)) != length) {
         free(packet);
-        return log_io_error(NULL, wr_len, length, false);
+        return log_io_error(NULL, wr_len, length, false, client);
     }
 
     free(packet);
@@ -5034,6 +5284,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     const time_t now = time(NULL);
 
     msg->sender_status.accepted_at = now;
+    total_messages_accepted_at++;
 
     if (qos == 0) {
         msg->sender_status.acknowledged_at = now;
@@ -5507,6 +5758,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     const struct property *prop;
     bool reconnect = false;
     bool clean = false;
+    bool unlock = false;
 
     uint8_t *will_topic = NULL;
     uint8_t will_qos = 0;
@@ -5598,7 +5850,7 @@ version_fail:
         reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
         goto fail;
     }
-    
+
     dbg_printf("[  ] handle_cp_connect: client_id=<%s> ",
             (char *)client->client_id);
 
@@ -5670,6 +5922,8 @@ version_fail:
         dbg_printf("will_qos [%u]\n", will_qos);
     }
 
+    dbg_printf("\n");
+
     /* FIXME */
     if (client->username && client->password)
         client->is_auth = true;
@@ -5686,6 +5940,7 @@ version_fail:
     client->protocol_version = protocol_version;
     client->keep_alive = keep_alive;
 
+
     if ((client->session = find_session(client)) == NULL) {
         /* New Session */
         dbg_printf(BWHT"     handle_cp_connect: no existing session"CRESET"\n");
@@ -5697,7 +5952,11 @@ create_new_session:
             goto fail;
         }
         dbg_printf("[%2d] handle_cp_connect: new session\n", client->session->id);
+        pthread_rwlock_wrlock(&global_sessions_lock);
+        unlock = true;
     } else {
+        pthread_rwlock_wrlock(&global_sessions_lock);
+        unlock = true;
         /* Existing Session */
         dbg_printf(BWHT"[%2d] handle_cp_connect: has existing session"CRESET"\n",
                 client->session->id);
@@ -5831,10 +6090,14 @@ create_new_session:
             reconnect ? " (reconnect)" : "",
             clean ? " (clean_start)" : "",
             (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) ? " (will)" : "");
+    pthread_rwlock_unlock(&global_sessions_lock);
 
     return 0;
 
 fail:
+    if (unlock)
+        pthread_rwlock_unlock(&global_sessions_lock);
+
     if (send_cp_connack(client, reason_code) == -1) {
         client->state = CS_CLOSING;
         if (client->disconnect_reason == 0)
@@ -5847,6 +6110,8 @@ fail:
         free_properties(will_props, num_will_props);
     if (will_payload)
         free(will_payload);
+    if (client->session && client->session->state == SESSION_NEW)
+        close_session(client->session);
 
     if (errno == 0)
         errno = EINVAL;
@@ -5978,7 +6243,7 @@ more:
             if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
                 return 0;
             } else if (rd_len == -1) {
-                log_io_error(NULL, rd_len, client->read_need, false);
+                log_io_error(NULL, rd_len, client->read_need, false, NULL);
                 goto eof;
             } else if (rd_len == 0) {
 eof:
@@ -6093,7 +6358,7 @@ readbody:
             if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 return 0;
             } else if (rd_len == -1) {
-                log_io_error(NULL, rd_len, client->read_need, false);
+                log_io_error(NULL, rd_len, client->read_need, false, NULL);
                 goto fail;
             } else if (rd_len == 0) {
                 goto eof;
@@ -6117,7 +6382,14 @@ exec_control:
 
             /* [MQTT-3.1.4-6] - maybe */
             if (!control_functions[client->new_packet->type].needs_auth ||
-                    client->is_auth)
+                    client->is_auth) {
+                bool unlock = false;
+
+                if (client->session) {
+                    pthread_rwlock_rdlock(&global_sessions_lock);
+                    unlock = true;
+                }
+
                 if (control_functions[client->new_packet->type].func(client,
                             client->new_packet, client->packet_buf) == -1) {
                     warn("control_function");
@@ -6125,17 +6397,25 @@ exec_control:
                         reason_code = client->disconnect_reason;
                     if (errno == EPIPE)
                         client->state = CS_CLOSED;
+                    if (unlock)
+                        pthread_rwlock_unlock(&global_sessions_lock);
                     goto fail;
                 }
+                if (unlock)
+                    pthread_rwlock_unlock(&global_sessions_lock);
+            }
             client->last_keep_alive = time(NULL);
 
+            /* If we don't lock here, there is a race between refcnt-- & free_packet() */
+            pthread_rwlock_wrlock(&global_packets_lock);
             if (IF_DEC_REFCNT(&client->new_packet->refcnt) == 1) {
-                free_packet(client->new_packet, true, true);
+                free_packet(client->new_packet, false, true);
             } else {
                 dbg_printf("[%2d] parse_incoming: can't free packet refcnt>0\n",
                         client->session ? client->session->id : (id_t)-1);
             }
             client->new_packet = NULL;
+            pthread_rwlock_unlock(&global_packets_lock);
 
             break;
         case READ_STATE_MAX:
@@ -6338,6 +6618,12 @@ static void tick_msg(struct message *msg)
         if (mds->session->client == NULL) {
             continue;
         }
+
+        if (mds->session->state != SESSION_ACTIVE)
+            continue;
+
+        if (mds->session->client->state != CS_ACTIVE)
+            continue;
 
         dbg_printf(BGRN
                 "     tick_msg: sending message: id=%d subscriber.id=%d <%s> ackat=%lu lastsent=%lu"
@@ -6666,11 +6952,16 @@ static void packet_tick(void)
 
 static void tick(void)
 {
-    session_tick();
-    client_tick();
-    topic_tick();
-    message_tick();
-    packet_tick();
+    if (num_sessions)
+        session_tick();
+    if (num_clients)
+        client_tick();
+    if (num_topics)
+        topic_tick();
+    if (num_messages)
+        message_tick();
+    if (num_packets)
+        packet_tick();
 }
 
 struct start_args {
@@ -6678,13 +6969,13 @@ struct start_args {
     int om_fd;
 };
 
-#ifdef WITH_THREADS
+#ifdef FEATURE_THREADS
 static void *tick_loop(void * /* arg */)
 {
     while (running)
     {
         const struct timespec req = {
-            .tv_sec = 0,
+            .tv_sec = 1,
             .tv_nsec = 100000000,
         };
         nanosleep(&req, NULL);
@@ -6697,7 +6988,7 @@ static void *tick_loop(void * /* arg */)
 }
 #endif
 
-#ifdef WITH_THREADS
+#ifdef FEATURE_THREADS
 static RETURN_TYPE om_loop(void *start_args)
 {
     const int om_fd = ((const struct start_args *)start_args)->om_fd;
@@ -6743,7 +7034,6 @@ static RETURN_TYPE om_loop(void *start_args)
 
 static RETURN_TYPE main_loop(void *start_args)
 {
-    bool has_clients;
     fd_set fds_in, fds_out, fds_exc;
     int mother_fd = ((const struct start_args *)start_args)->fd;
     int om_fd = ((const struct start_args *)start_args)->om_fd;
@@ -6764,25 +7054,30 @@ static RETURN_TYPE main_loop(void *start_args)
 
         has_clients = false;
 
-        pthread_rwlock_rdlock(&global_clients_lock);
-        for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
-        {
-            if (clnt->state == CS_NEW || clnt->state == CS_DISCONNECTED ||
-                    clnt->fd == -1)
-                continue;
+        if (num_clients) {
+            pthread_rwlock_rdlock(&global_clients_lock);
+            for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
+            {
+                if (clnt->state == CS_NEW || clnt->state == CS_DISCONNECTED ||
+                        clnt->fd == -1)
+                    continue;
 
-            if (clnt->fd > max_fd)
-                max_fd = clnt->fd;
+                if (clnt->owner != pthread_self())
+                    continue;
 
-            FD_SET(clnt->fd, &fds_in);
-            FD_SET(clnt->fd, &fds_out);
-            FD_SET(clnt->fd, &fds_exc);
+                if (clnt->fd > max_fd)
+                    max_fd = clnt->fd;
 
-            has_clients = true;
+                FD_SET(clnt->fd, &fds_in);
+                FD_SET(clnt->fd, &fds_out);
+                FD_SET(clnt->fd, &fds_exc);
+
+                has_clients = true;
+            }
+            pthread_rwlock_unlock(&global_clients_lock);
         }
-        pthread_rwlock_unlock(&global_clients_lock);
 
-        tv.tv_sec = 0;
+        tv.tv_sec = 1;
 
         if (has_clients == false) {
             tv.tv_usec = 100000;
@@ -6795,14 +7090,14 @@ static RETURN_TYPE main_loop(void *start_args)
              * writes and b) avoid select instantly returning (as any
              * non-blocking writable fd seems to terminate the select,
              * i.e. all of them */
-            tv.tv_sec = 0;
+            tv.tv_sec = 1;
             tv.tv_usec = 1000;
             select(max_fd + 1, NULL, &fds_out, NULL, &tv);
         }
 
         if (rc == 0) {
             /* a timeout occured, but no fds */
-#ifndef WITH_THREADS
+#ifndef FEATURE_THREADS
             goto tick_me;
 #endif
         } else if (rc == -1 && (errno == EAGAIN || errno == EINTR)) {
@@ -6810,7 +7105,7 @@ static RETURN_TYPE main_loop(void *start_args)
             continue;
         } else if (rc == -1) {
             warn("main_loop: select");
-#ifdef WITH_THREADS
+#ifdef FEATURE_THREADS
             pthread_exit(&errno);
 #else
             running = false;
@@ -6822,8 +7117,10 @@ static RETURN_TYPE main_loop(void *start_args)
             int tmp_fd;
 
             if ((tmp_fd = accept(om_fd, NULL, NULL)) != -1) {
-                openmetrics_export(tmp_fd);
-                close(tmp_fd);
+                if (openmetrics_export(tmp_fd) == -1)
+                    close_socket(&tmp_fd);
+                else
+                    close_socket(&tmp_fd);
             }
         }
 
@@ -6862,56 +7159,62 @@ shit_fd:
                 continue;
             }
 
+            new_client->owner = pthread_self();
+
             if (inet_ntop(AF_INET, &sin_client.sin_addr.s_addr,
                         new_client->hostname, sin_client_len) == NULL)
                 warn("inet_ntop");
 
             new_client->fd = child_fd;
-            new_client->state = CS_ACTIVE;
             new_client->tcp_accepted_at = time(NULL);
             new_client->remote_port = ntohs(sin_client.sin_port);
             new_client->remote_addr = ntohl(sin_client.sin_addr.s_addr);
 
-
             dbg_printf("     main_loop: new client from [%s:%u]\n",
                     new_client->hostname, new_client->remote_port);
             logger(LOG_INFO, new_client, "main_loop: new connection");
+            new_client->state = CS_ACTIVE;
         }
 
-        pthread_rwlock_rdlock(&global_clients_lock);
-        for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
-        {
-            if (clnt->state != CS_ACTIVE || clnt->fd == -1)
-                continue;
+        if (num_clients) {
+            pthread_rwlock_rdlock(&global_clients_lock);
+            for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
+            {
+                if (clnt->state != CS_ACTIVE || clnt->fd == -1)
+                    continue;
 
-            if (FD_ISSET(clnt->fd, &fds_in)) {
-                if (parse_incoming(clnt) == -1) {
-                    /* TODO do something? */ ;
+                if (clnt->owner != pthread_self())
+                    continue;
+
+                if (FD_ISSET(clnt->fd, &fds_in)) {
+                    if (parse_incoming(clnt) == -1) {
+                        /* TODO do something? */ ;
+                    }
+                }
+
+                if (clnt->fd == -1)
+                    continue;
+
+                if (FD_ISSET(clnt->fd, &fds_out)) {
+                    clnt->write_ok = true;
+                    /* socket is writable without blocking [ish] */
+                } else {
+                    clnt->write_ok = false;
+                }
+
+                if (clnt->fd == -1)
+                    continue;
+
+                if (FD_ISSET(clnt->fd, &fds_exc)) {
+                    dbg_printf("     main_loop exception event on %p[%d]\n",
+                            (void *)clnt, clnt->fd);
+                    /* TODO close? */
                 }
             }
-
-            if (clnt->fd == -1)
-                continue;
-
-            if (FD_ISSET(clnt->fd, &fds_out)) {
-                clnt->write_ok = true;
-                /* socket is writable without blocking [ish] */
-            } else {
-                clnt->write_ok = false;
-            }
-
-            if (clnt->fd == -1)
-                continue;
-
-            if (FD_ISSET(clnt->fd, &fds_exc)) {
-                dbg_printf("     main_loop exception event on %p[%d]\n",
-                        (void *)clnt, clnt->fd);
-                /* TODO close? */
-            }
+            pthread_rwlock_unlock(&global_clients_lock);
         }
-        pthread_rwlock_unlock(&global_clients_lock);
 
-#ifndef WITH_THREADS
+#ifndef FEATURE_THREADS
 tick_me:
             tick();
 #endif
@@ -6920,7 +7223,7 @@ tick_me:
     logger(LOG_INFO, NULL, "main_loop: terminated normally");
 
     errno = 0;
-#ifdef WITH_THREADS
+#ifdef FEATURE_THREADS
     pthread_exit(&errno);
 #else
     return 0;
@@ -7082,161 +7385,7 @@ int main(int argc, char *argv[])
     opt_om_listen.s_addr = htonl(INADDR_LOOPBACK);
     opt_statepath = DEF_DB_PATH;
 
-    char *logfile_name = NULL;
-
-    {
-        int opt;
-        char *subopts;
-        char *value;
-
-        enum {
-            LOGGER_SYSLOG = 0,
-            LOGGER_FILE,
-            LOGGER_STDOUT,
-            LOGGER_NOSTDOUT,
-            LOGGER_LEVEL,
-            LOGGER_APPEND,
-            LOGGER_SYNC,
-        };
-
-        char *const logger_token[] = {
-            [LOGGER_SYSLOG] = "syslog",
-            [LOGGER_FILE] = "file",
-            [LOGGER_STDOUT] = "stdout",
-            [LOGGER_NOSTDOUT] = "nostdout",
-            [LOGGER_LEVEL] = "level",
-            [LOGGER_APPEND] = "append",
-            [LOGGER_SYNC] = "sync",
-            NULL
-        };
-
-        enum {
-            OM_ENABLE = 0,
-            OM_DISABLE,
-            OM_PORT,
-            OM_BIND,
-        };
-
-        char *const om_token[] = {
-            [OM_ENABLE] = "enable",
-            [OM_DISABLE] = "disable",
-            [OM_PORT] = "port",
-            [OM_BIND] = "bind",
-            NULL,
-        };
-
-        while ((opt = getopt(argc, argv, "hVp:H:l:do:nD:")) != -1)
-        {
-            switch (opt)
-            {
-                case 'D':
-                    if ((opt_statepath = strdup(optarg)) == NULL)
-                        err(EXIT_FAILURE, "main: strdup(optarg)");
-                    break;
-                case 'n':
-                    opt_database = false;
-                    break;
-                case 'd':
-                    opt_background = true;
-                    break;
-                case 'o':
-                    subopts = optarg;
-                    while (*subopts != '\0') {
-                        switch(getsubopt(&subopts, om_token, &value))
-                        {
-                            case OM_ENABLE:
-                                opt_openmetrics = true;
-                                break;
-                            case OM_DISABLE:
-                                opt_openmetrics = false;
-                                break;
-                            case OM_PORT:
-                                if (value == NULL)
-                                    goto shit_usage;
-                                int tmp = atoi(value);
-                                if (tmp == 0 || tmp > USHRT_MAX)
-                                    goto shit_usage;
-                                opt_om_port = tmp;
-                                break;
-                            case OM_BIND:
-                                if (value == NULL)
-                                    goto shit_usage;
-                                if (inet_pton(AF_INET, value, &opt_om_listen) == -1)
-                                    goto shit_usage;
-                                break;
-                            default:
-                                goto shit_usage;
-                        }
-                    }
-                    break;
-                case 'l':
-                    subopts = optarg;
-                    while (*subopts != '\0') {
-                        switch(getsubopt(&subopts, logger_token, &value))
-                        {
-                            case LOGGER_SYSLOG:
-                                opt_logsyslog = true;
-                                break;
-                            case LOGGER_FILE:
-                                if (value == NULL)
-                                    goto shit_usage;
-                                logfile_name = value;
-                                break;
-                            case LOGGER_STDOUT:
-                                opt_logstdout = true;
-                                break;
-                            case LOGGER_NOSTDOUT:
-                                opt_logstdout = false;
-                                break;
-                            case LOGGER_LEVEL:
-                                if (value == NULL)
-                                    goto shit_usage;
-                                if (!strcmp(value, "?")) {
-                                    for (unsigned idx = 0; priority_str[idx]; idx++)
-                                        printf("%s\n", priority_str[idx]);
-                                    exit(EXIT_SUCCESS);
-                                }
-                                if ((opt_loglevel = find_str(priority_str, value, 0)) == -1)
-                                    goto shit_usage;
-                                break;
-                            case LOGGER_SYNC:
-                                opt_logfilesync = true;
-                                break;
-                            case LOGGER_APPEND:
-                                opt_logfileappend = true;
-                                break;
-                            default:
-                                goto shit_usage;
-                        }
-                    }
-                    break;
-                case 'H':
-                    if (inet_pton(AF_INET, optarg, &opt_listen) == -1) {
-                        warn("main: inet_pton");
-                        exit(EXIT_FAILURE);
-                    }
-                    break;
-                case 'p':
-                    int tmp = atoi(optarg);
-                    if (tmp == 0 || tmp > USHRT_MAX) {
-                        show_usage(stderr, argv[0]);
-                        exit(EXIT_FAILURE);
-                    }
-                    opt_port = tmp;
-                    break;
-                case 'h':
-                    show_usage(stdout, argv[0]);
-                    exit(EXIT_SUCCESS);
-                case 'V':
-                    show_version(stdout);
-                    exit(EXIT_SUCCESS);
-                default:
-shit_usage:
-                    show_usage(stderr, argv[0]);
-                    exit(EXIT_FAILURE);
-            }
-        }
-    }
+    parse_cmdline(argc, argv);
 
     if (logfile_name) {
         if ((opt_logfile = fopen(logfile_name,
@@ -7363,12 +7512,13 @@ shit_usage:
 
     atexit(close_all_sockets);
     atexit(free_all_topics_two);
+    atexit(free_all_messages_two);
     atexit(free_all_sessions);
-    atexit(free_all_message_delivery_states);
     atexit(free_all_messages);
     atexit(free_all_topics);
     atexit(free_all_packets);
     atexit(free_all_clients);
+    atexit(free_all_message_delivery_states);
 
     if (opt_database)
         atexit(save_all_topics);
@@ -7409,34 +7559,17 @@ shit_usage:
     if ((global_mother_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
         logger(LOG_EMERG, NULL, "socket(mother): %s", strerror(errno));
 
-    if (opt_openmetrics)
+    sock_linger(global_mother_fd);
+    sock_reuse(global_mother_fd, 1);
+    sock_nonblock(global_mother_fd);
+
+    if (opt_openmetrics) {
         if ((global_om_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
             logger(LOG_EMERG, NULL, "socket(om): %s", strerror(errno));
-
-    struct linger linger = {
-        .l_onoff = 0,
-        .l_linger = 0,
-    };
-
-    if (setsockopt(global_mother_fd, SOL_SOCKET, SO_LINGER, &linger,
-                sizeof(linger)) == -1)
-        warn("setsockopt(SO_LINGER, mother)");
-
-    if (opt_openmetrics)
-        if (setsockopt(global_om_fd, SOL_SOCKET, SO_LINGER, &linger,
-                    sizeof(linger)) == -1)
-            warn("setsockopt(SO_LINGER, openmetrics)");
-
-    int reuse = 1;
-
-    if (setsockopt(global_mother_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
-                sizeof(reuse)) == -1)
-        warn("setsockopt(SO_REUSEADDR, mother)");
-
-    if (opt_openmetrics)
-        if (setsockopt(global_om_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
-                    sizeof(reuse)) == -1)
-            warn("setsockopt(SO_REUSEADDR, openmetrics)");
+        sock_linger(global_om_fd);
+        sock_reuse(global_om_fd, 1);
+        sock_nonblock(global_om_fd);
+    }
 
     struct sockaddr_in sin = {0};
     char bind_addr[INET_ADDRSTRLEN];
@@ -7470,7 +7603,7 @@ shit_usage:
             logger(LOG_EMERG, NULL, "listen(om): %s", strerror(errno));
     }
 
-#ifdef WITH_THREADS
+#ifdef FEATURE_THREADS
     struct start_args start_args = {
         .fd = global_mother_fd,
         .om_fd = -1,
@@ -7486,31 +7619,46 @@ shit_usage:
         .om_fd = opt_openmetrics ? global_om_fd : 0,
     };
 #endif
-
     running = true;
 
-#ifdef WITH_THREADS
-    pthread_t main_thread, tick_thread, om_thread;
+#ifdef FEATURE_THREADS
+    pthread_t main_thread[4], tick_thread[4], om_thread;
 
     if (opt_openmetrics &&
             pthread_create(&om_thread, NULL, om_loop, &start_args_om) == -1)
         err(EXIT_FAILURE, "pthread_create: om_loop");
 
-    if (pthread_create(&main_thread, NULL, main_loop, &start_args) == -1)
-        err(EXIT_FAILURE, "pthread_create: main_thread");
+    for (unsigned idx = 0; idx < 4; idx++)
+        if (pthread_create(&main_thread[idx], NULL, main_loop, &start_args) == -1)
+            err(EXIT_FAILURE, "pthread_create: main_thread[%u]", idx);
 
-    if (pthread_create(&tick_thread, NULL, tick_loop, NULL) == -1)
-        err(EXIT_FAILURE, "pthread_create: tick");
+    for (unsigned idx = 0; idx < 4; idx++)
+        if (pthread_create(&tick_thread[idx], NULL, tick_loop, NULL) == -1)
+            err(EXIT_FAILURE, "pthread_create: tick[%u]", idx);
 
-    pthread_join(main_thread, NULL);
-    pthread_join(tick_thread, NULL);
     if (opt_openmetrics)
         pthread_join(om_thread, NULL);
+
+    for (unsigned idx = 0; idx < 4; idx++)
+        if (pthread_join(tick_thread[idx], NULL) == -1)
+            warn("main: pthread_join(tick_thread)");
+        else
+            logger(LOG_INFO, NULL, "main: pthread_join(tick_thread[%u]): OK", idx);
+    
+    for (unsigned idx = 0; idx < 4; idx++)
+        if (pthread_join(main_thread[idx], NULL) == -1)
+            warn("main: pthread_join(tick_thread)");
+        else
+            logger(LOG_INFO, NULL, "main: pthread_join(main_thread[%u]): OK", idx);
 #else
     if (main_loop(&start_args) == -1)
         logger(LOG_EMERG, NULL, "main_loop returned an error: %s",
                 strerror(errno));
 #endif
-
+    logger(LOG_INFO, NULL, "main: done");
     exit(EXIT_SUCCESS);
+
+shit_usage:
+    show_usage(stderr, argv[0]);
+    exit(EXIT_FAILURE);
 }
