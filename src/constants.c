@@ -199,6 +199,11 @@ const char *const priority_str[] = {
     NULL,
 };
 
+const char *const packet_dir_str[PACKET_DIR_MAX] = {
+    [PACKET_IN]  = "IN",
+    [PACKET_OUT] = "OUT",
+};
+
 const char *const reason_codes_str[MQTT_REASON_CODE_MAX] =
 {
     [MQTT_SUCCESS] = "SUCCESS/NORMAL_DISCONNECTION/GRANTED_QOS_0",

@@ -265,6 +265,12 @@ typedef enum {
 } read_state_t;
 
 typedef enum {
+    PACKET_IN = 0,
+    PACKET_OUT = 1,
+    PACKET_DIR_MAX
+} packet_type_t;
+
+typedef enum {
     SUB_NON_SHARED = 0,
     SUB_SHARED,
     SUB_TYPE_MAX,
@@ -289,6 +295,7 @@ struct property {
 struct packet {
     struct packet *next;
     id_t id;
+    bool deleted;
 
     /* HEAD for next_client list */
     struct client *owner;
@@ -307,6 +314,7 @@ struct packet {
     unsigned property_count;
     //unsigned num_will_props;
     reason_code_t reason_code;
+    packet_type_t direction;
 
     _Atomic unsigned refcnt;
 };
@@ -319,8 +327,9 @@ struct message_delivery_state {
     id_t id;
     struct session *session;
     struct message *message;
-
+    bool read_only;
     uint16_t packet_identifier;
+    bool deleted;
 
                                 /*   QoS=1     |   QoS=2     */
     union {
@@ -349,6 +358,7 @@ struct message_save {
 struct message {
     struct message *next;
     id_t id;
+    bool deleted;
     struct message *next_queue;
     struct session *sender;
     //uint16_t sender_packet_identifier;
@@ -551,5 +561,6 @@ extern const char *const priority_str[];
 extern const char *const reason_codes_str[MQTT_REASON_CODE_MAX];
 extern const char *const message_type_str[MSG_TYPE_MAX];
 extern const char *const subscription_type_str[SUB_TYPE_MAX];
+extern const char *const packet_dir_str[PACKET_DIR_MAX];
 
 #endif
