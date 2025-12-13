@@ -41,6 +41,8 @@ Optional features:
   --disable-dependency-tracking
   --enable-debugging              enable debugging (unset NDEBUG)
   --disable-debugging             disable debugging (set NDEBUG) (default)
+  --enable-threads                enable threads (EXPERIMENTAL)
+  --disable-threads               disable threads (default)
 EOF
 }
 
