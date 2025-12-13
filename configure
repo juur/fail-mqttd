@@ -54,6 +54,7 @@ EOF
 QUIET=0
 DEPS=1
 FEATURE_DEBUG=0
+FEATURE_THREADS=0
 SAVED_ARGS="$*"
 
 while :; do
@@ -401,8 +402,12 @@ fi
 	echo "#define SYSCONFDIR \"${SYSCONFDIR}\""
 	echo "#define RUNSTATEDIR \"${RUNSTATEDIR}\""
 	echo "#define LOCALSTATEDIR \"${LOCALSTATEDIR}\"" 
-	echo "#define FEATURE_THREADS 1"
-	echo "#define FEATURE_DEBUG 1"
+	if [[ "${FEATURE_THREADS}" -eq 1 ]]; then
+		echo "#define FEATURE_THREADS 1"
+	fi
+	if [[ "${FEATURE_DEBUG}" -eq 1 ]]; then
+		echo "#define FEATURE_DEBUG 1"
+	fi
 } >> "${OBJDIR}"/config.h
 
 printf "\n#endif\n" >> "${OBJDIR}"/config.h
