@@ -296,7 +296,7 @@ echo "objdir = ${OBJDIR}; srcdir = ${SRCDIR};"
 
 # List of system headers we need to check for
 
-H_FILES="stdlib.h netinet/in.h sys/socket.h fcntl.h unistd.h err.h stdio.h string.h stdbool.h errno.h sys/select.h stdatomic.h signal.h assert.h pthread.h arpa/inet.h limits.h pthread.h stdarg.h syslog.h time.h ifaddrs.h net/if_arp.h linux/if_packet.h ndbm.h"
+H_FILES="stdlib.h netinet/in.h sys/socket.h fcntl.h unistd.h err.h stdio.h string.h stdbool.h errno.h sys/select.h stdatomic.h signal.h assert.h pthread.h arpa/inet.h limits.h pthread.h stdarg.h syslog.h time.h ifaddrs.h net/if_arp.h linux/if_packet.h ndbm.h sys/stat.h"
 
 # List of system functions to check for function:arg0,arg1
 
