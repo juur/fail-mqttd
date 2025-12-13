@@ -482,6 +482,7 @@ struct client {
     uint8_t connect_response_flags;
     uint8_t protocol_version;
     uint16_t keep_alive;
+    bool keep_alive_override;
     time_t tcp_accepted_at;
     time_t last_connected;
     time_t last_keep_alive;

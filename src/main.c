@@ -130,14 +130,19 @@ static const unsigned  MAX_PROPERTIES        = 0x10;
 static const unsigned  MAX_RECEIVE_PUBS      = 0x10;
 static const unsigned  MAX_SESSIONS          = 0x100;
 static const unsigned  MAX_TOPIC_ALIAS       = 0x20;
+static const unsigned  MIN_KEEP_ALIVE        = 60;
+static const unsigned  MAX_CLIENTID_LEN      = 0x100;
 
 static const uint32_t  MAX_SUB_IDENTIFIER    = 0xfffffff;
 static const uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
 
-static const char     *const PID_FILE        = RUNSTATEDIR "/fail-mqttd.pid";
-static const char     *const DEF_DB_PATH     = LOCALSTATEDIR "/fail-mqttd/";
-static const char      SHARED_PREFIX[]       = "$shared/";
-static const size_t    SHARED_PREFIX_LENGTH  = sizeof(SHARED_PREFIX);
+static const char  *const PID_FILE              = RUNSTATEDIR "/fail-mqttd.pid";
+static const char  *const DEF_DB_PATH           = LOCALSTATEDIR "/fail-mqttd/";
+static const char         SHARED_PREFIX[]       = "$shared/";
+static const size_t       SHARED_PREFIX_LENGTH  = sizeof(SHARED_PREFIX);
+static const char         PROTOCOL_NAME[]       = {'M','Q','T','T'};
+static const size_t       PROTOCOL_NAME_LEN     = sizeof(PROTOCOL_NAME);
+static const uint8_t      PROTOCOL_VERSION      = 5;
 
 /*
  * global lists and associated locks & counts
@@ -4443,13 +4448,31 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     uint8_t proplen[4], remlen[4];
     int proplen_len, remlen_len, prop_len;
 
+    struct property (*tmp_connack_props)[] = NULL;
+    unsigned num_tmp_connack_props = 0;
+
     errno = 0;
 
     dbg_printf("     send_cp_connack: %s to client <%s>\n",
             reason_codes_str[reason_code], (const char *)client->client_id);
 
+    num_tmp_connack_props = num_connack_props;
+    if (client->keep_alive_override)
+        num_tmp_connack_props++;
+
+    if ((tmp_connack_props = calloc(num_tmp_connack_props, sizeof(struct property))) == NULL)
+        return -1;
+
+    for (unsigned idx = 0; idx < num_connack_props; idx++)
+        memcpy(&(*tmp_connack_props)[idx], &connack_props[idx], sizeof(struct property));
+
+    if (client->keep_alive_override) {
+        (*tmp_connack_props)[num_connack_props].byte2 = client->keep_alive;
+        (*tmp_connack_props)[num_connack_props].ident = MQTT_PROP_SERVER_KEEP_ALIVE;
+    }
+
     /* Calculate the Property[] Length */
-    if ((prop_len = get_properties_size(&connack_props, num_connack_props)) == -1)
+    if ((prop_len = get_properties_size(tmp_connack_props, num_tmp_connack_props)) == -1)
         return -1;
 
     /* Calculate the length of Property Length */
@@ -4490,7 +4513,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     memcpy(ptr, proplen, proplen_len);
     ptr += proplen_len;
 
-    if (build_properties(&connack_props, num_connack_props, &ptr) == -1)
+    if (build_properties(tmp_connack_props, num_tmp_connack_props, &ptr) == -1)
         goto fail;
 
     /* Now send the packet */
@@ -4500,17 +4523,22 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     }
 
     free(packet);
+    free(tmp_connack_props);
 
     if (is_malformed(reason_code)) {
         client->disconnect_reason = reason_code;
         client->state = CS_CLOSING;
     }
 
+
     return 0;
 
 fail:
     if (packet)
         free(packet);
+
+    if (tmp_connack_props)
+        free_properties(tmp_connack_props, num_tmp_connack_props);
 
     if (is_malformed(reason_code))
         client->state = CS_CLOSING;
@@ -5843,7 +5871,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     reason_code_t reason_code = MQTT_MALFORMED_PACKET;
     uint16_t connect_header_length, keep_alive = 0;
     uint8_t protocol_version, connect_flags;
-    uint8_t protocol_name[4];
+    uint8_t protocol_name[PROTOCOL_NAME_LEN];
     const struct property *prop;
     bool reconnect = false;
     bool clean = false;
@@ -5853,6 +5881,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     uint8_t will_qos = 0;
     void *will_payload = NULL;
     bool will_retain = false;
+    bool keep_alive_override = false;
     uint16_t will_payload_len = 0;
     uint8_t payload_format = 0;
     struct property (*will_props)[] = NULL;
@@ -5883,9 +5912,9 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
         goto fail;
     }
 
-    memcpy(protocol_name, ptr, 4);
-    ptr += 4;
-    bytes_left -= 4;
+    memcpy(protocol_name, ptr, PROTOCOL_NAME_LEN);
+    ptr += PROTOCOL_NAME_LEN;
+    bytes_left -= PROTOCOL_NAME_LEN;
 
     protocol_version = *ptr++;
     bytes_left--;
@@ -5898,17 +5927,22 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     ptr += 2;
     bytes_left -= 2;
 
-    if (memcmp(protocol_name, "MQTT", 4))
+    if (keep_alive > 0 && keep_alive < MIN_KEEP_ALIVE) {
+        keep_alive = MIN_KEEP_ALIVE;
+        keep_alive_override = true;
+    }
+
+    if (memcmp(protocol_name, PROTOCOL_NAME, PROTOCOL_NAME_LEN))
         goto fail;
 
     if (connect_flags & MQTT_CONNECT_FLAG_RESERVED)
         goto fail;
 
-    if (protocol_version != 5) {
+    if (protocol_version != PROTOCOL_VERSION) {
 version_fail:
         logger(LOG_WARNING, client, "handle_cp_connect: unsupported protocol version %d",
                 protocol_version);
-        if (protocol_version < 5)
+        if (protocol_version < PROTOCOL_VERSION)
             reason_code = 0x1; /* Connection Refused, unacceptable protocol version */
         else
             reason_code = MQTT_UNSUPPORTED_PROTOCOL_VERSION;
@@ -5924,7 +5958,7 @@ version_fail:
         goto fail;
 
     if (client->client_id != NULL) {
-        logger(LOG_ERR, client, "client_id already set");
+        logger(LOG_ERR, client, "clientid already set");
         errno = EEXIST;
         reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
         goto fail;
@@ -5935,7 +5969,21 @@ version_fail:
 
     /* [MQTT-3.1.3-5] */
     if (is_valid_connection_id(client->client_id) == -1) {
-        warn("handle_cp_connect: invalid connection id");
+        logger(LOG_WARNING, NULL, "handle_cp_connect: invalid clientid");
+        reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
+        goto fail;
+    }
+
+    const size_t clientid_len = strlen((const char *)client->client_id);
+
+    if (clientid_len > MAX_CLIENTID_LEN) {
+        logger(LOG_WARNING, NULL, "handle_cp_connect: clientid too long");
+        reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
+        goto fail;
+    }
+
+    if (clientid_len == 0) {
+        logger(LOG_WARNING, NULL, "handle_cp_connect: zero-length clientid not supported");
         reason_code = MQTT_CLIENT_IDENTIFIER_NOT_VALID;
         goto fail;
     }
@@ -6167,6 +6215,8 @@ create_new_session:
         client->topic_alias_maximum = prop->byte2;
     }
 
+    client->keep_alive_override = keep_alive_override;
+
     if (send_cp_connack(client, MQTT_SUCCESS) == -1) {
         reason_code = MQTT_UNSPECIFIED_ERROR;
         warn("handle_cp_connect: send_cp_connack failed");
@@ -6187,10 +6237,14 @@ fail:
     if (unlock)
         pthread_rwlock_unlock(&global_sessions_lock);
 
+    if (reason_code == MQTT_CLIENT_IDENTIFIER_NOT_VALID) {
+        if (client->client_id) {
+            free((void *)client->client_id);
+            client->client_id = NULL;
+        }
+    }
+
     if (send_cp_connack(client, reason_code) == -1) {
-        client->state = CS_CLOSING;
-        if (client->disconnect_reason == 0)
-            client->disconnect_reason = reason_code;
     }
 
     if (will_topic)
@@ -6204,6 +6258,10 @@ fail:
 
     if (errno == 0)
         errno = EINVAL;
+    
+    client->state = CS_CLOSING;
+    if (client->disconnect_reason == 0)
+        client->disconnect_reason = reason_code;
 
     return -1;
 }
@@ -6493,7 +6551,7 @@ exec_control:
                 if (unlock)
                     pthread_rwlock_unlock(&global_sessions_lock);
             }
-            //client->last_keep_alive = time(NULL);
+            client->last_keep_alive = time(NULL);
 
             /* If we don't lock here, there is a race between refcnt-- & free_packet() */
             pthread_rwlock_wrlock(&global_packets_lock);
@@ -6560,7 +6618,7 @@ static void client_tick(void)
                     time_t overdue = 1 + (clnt->keep_alive * 1.5f);
                     if (now > (clnt->last_keep_alive + overdue)) {
                         warnx("client_tick: closing idle link: no PINGREQ within Keep Alive: %lu > %lu",
-                                now, overdue);
+                                now, (clnt->last_keep_alive + overdue));
                         goto force_close;
                     }
                 }
@@ -6762,7 +6820,6 @@ static void tick_msg(struct message *msg)
             DEC_REFCNT(&packet->refcnt);
             free_packet(packet, true, true); /* Anything else? */
             packet = NULL;
-            warnx("tick_msg: continuing");
             continue;
         }
 
