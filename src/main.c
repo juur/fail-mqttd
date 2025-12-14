@@ -6365,6 +6365,7 @@ static void handle_outbound(struct client *client)
     rc = write(client->fd, client->po_buf + client->po_offset, client->po_remaining);
 
     if (rc == client->po_remaining) {
+free_and_return:
         free((void *)client->po_buf);
         client->po_buf = NULL;
         client->po_remaining = 0;
@@ -6374,13 +6375,14 @@ static void handle_outbound(struct client *client)
     }
 
     if (rc == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
             client->write_ok = false;
-        else {
-            client->state = CS_CLOSING;
-            log_io_error(NULL, rc, client->po_remaining, false, client);
+            return;
         }
-        return;
+
+        client->state = CS_CLOSING;
+        log_io_error(NULL, rc, client->po_remaining, false, client);
+        goto free_and_return;
     }
 
     /* short write */
