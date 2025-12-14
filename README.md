@@ -25,7 +25,6 @@ There are various things it doesn't at all:
 - *persistence*: only topics and retained messages are stored to disk.
 - *availability*: there is no active-active or active-passive fail-over, etc.
 - *security*: there is no (useful) authentication, authorisation, confidentiality or integrity.
-- server initiated keep-alive
 - multi-threaded operation (partial support)
 - few properties are implemented
-- Shared Subscriptions
+- Shared Subscriptions (partial support)
