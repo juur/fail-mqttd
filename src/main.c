@@ -138,7 +138,7 @@ static const uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
 
 static const char  *const PID_FILE              = RUNSTATEDIR "/fail-mqttd.pid";
 static const char  *const DEF_DB_PATH           = LOCALSTATEDIR "/fail-mqttd/";
-static const char         SHARED_PREFIX[]       = "$shared/";
+static const char         SHARED_PREFIX[]       = {'$','s','h','a','r','e','d','/'};
 static const size_t       SHARED_PREFIX_LENGTH  = sizeof(SHARED_PREFIX);
 static const char         PROTOCOL_NAME[]       = {'M','Q','T','T'};
 static const size_t       PROTOCOL_NAME_LEN     = sizeof(PROTOCOL_NAME);
@@ -171,6 +171,11 @@ static _Atomic unsigned num_topics        = 0;
 static _Atomic unsigned num_sessions      = 0;
 static _Atomic unsigned num_mds           = 0;
 static _Atomic unsigned num_subscriptions = 0;
+static _Atomic unsigned num_shared_subscriptions = 0;
+
+static _Atomic unsigned long total_control_packets_recv            = 0;
+static _Atomic unsigned long total_control_packets_processed       = 0;
+static _Atomic unsigned long total_control_packets_processed_ok    = 0;
 
 static _Atomic unsigned long total_messages_accepted_at            = 0;
 static _Atomic unsigned long total_messages_acknowledged_at        = 0;
@@ -221,7 +226,7 @@ static char *logfile_name = NULL;
 [[gnu::nonnull]] static void set_outbound(struct client *client, const uint8_t *buf, unsigned len);
 [[gnu::nonnull]] static void close_session(struct session *session);
 [[gnu::nonnull]] static void close_client(struct client *client, reason_code_t reason, bool disconnect);
-[[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe(struct subscription *sub);
+[[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe(struct subscription *sub, struct session *session);
 [[gnu::nonnull, gnu::warn_unused_result]] static int dequeue_message(struct message *msg);
 [[gnu::nonnull]] static void free_message(struct message *msg, bool need_lock);
 [[gnu::nonnull, gnu::warn_unused_result]] static int remove_delivery_state(
@@ -799,6 +804,10 @@ static int openmetrics_export(int fd)
             "num_packets %u\n"
             "# TYPE num_subscriptions gauge\n"
             "num_subscriptions %u\n"
+            "# TYPE num_shared_subscriptions gauge\n"
+            "num_shared_subscriptions %u\n"
+            "# TYPE num_non_shared_subscriptions gauge\n"
+            "num_non_shared_subscriptions %u\n"
             "# TYPE total_messages_accepted_at counter\n"
             "total_messages_accepted_at %lu\n"
             "# TYPE total_messages_completed_at counter\n"
@@ -815,6 +824,14 @@ static int openmetrics_export(int fd)
             "total_messages_sender_released_at %lu\n"
             "# TYPE total_messages_sender_acknowledged_at counter\n"
             "total_messages_sender_acknowledged_at %lu\n"
+            "# TYPE total_control_packets_recv counter\n"
+            "total_control_packets_recv %lu\n"
+            "# TYPE total_control_packets_processed counter\n"
+            "total_control_packets_processed %lu\n"
+            "# TYPE total_control_packets_processed_ok counter\n"
+            "total_control_packets_processed_ok %lu\n"
+            "# TYPE total_control_packets_processed_not_ok counter\n"
+            "total_control_packets_processed_not_ok %lu\n"
             ,
             num_sessions,
             num_clients,
@@ -823,6 +840,8 @@ static int openmetrics_export(int fd)
             num_mds,
             num_packets,
             num_subscriptions,
+            num_shared_subscriptions,
+            num_subscriptions - num_shared_subscriptions,
             total_messages_accepted_at,
             total_messages_completed_at,
             total_messages_released_at,
@@ -830,7 +849,11 @@ static int openmetrics_export(int fd)
             total_messages_sender_accepted_at,
             total_messages_sender_completed_at,
             total_messages_sender_released_at,
-            total_messages_sender_acknowledged_at
+            total_messages_sender_acknowledged_at,
+            total_control_packets_recv,
+            total_control_packets_processed,
+            total_control_packets_processed_ok,
+            total_control_packets_processed - total_control_packets_processed_ok
            );
 
 #if 0
@@ -1042,12 +1065,11 @@ static void close_socket(int *fd)
     if (*fd != -1) {
         shutdown(*fd, SHUT_RDWR);
         close(*fd);
-        dbg_printf("     close_socket: %u\n", *fd);
         *fd = -1;
     }
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static void free_subscription(struct subscription *sub)
 {
     struct subscription *tmp;
@@ -1072,9 +1094,12 @@ static void free_subscription(struct subscription *sub)
     switch (sub->type)
     {
         case SUB_SHARED:
-            /* TODO REFCNT reduction per SUB_NON_SHARED */
-            if (sub->shared.sessions)
+            if (sub->shared.sessions) {
+                for (unsigned idx = 0; idx < sub->shared.num_sessions; idx++)
+                    if (sub->shared.sessions[idx])
+                        DEC_REFCNT(&sub->shared.sessions[idx]->refcnt);
                 free(sub->shared.sessions);
+            }
             if (sub->shared.qos_levels)
                 free(sub->shared.qos_levels);
             if (sub->shared.share_name)
@@ -1083,6 +1108,7 @@ static void free_subscription(struct subscription *sub)
             sub->shared.num_sessions = 0;
             sub->shared.sessions = NULL;
             sub->shared.share_name = NULL;
+            sub->shared.qos_levels = NULL;
             break;
 
         case SUB_NON_SHARED:
@@ -1102,6 +1128,9 @@ static void free_subscription(struct subscription *sub)
         free((void *)sub->topic_filter);
         sub->topic_filter = NULL;
     }
+
+    if (sub->type == SUB_SHARED)
+        num_shared_subscriptions--;
 
     num_subscriptions--;
     free(sub);
@@ -1227,8 +1256,7 @@ static void free_topic(struct topic *topic)
 }
 
 [[gnu::nonnull]]
-static void free_properties(
-        struct property (*props)[], unsigned count)
+static void free_properties(struct property (*props)[], unsigned count)
 {
     type_t type;
 
@@ -1780,14 +1808,72 @@ fail:
     return NULL;
 }
 
+static int remove_session_from_shared_sub(struct subscription *sub,
+        struct session *session)
+{
+    void *tmp = NULL, *tmp_qos = NULL;
+    unsigned old_idx, new_idx;
+    bool found = false;
+    size_t new_size;
+
+    assert(session != NULL);
+
+    dbg_printf("     remove_session_from_shared_sub: subscription.id=%d session.id=%d\n",
+            sub->id, session->id);
+    assert(sub->type == SUB_SHARED);
+    assert(sub->shared.sessions != NULL);
+    assert(sub->shared.qos_levels != NULL);
+
+    new_size = sizeof(struct subscription *) * (sub->shared.num_sessions - 1);
+    if ((tmp = malloc(new_size)) == NULL)
+        goto fail;
+
+    new_size = sizeof(uint8_t) * (sub->shared.num_sessions - 1);
+    if ((tmp_qos = malloc(new_size)) == NULL)
+        goto fail;
+
+    for (old_idx = 0, new_idx = 0; old_idx < sub->shared.num_sessions; old_idx++)
+    {
+        if (sub->shared.sessions[old_idx] == session) {
+            found = true;
+            continue;
+        }
+
+        if (new_idx == sub->shared.num_sessions - 1)
+            break;
+
+        ((struct session **)tmp)[new_idx] = sub->shared.sessions[old_idx];
+        ((uint8_t *)tmp_qos)[new_idx] = sub->shared.qos_levels[old_idx];
+        new_idx++;
+    }
+
+    if (found == true) {
+        sub->shared.num_sessions--;
+        free(sub->shared.sessions);
+        free(sub->shared.qos_levels);
+        sub->shared.sessions = tmp;
+        sub->shared.qos_levels = tmp_qos;
+        return 0;
+    }
+
+    errno = ENOENT;
+fail:
+    if (tmp)
+        free(tmp);
+    if (tmp_qos)
+        free(tmp_qos);
+
+    return -1;
+}
+
 [[gnu::nonnull]]
 static int add_session_to_shared_sub(struct subscription *sub,
         struct session *session, uint8_t qos)
 {
     void *tmp;
 
-    dbg_printf("[%2d] add_session_to_shared_sub: subscription.id=%d\n",
-            session->id, sub->id);
+    dbg_printf("[%2d] add_session_to_shared_sub: subscription.id=%d session.id=%d\n",
+            session->id, sub->id, session->id);
 
     assert(sub->type == SUB_SHARED);
     size_t new_size = sizeof(struct subscription *) * (sub->shared.num_sessions + 1);
@@ -1802,7 +1888,7 @@ static int add_session_to_shared_sub(struct subscription *sub,
         goto fail;
     sub->shared.qos_levels = tmp;
 
-    INC_REFCNT(&session->refcnt); /* TODO DEC_REFCNT */
+    INC_REFCNT(&session->refcnt); /* remove_session_from_shared_sub() || free_subscription() */
     sub->shared.sessions[sub->shared.num_sessions] = session;
     sub->shared.qos_levels[sub->shared.num_sessions] = qos;
     sub->shared.num_sessions++;
@@ -1855,6 +1941,8 @@ static struct subscription *alloc_subscription(struct session *session,
     ret->next = global_subscription_list;
     global_subscription_list = ret;
     num_subscriptions++;
+    if (type == SUB_SHARED)
+        num_shared_subscriptions++;
     pthread_rwlock_unlock(&global_subscriptions_lock);
 
     return ret;
@@ -3292,6 +3380,9 @@ static struct subscription *find_subscription(const struct session *session,
     pthread_rwlock_rdlock(&global_subscriptions_lock);
     for (tmp = global_subscription_list; tmp; tmp = tmp->next)
     {
+        if (tmp->topic_filter == NULL)
+            continue;
+
         if (strcmp((const void *)tmp->topic_filter, (const void *)topic_filter))
             continue;
 
@@ -3300,6 +3391,9 @@ static struct subscription *find_subscription(const struct session *session,
             case SUB_NON_SHARED:
                 if (session != tmp->non_shared.session)
                     continue;
+                break;
+
+            case SUB_SHARED:
                 break;
 
             default:
@@ -3531,6 +3625,25 @@ static int enqueue_message(struct topic *topic, struct message *msg)
 
         switch(matched_sub->type)
         {
+            case SUB_SHARED:
+                for (unsigned idx = 0; idx < matched_sub->shared.num_sessions; idx++) {
+                    if (matched_sub->shared.sessions[idx] == NULL)
+                        continue;
+                    if (matched_sub->shared.sessions[idx]->state != SESSION_ACTIVE)
+                        continue;
+                    if (matched_sub->shared.sessions[idx]->client == NULL)
+                        continue;
+                    if (matched_sub->shared.sessions[idx]->client->state != CS_ACTIVE)
+                        continue;
+                    dbg_printf("     enqueue_message: selected session_id=%d\n",
+                            matched_sub->shared.sessions[idx]->id);
+                    enqueue_one_mds(msg, matched_sub->shared.sessions[idx]);
+
+                    found = true;
+                    break;
+                }
+                break;
+
             case SUB_NON_SHARED:
                 if (matched_sub->non_shared.session == msg->sender) /* TODO echo y/n ? */
                     continue;
@@ -3710,19 +3823,16 @@ fail:
 
 /* TODO locking */
 [[gnu::nonnull, gnu::warn_unused_result]]
-static int unsubscribe(struct subscription *sub)
+static int unsubscribe(struct subscription *sub, struct session *session)
 {
     struct subscription **tmp_topic = NULL;
     struct subscription **tmp_client = NULL;
     size_t client_sub_size, client_sub_cnt = 0;
     unsigned old_idx, new_idx;
 
-    struct session *session;
+    dbg_printf(BWHT "     unsubscribe: sub.id=%d session.id=%d [%s] <%s>" CRESET "\n",
+            sub->id, session->id, subscription_type_str[sub->type], sub->topic_filter);
 
-    dbg_printf(BWHT "     unsubscribe"CRESET"\n");
-
-    /* TODO handle SUB_SHARED */
-    session = sub->non_shared.session;
     errno = 0;
 
     /* remove the back references for this subscription */
@@ -3775,11 +3885,27 @@ skip_client:
     session->num_subscriptions = client_sub_cnt;
 
     /* TODO handle SUB_SHARED */
-    DEC_REFCNT(&sub->non_shared.session->refcnt); /* alloc_subscription */
-    sub->non_shared.session = NULL;
+    switch (sub->type)
+    {
+        case SUB_NON_SHARED:
+            DEC_REFCNT(&session->refcnt); /* alloc_subscription */
+            sub->non_shared.session = NULL;
+            free_subscription(sub);
+            sub = NULL;
+            break;
+        case SUB_SHARED:
+            if (remove_session_from_shared_sub(sub, session) == -1)
+                warn("unsubscribe: remove_session_from_shared_sub");
+            DEC_REFCNT(&session->refcnt); /* add_session_to_shared_sub */
+            if (sub->shared.num_sessions == 0)
+                free_subscription(sub);
+            break;
+        default:
+            errno = EINVAL;
+            warn("unsubscribe: invalid sub.type");
+            break;
+    }
 
-    free_subscription(sub);
-    sub = NULL;
 
     pthread_rwlock_unlock(&session->subscriptions_lock);
     return 0;
@@ -3857,13 +3983,20 @@ static int unsubscribe_from_topics(struct session *session,
         switch (sub->type)
         {
             case SUB_SHARED:
+                if (unsubscribe(sub, session) == -1) {
+                    if (request->reason_codes)
+                        request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
+                    continue;
+                }
+#if 0
                 if (request->reason_codes)
                     request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
                 warn("unsubscribe_from_topics: SUB_SHARED not implemented");
+#endif
                 continue;
 
             case SUB_NON_SHARED:
-                if (unsubscribe(sub) == -1) {
+                if (unsubscribe(sub, session) == -1) {
                     if (request->reason_codes)
                         request->reason_codes[idx] = MQTT_UNSPECIFIED_ERROR;
                     continue;
@@ -3910,6 +4043,7 @@ static int subscribe_to_one_topic(struct session *session,
             session->id, (const char *)topic_filter);
 
     if (is_shared_subscription(topic_filter)) {
+        dbg_printf("[%2d] subscribe_to_topics: likely SHARED\n", session->id);
         ptr = topic_filter + SHARED_PREFIX_LENGTH;
 
         while (*ptr && *ptr != '/')
@@ -3932,6 +4066,7 @@ static int subscribe_to_one_topic(struct session *session,
             goto fail;
 
         type = SUB_SHARED;
+        dbg_printf("     subscribe_to_one_topic: shared\n");
 not_shared:
     }
 
@@ -3988,6 +4123,9 @@ force_existing:
         case SUB_SHARED:
             add_session_to_shared_sub(existing_sub, session,
                     (options & MQTT_SUBOPT_QOS_MASK));
+            /* refactor somewhere? */
+            session->subscriptions[sub_idx] = existing_sub;
+            session->num_subscriptions++;
             break;
 
         default:
@@ -5661,6 +5799,9 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                         &bytes_left)) == NULL)
             goto fail;
 
+        dbg_printf("[%2d] handle_cp_subscribe: got topic <%s>\n", client->session->id,
+                (const char *)request->topics[request->num_topics]);
+
         if (bytes_left < 1)
             goto fail;
 
@@ -5679,13 +5820,17 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
         if ((*ptr & MQTT_SUBOPT_RETAIN_HANDLING_MASK) == MQTT_SUBOPT_RETAIN_HANDLING_MASK)
             goto fail;
 
-        if (!strncmp("$share/", (char *)request->topics[request->num_topics], 7)) {
+        if (!strncmp(SHARED_PREFIX, (char *)request->topics[request->num_topics], SHARED_PREFIX_LENGTH)) {
+            dbg_printf("[%2d] handle_cp_subscribe: SHARED request: <%s>\n", client->session->id,
+                    (const char *)request->topics[request->num_topics]);
             if ((*ptr & MQTT_SUBOPT_NO_LOCAL))
                 goto fail;
+            /*
             request->reason_codes[request->num_topics] = MQTT_SHARED_SUBSCRIPTIONS_NOT_SUPPORTED;
             free((void *)request->topics[request->num_topics]);
             request->topics[request->num_topics] = NULL;
             goto next;
+            */
         }
 
         if (is_valid_topic_filter(request->topics[request->num_topics]) == -1) {
@@ -5702,7 +5847,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
 
         /* TODO do something with the RETAIN flag */
 
-next:
+//next:
         request->options[request->num_topics] = *ptr++;
         bytes_left--;
 
@@ -6619,6 +6764,8 @@ exec_control:
                     client->session ? client->session->id : (id_t)-1,
                     client->id);
 
+            total_control_packets_recv++;
+
             /* [MQTT-3.1.4-6] - maybe */
             if (!control_functions[client->new_packet->type].needs_auth ||
                     client->is_auth) {
@@ -6629,6 +6776,7 @@ exec_control:
                     unlock = true;
                 }
 
+                total_control_packets_processed++;
                 if (control_functions[client->new_packet->type].func(client,
                             client->new_packet, client->packet_buf) == -1) {
                     warn("control_function");
@@ -6640,6 +6788,7 @@ exec_control:
                         pthread_rwlock_unlock(&global_sessions_lock);
                     goto fail;
                 }
+                total_control_packets_processed_ok++;
                 if (unlock)
                     pthread_rwlock_unlock(&global_sessions_lock);
             }
@@ -7695,11 +7844,17 @@ fail:
 
 int main(int argc, char *argv[])
 {
+    errno = 0;
+
+    /* Set defaults */
+
     opt_listen.s_addr = htonl(INADDR_LOOPBACK);
     opt_om_listen.s_addr = htonl(INADDR_LOOPBACK);
     opt_statepath = DEF_DB_PATH;
 
     parse_cmdline(argc, argv);
+
+    /* cmd line logic checks */
 
     if (logfile_name) {
         if ((opt_logfile = fopen(logfile_name,
@@ -7796,6 +7951,8 @@ int main(int argc, char *argv[])
         logger(LOG_INFO, NULL, "main: successfully daemonised");
     }
 
+    /* Signal handling */
+
     struct sigaction sa = {
         .sa_sigaction = sh_sigint,
         .sa_flags = SA_SIGINFO,
@@ -7834,10 +7991,9 @@ int main(int argc, char *argv[])
     atexit(free_all_clients);
     atexit(free_all_message_delivery_states);
 
-    if (opt_database)
+    if (opt_database) {
         atexit(save_all_topics);
 
-    if (opt_database) {
         if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
             logger(LOG_EMERG, NULL, "main: cannot find MAC address");
 
@@ -7847,6 +8003,8 @@ int main(int argc, char *argv[])
                 global_hwaddr[3], global_hwaddr[4], global_hwaddr[5]
               );
     }
+
+    /* if any topic names have been passed on the cmdline, process them */
 
     while (optind < argc)
     {
@@ -7869,6 +8027,8 @@ int main(int argc, char *argv[])
         }
         optind++;
     }
+
+    /* Set-up sockets */
 
     if ((global_mother_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
         logger(LOG_EMERG, NULL, "socket(mother): %s", strerror(errno));
@@ -7922,7 +8082,7 @@ int main(int argc, char *argv[])
         .fd = global_mother_fd,
         .om_fd = -1,
     };
-    
+
     struct start_args start_argsn = {
         .fd = -1,
         .om_fd = -1,
