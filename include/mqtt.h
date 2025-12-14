@@ -504,6 +504,12 @@ struct client {
     unsigned rl_offset;
     uint8_t header_buffer[sizeof(struct mqtt_fixed_header) + 4];
 
+    /* packet outbound (po) data */
+    const uint8_t *po_buf;
+    unsigned po_size;
+    unsigned po_offset;
+    unsigned po_remaining;
+
     _Atomic unsigned refcnt;
 
     uint16_t topic_alias_maximum; /* Client, Server is MAX_TOPIC_ALIAS */

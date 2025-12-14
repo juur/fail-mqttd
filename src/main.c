@@ -218,6 +218,8 @@ static char *logfile_name = NULL;
  * forward declarations
  */
 
+[[gnu::nonnull]] static void handle_outbound(struct client *client);
+[[gnu::nonnull]] static void set_outbound(struct client *client, const uint8_t *buf, unsigned len);
 [[gnu::nonnull]] static void close_session(struct session *session);
 [[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe(struct subscription *sub);
 [[gnu::nonnull, gnu::warn_unused_result]] static int dequeue_message(struct message *msg);
@@ -979,7 +981,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
             pthread_rwlock_wrlock(&mds->message->delivery_states_lock);
 
         if (mds->message->num_message_delivery_states) {
-            unsigned old_len = mds->message->num_message_delivery_states;
+            //unsigned old_len = mds->message->num_message_delivery_states;
             if (remove_delivery_state(&mds->message->delivery_states,
                         &mds->message->num_message_delivery_states, mds) == -1) {
                 //if (errno != ENOENT) {
@@ -987,7 +989,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
                     rc = -1;
                 //}
             }
-            assert(mds->message->num_message_delivery_states == old_len -1);
+            //assert(mds->message->num_message_delivery_states == old_len -1);
         }
 
         if (GET_REFCNT(&mds->message->refcnt) > 0) {
@@ -1608,8 +1610,15 @@ static void free_client(struct client *client, bool needs_lock)
         client->password = NULL;
     }
 
-    if (client->packet_buf)
+    if (client->packet_buf) {
         free(client->packet_buf);
+        client->packet_buf = NULL;
+    }
+
+    if (client->po_buf) {
+        free((void *)client->po_buf);
+        client->po_buf = NULL;
+    }
 
     if (client->session) {
         client->session->client = NULL;
@@ -3606,7 +3615,7 @@ done:
  */
 [[gnu::nonnull]]
 static struct message *register_message(const uint8_t *topic_name, int format,
-        uint16_t len, const void *payload, unsigned qos, struct session *sender,
+        uint32_t len, const void *payload, unsigned qos, struct session *sender,
         bool retain, message_type_t type)
 {
     struct topic *topic;
@@ -4220,7 +4229,7 @@ fail:
 [[gnu::nonnull, gnu::warn_unused_result]]
 static int send_cp_publish(struct packet *pkt)
 {
-    ssize_t length, wr_len;
+    ssize_t length;//, wr_len;
     uint8_t *packet, *ptr;
     uint8_t proplen[4], remlen[4];
     int proplen_len, remlen_len, prop_len;
@@ -4321,13 +4330,9 @@ static int send_cp_publish(struct packet *pkt)
         goto fail;
     }
 
-    /* Now send the packet */
-    if ((wr_len = write(pkt->owner->fd, packet, length)) != length) {
-        pkt->owner->state = CS_CLOSED;
-        close_socket(&pkt->owner->fd);
-        free(packet);
-        return log_io_error(NULL, wr_len, length, false, pkt->owner);
-    }
+    set_outbound(pkt->owner, packet, length);
+    handle_outbound(pkt->owner);
+    return 0;
 
 skip_write:
     free(packet);
@@ -5318,12 +5323,13 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
                 &packet->property_count, MQTT_CP_PUBLISH) == -1)
         goto fail;
-    dbg_printf("payload_format=%u [%lub]", payload_format, bytes_left);
+    dbg_printf("payload_format=%u [%lub] ", payload_format, bytes_left);
 
     packet->payload_len = bytes_left;
     if ((packet->payload = malloc(bytes_left)) == NULL)
         goto fail;
     memcpy(packet->payload, ptr, bytes_left);
+    dbg_printf("payload_len=%u ", packet->payload_len);
 
     dbg_printf("\n");
 
@@ -5379,6 +5385,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     }
 
     struct message *msg;
+    dbg_printf("     about to register_message with payload_len of %u\n", packet->payload_len);
     if ((msg = register_message(topic_name, payload_format, packet->payload_len,
                     packet->payload, qos, client->session, flag_retain,
                     MSG_NORMAL)) == NULL) {
@@ -6258,7 +6265,7 @@ fail:
 
     if (errno == 0)
         errno = EINVAL;
-    
+
     client->state = CS_CLOSING;
     if (client->disconnect_reason == 0)
         client->disconnect_reason = reason_code;
@@ -6340,6 +6347,58 @@ static const struct {
 /*
  * other functions
  */
+
+[[gnu::nonnull]]
+static void handle_outbound(struct client *client)
+{
+    ssize_t rc;
+
+    if (client->fd == -1)
+        return;
+
+    dbg_printf(BWHT "[%2d] handle_outbound: size=%u offset=%u remaining=%u" CRESET "\n",
+            client->session ? client->session->id : (id_t)-1,
+            client->po_size,
+            client->po_offset,
+            client->po_remaining);
+
+    rc = write(client->fd, client->po_buf + client->po_offset, client->po_remaining);
+
+    if (rc == client->po_remaining) {
+        free((void *)client->po_buf);
+        client->po_buf = NULL;
+        client->po_remaining = 0;
+        client->po_offset = 0;
+        client->po_size = 0;
+        return;
+    }
+
+    if (rc == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            client->write_ok = false;
+        else {
+            client->state = CS_CLOSING;
+            log_io_error(NULL, rc, client->po_remaining, false, client);
+        }
+        return;
+    }
+
+    /* short write */
+    client->po_remaining -= rc;
+    client->po_offset += rc;
+    log_io_error(NULL, rc, client->po_remaining, false, client);
+}
+
+static void set_outbound(struct client *client, const uint8_t *buf, unsigned len)
+{
+    if (client->po_buf)
+        free((void *)client->po_buf);
+
+    client->po_buf = buf;
+    client->po_size = len;
+    client->po_offset = 0;
+    client->po_remaining = len;
+}
 
 
 [[gnu::nonnull]]
@@ -6622,6 +6681,9 @@ static void client_tick(void)
                         goto force_close;
                     }
                 }
+
+                if (clnt->write_ok && clnt->po_buf)
+                    handle_outbound(clnt);
 
                 break;
 
@@ -7232,11 +7294,14 @@ static RETURN_TYPE main_loop(void *start_args)
                 if (clnt->owner != pthread_self())
                     continue;
 #endif
-
                 if (clnt->fd > max_fd)
                     max_fd = clnt->fd;
 
-                FD_SET(clnt->fd, &fds_in);
+                /* We don't want to start parsing a new incoming packet,
+                 * if we're still sending an outbound one
+                 */
+                if (clnt->po_buf == NULL)
+                    FD_SET(clnt->fd, &fds_in);
                 FD_SET(clnt->fd, &fds_out);
                 FD_SET(clnt->fd, &fds_exc);
 
@@ -7358,13 +7423,6 @@ shit_fd:
                 if (clnt->owner != pthread_self())
                     continue;
 #endif
-
-                if (FD_ISSET(clnt->fd, &fds_in)) {
-                    if (parse_incoming(clnt) == -1) {
-                        /* TODO do something? */ ;
-                    }
-                }
-
                 if (clnt->fd == -1)
                     continue;
 
@@ -7373,6 +7431,15 @@ shit_fd:
                     /* socket is writable without blocking [ish] */
                 } else {
                     clnt->write_ok = false;
+                }
+
+                if (clnt->fd == -1)
+                    continue;
+
+                if (FD_ISSET(clnt->fd, &fds_in)) {
+                    if (parse_incoming(clnt) == -1) {
+                        /* TODO do something? */ ;
+                    }
                 }
 
                 if (clnt->fd == -1)
