@@ -891,7 +891,6 @@ static int openmetrics_export(int fd)
     } else
         size = 0;
 
-
     if (buffer)
         free(buffer);
     fclose(in);
@@ -1019,7 +1018,6 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
             DEC_REFCNT(&mds->message->refcnt); /* alloc_message_delivery_state */
             dbg_printf("     mds_detach_and_free: DEC_REFCNT on message.id=%d refcnt=%u\n", mds->message->id, mds->message->refcnt);
         }
-
 
         if (message_lock)
             pthread_rwlock_unlock(&mds->message->delivery_states_lock);
@@ -1562,7 +1560,6 @@ static void free_client(struct client *client, bool needs_lock)
             client->session ? (char *)client->session->client_id : "",
             GET_REFCNT(&client->refcnt));
 
-
     if (needs_lock)
         pthread_rwlock_wrlock(&global_clients_lock);
 
@@ -1870,7 +1867,17 @@ fail:
 static int add_session_to_shared_sub(struct subscription *sub,
         struct session *session, uint8_t qos)
 {
-    void *tmp;
+    void *tmp = NULL;
+
+    errno = 0;
+
+    /* first, check if the sub is already present, if so, updated qos and return */
+    for (unsigned idx = 0; idx < sub->shared.num_sessions; idx++)
+        if (sub->shared.sessions[idx] == session) {
+            sub->shared.qos_levels[idx] = qos;
+            errno = EEXIST;
+            return -1;
+        }
 
     dbg_printf("[%2d] add_session_to_shared_sub: subscription.id=%d session.id=%d\n",
             session->id, sub->id, session->id);
@@ -2335,7 +2342,6 @@ static struct session *find_session(struct client *client)
     return NULL;
 }
 
-
 /*
  * packet parsing helpers
  */
@@ -2542,7 +2548,6 @@ next:
 
     return true;
 }
-
 
 [[gnu::nonnull, gnu::warn_unused_result]]
 static int encode_var_byte(uint32_t value, uint8_t out[static 4])
@@ -3340,7 +3345,6 @@ static struct subscription *find_matching_subscription(const uint8_t *name,
     return NULL;
 }
 
-
 [[gnu::nonnull(1), gnu::warn_unused_result]]
 static struct topic *find_or_register_topic(const uint8_t *name)
 {
@@ -3883,20 +3887,17 @@ skip_client:
 
     session->subscriptions = tmp_client;
     session->num_subscriptions = client_sub_cnt;
+    DEC_REFCNT(&session->refcnt); /* alloc_subscription || add_session_to_shared_sub */
 
-    /* TODO handle SUB_SHARED */
     switch (sub->type)
     {
         case SUB_NON_SHARED:
-            DEC_REFCNT(&session->refcnt); /* alloc_subscription */
             sub->non_shared.session = NULL;
             free_subscription(sub);
-            sub = NULL;
             break;
         case SUB_SHARED:
             if (remove_session_from_shared_sub(sub, session) == -1)
                 warn("unsubscribe: remove_session_from_shared_sub");
-            DEC_REFCNT(&session->refcnt); /* add_session_to_shared_sub */
             if (sub->shared.num_sessions == 0)
                 free_subscription(sub);
             break;
@@ -3905,7 +3906,7 @@ skip_client:
             warn("unsubscribe: invalid sub.type");
             break;
     }
-
+    sub = NULL;
 
     pthread_rwlock_unlock(&session->subscriptions_lock);
     return 0;
@@ -4043,7 +4044,6 @@ static int subscribe_to_one_topic(struct session *session,
             session->id, (const char *)topic_filter);
 
     if (is_shared_subscription(topic_filter)) {
-        dbg_printf("[%2d] subscribe_to_topics: likely SHARED\n", session->id);
         ptr = topic_filter + SHARED_PREFIX_LENGTH;
 
         while (*ptr && *ptr != '/')
@@ -4066,7 +4066,6 @@ static int subscribe_to_one_topic(struct session *session,
             goto fail;
 
         type = SUB_SHARED;
-        dbg_printf("     subscribe_to_one_topic: shared\n");
 not_shared:
     }
 
@@ -4090,10 +4089,9 @@ not_shared:
                 break;
         }
 
-        /* TODO refactor to add_subscription_to_session() */
         session->subscriptions[sub_idx] = new_sub;
-        existing_sub = new_sub;
         session->num_subscriptions++;
+        existing_sub = new_sub;
 
         goto force_existing;
 
@@ -4111,19 +4109,26 @@ not_shared:
 
 force_existing:
     /* At this point existing_sub = new_sub|existing_sub */
-    existing_sub->option = options;
 
     /* TODO what if non-QoS options have changed ? */
-
     switch(type)
     {
         case SUB_NON_SHARED:
+            existing_sub->option = options; /* TODO move this to sub->non_shared? */
             break;
 
         case SUB_SHARED:
-            add_session_to_shared_sub(existing_sub, session,
-                    (options & MQTT_SUBOPT_QOS_MASK));
-            /* refactor somewhere? */
+            if (add_session_to_shared_sub(existing_sub, session,
+                    (options & MQTT_SUBOPT_QOS_MASK)) == -1) {
+
+                /* We were just doing an update. */
+                if (errno == EEXIST)
+                    break;
+
+                *reason_code = MQTT_UNSPECIFIED_ERROR;
+                goto done;
+            }
+
             session->subscriptions[sub_idx] = existing_sub;
             session->num_subscriptions++;
             break;
@@ -4351,7 +4356,6 @@ fail:
     pthread_rwlock_unlock(&session->delivery_states_lock);
     return -1;
 }
-
 
 /*
  * control packet response functions
@@ -4766,7 +4770,6 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     errno = 0;
     dbg_printf("[%2d] send_cp_pubcomp: packet_id=%u reason_code=%d <%s> client.id=%d\n", client->session ? client->session->id : (id_t)-1, packet_id, reason_code, reason_codes_str[reason_code], client->id);
 
-
     length = 0;
     length +=2; /* Packet Identifier */
 
@@ -5123,7 +5126,6 @@ fail:
         free(packet);
     return -1;
 }
-
 
 /*
  * control packet processing functions
@@ -6018,7 +6020,6 @@ static int handle_cp_pingreq(struct client *client,
 {
     dbg_printf("[%2d] handle_cp_pingreq\n", client->session->id);
 
-
     if (packet->remaining_length > 0) {
         errno = EINVAL;
         close_client(client, MQTT_MALFORMED_PACKET, false);
@@ -6177,7 +6178,6 @@ version_fail:
         will_topic = read_utf8(&ptr, &bytes_left);
         if (will_topic == NULL)
             goto fail;
-
 
         if ((will_payload = read_binary(&ptr, &bytes_left,
                         &will_payload_len)) == NULL)
@@ -6567,6 +6567,7 @@ free_and_return:
     log_io_error(NULL, rc, client->po_remaining, false, client);
 }
 
+[[gnu::nonnull]]
 static void set_outbound(struct client *client, const uint8_t *buf, unsigned len)
 {
     if (client->po_buf)
@@ -6577,7 +6578,6 @@ static void set_outbound(struct client *client, const uint8_t *buf, unsigned len
     client->po_offset = 0;
     client->po_remaining = len;
 }
-
 
 [[gnu::nonnull]]
 static int parse_incoming(struct client *client)
@@ -7428,7 +7428,7 @@ static void *tick_loop(void * /* arg */)
 #endif
 
 #ifdef FEATURE_THREADS
-static RETURN_TYPE om_loop(void *start_args)
+static RETURN_TYPE openmetrics_loop(void *start_args)
 {
     const int om_fd = ((const struct start_args *)start_args)->om_fd;
 
@@ -7448,7 +7448,7 @@ static RETURN_TYPE om_loop(void *start_args)
         if ((rc = select(om_fd + 1, &fds_in, NULL, NULL, &timeout)) == -1) {
             if (errno == EINTR)
                 continue;
-            logger(LOG_WARNING, NULL, "om_loop: select: %s", strerror(errno));
+            logger(LOG_WARNING, NULL, "openmetrics_loop: select: %s", strerror(errno));
             sleep(1);
         }
 
@@ -7457,7 +7457,7 @@ static RETURN_TYPE om_loop(void *start_args)
 
         if ((fd = accept(om_fd, NULL, NULL)) == -1) {
             if (errno != EWOULDBLOCK && errno != EAGAIN)
-                logger(LOG_WARNING, NULL, "om_loop: accept: %s", strerror(errno));
+                logger(LOG_WARNING, NULL, "openmetrics_loop: accept: %s", strerror(errno));
             sleep(1);
             continue;
         }
@@ -7468,7 +7468,7 @@ static RETURN_TYPE om_loop(void *start_args)
             close_socket(&fd);
     }
 
-    logger(LOG_INFO, NULL, "om_loop: terminated normally");
+    logger(LOG_INFO, NULL, "openmetrics_loop: terminated normally");
 
     return 0;
 }
@@ -8105,9 +8105,8 @@ int main(int argc, char *argv[])
     pthread_t main_thread[NUM_THREADS], tick_thread[NUM_THREADS], om_thread;
 
     if (opt_openmetrics &&
-            pthread_create(&om_thread, NULL, om_loop, &start_args_om) == -1)
-        err(EXIT_FAILURE, "pthread_create: om_loop");
-
+            pthread_create(&om_thread, NULL, openmetrics_loop, &start_args_om) == -1)
+        err(EXIT_FAILURE, "pthread_create: openmetrics_loop");
 
     for (unsigned idx = 0; idx < NUM_THREADS; idx++)
         if (pthread_create(&main_thread[idx], NULL, main_loop, idx == 0 ? &start_args0 : &start_argsn) == -1)
