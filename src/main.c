@@ -7330,7 +7330,9 @@ static RETURN_TYPE main_loop(void *start_args)
     fd_set fds_in, fds_out, fds_exc;
     const int mother_fd = ((const struct start_args *)start_args)->fd;
     const int om_fd = ((const struct start_args *)start_args)->om_fd;
+#ifdef FEATURE_THREADS
     const pthread_t self = pthread_self();
+#endif
 
     while (running)
     {
