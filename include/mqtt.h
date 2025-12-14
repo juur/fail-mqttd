@@ -487,6 +487,7 @@ struct client {
     time_t last_connected;
     time_t last_keep_alive;
     reason_code_t disconnect_reason;
+    bool send_disconnect;
     uint32_t maximum_packet_size;
     bool is_auth;
     bool write_ok;
@@ -509,6 +510,7 @@ struct client {
     unsigned po_size;
     unsigned po_offset;
     unsigned po_remaining;
+    pthread_rwlock_t po_lock;
 
     _Atomic unsigned refcnt;
 

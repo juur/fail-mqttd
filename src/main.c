@@ -172,15 +172,14 @@ static _Atomic unsigned num_sessions      = 0;
 static _Atomic unsigned num_mds           = 0;
 static _Atomic unsigned num_subscriptions = 0;
 
-static _Atomic unsigned long total_messages_accepted_at = 0;
-static _Atomic unsigned long total_messages_acknowledged_at = 0;
-static _Atomic unsigned long total_messages_released_at = 0;
-static _Atomic unsigned long total_messages_completed_at = 0;
-static _Atomic unsigned long total_messages_sender_accepted_at = 0;
+static _Atomic unsigned long total_messages_accepted_at            = 0;
+static _Atomic unsigned long total_messages_acknowledged_at        = 0;
+static _Atomic unsigned long total_messages_released_at            = 0;
+static _Atomic unsigned long total_messages_completed_at           = 0;
+static _Atomic unsigned long total_messages_sender_accepted_at     = 0;
 static _Atomic unsigned long total_messages_sender_acknowledged_at = 0;
-static _Atomic unsigned long total_messages_sender_released_at = 0;
-static _Atomic unsigned long total_messages_sender_completed_at = 0;
-
+static _Atomic unsigned long total_messages_sender_released_at     = 0;
+static _Atomic unsigned long total_messages_sender_completed_at    = 0;
 
 static _Atomic bool has_clients = false;
 
@@ -221,6 +220,7 @@ static char *logfile_name = NULL;
 [[gnu::nonnull]] static void handle_outbound(struct client *client);
 [[gnu::nonnull]] static void set_outbound(struct client *client, const uint8_t *buf, unsigned len);
 [[gnu::nonnull]] static void close_session(struct session *session);
+[[gnu::nonnull]] static void close_client(struct client *client, reason_code_t reason, bool disconnect);
 [[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe(struct subscription *sub);
 [[gnu::nonnull, gnu::warn_unused_result]] static int dequeue_message(struct message *msg);
 [[gnu::nonnull]] static void free_message(struct message *msg, bool need_lock);
@@ -1042,6 +1042,7 @@ static void close_socket(int *fd)
     if (*fd != -1) {
         shutdown(*fd, SHUT_RDWR);
         close(*fd);
+        dbg_printf("     close_socket: %u\n", *fd);
         *fd = -1;
     }
 }
@@ -2073,6 +2074,9 @@ static struct client *alloc_client(void)
     if (pthread_rwlock_init(&client->active_packets_lock, NULL) == -1)
         goto fail;
 
+    if (pthread_rwlock_init(&client->po_lock, NULL) == -1)
+        goto fail;
+
     pthread_rwlock_wrlock(&global_clients_lock);
     client->next = global_client_list;
     global_client_list = client;
@@ -2276,8 +2280,11 @@ static int disconnect_if_malformed(struct client *client, reason_code_t code)
     if (!is_malformed(code))
         return 0;
 
+    client->send_disconnect = false;
     client->disconnect_reason = code;
     client->state = CS_CLOSED;
+    if (client->fd != -1)
+        close_socket(&client->fd);
 
     if (errno == 0)
         errno = EINVAL;
@@ -3381,8 +3388,7 @@ static int remove_delivery_state(
 
     for (; new_idx <= new_length && old_idx < old_length; old_idx++)
     {
-        dbg_printf("     remove_delivery_state: new_idx=%u old_idx=%u\n",
-                new_idx, old_idx);
+        //dbg_printf("     remove_delivery_state: new_idx=%u old_idx=%u\n", new_idx, old_idx);
 
         if ((*state_array)[old_idx] == rem) {
             found = true;
@@ -4330,8 +4336,12 @@ static int send_cp_publish(struct packet *pkt)
         goto fail;
     }
 
+    /* We lock here to avoid another thread picking up half way inside
+     * set_outbound() and clashing with handle_outbound() */
+    pthread_rwlock_wrlock(&pkt->owner->po_lock);
     set_outbound(pkt->owner, packet, length);
     handle_outbound(pkt->owner);
+    pthread_rwlock_unlock(&pkt->owner->po_lock);
     return 0;
 
 skip_write:
@@ -4391,8 +4401,11 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
             client->session ? client->session->id : (id_t)-1, reason_code);
 
     free(packet);
+    client->send_disconnect = false;
+#if 0
     client->state = CS_CLOSING;
     client->disconnect_reason = 0;
+#endif
 
     return 0;
 }
@@ -4530,11 +4543,13 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     free(packet);
     free(tmp_connack_props);
 
+#if 0
+    /* TODO check caller has called close_socket() correctly */
     if (is_malformed(reason_code)) {
         client->disconnect_reason = reason_code;
         client->state = CS_CLOSING;
     }
-
+#endif
 
     return 0;
 
@@ -5820,7 +5835,8 @@ skip:
     if (bytes_left)
         goto fail;
 
-    if (disconnect_reason == 0) {
+    /* TODO MQTT_DISCONNECT_WITH_WILL_MESSAGE ? */
+    if (disconnect_reason == MQTT_NORMAL_DISCONNECTION) {
         if (client->session && client->session->will_topic) {
             client->session->will_retain = false;
             if (client->session->will_payload) {
@@ -5840,12 +5856,14 @@ skip:
         }
     }
 
-    client->state = CS_DISCONNECTED;
+    close_client(client, disconnect_reason, true); /* TODO check */
+    //client->state = CS_DISCONNECTED;
     return 0;
 
 fail:
-    warnx("handle_cp_disconnect: packet malformed");
-    client->state = CS_CLOSING;
+    //warnx("handle_cp_disconnect: packet malformed");
+    //client->state = CS_CLOSING;
+    close_client(client, MQTT_MALFORMED_PACKET, false);
     return -1;
 }
 
@@ -5858,7 +5876,8 @@ static int handle_cp_pingreq(struct client *client,
 
     if (packet->remaining_length > 0) {
         errno = EINVAL;
-        disconnect_if_malformed(client, MQTT_MALFORMED_PACKET);
+        close_client(client, MQTT_MALFORMED_PACKET, false);
+        //disconnect_if_malformed(client, MQTT_MALFORMED_PACKET);
         return -1;
     }
 
@@ -6251,7 +6270,10 @@ fail:
         }
     }
 
+    bool connack_failed = false;
+
     if (send_cp_connack(client, reason_code) == -1) {
+        connack_failed = true;
     }
 
     if (will_topic)
@@ -6266,9 +6288,15 @@ fail:
     if (errno == 0)
         errno = EINVAL;
 
+    close_client(client, reason_code, false);
+    if (!connack_failed) /* response already sent via CONNACK */
+        client->send_disconnect = false;
+
+#if 0
     client->state = CS_CLOSING;
     if (client->disconnect_reason == 0)
         client->disconnect_reason = reason_code;
+#endif
 
     return -1;
 }
@@ -6317,8 +6345,11 @@ skip_props:
     return 0;
 
 fail:
+    close_client(client, reason_code, false);
+#if 0
     if (disconnect_if_malformed(client, reason_code))
         return -1;
+#endif
 
     return -1;
 }
@@ -6520,7 +6551,7 @@ lenread:
                     return 0;
 
                 if (client->rl_value > MAX_PACKET_LENGTH) {
-                    client->disconnect_reason = MQTT_PACKET_TOO_LARGE;
+                    reason_code = MQTT_PACKET_TOO_LARGE;
                     errno = EFBIG;
                     goto fail;
                 }
@@ -6647,11 +6678,37 @@ fail:
     client->parse_state = READ_STATE_NEW;
     client->state = CS_CLOSING;
     client->disconnect_reason = reason_code;
+    client->send_disconnect = true; /* TODO move to close_client() ? */
 
     return -1;
 }
 
 /* Clients */
+
+/*
+ * we need to handle several scenarios:
+ * 1. a polite disconnection (ready for reconnection)
+ * 2. a requested disconnection (no reconnection)
+ * 3. a termination (with DISCONNECT)
+ * 4. a termination (without DISCONNECT) e.g. a malformed packet
+ */
+static void close_client(struct client *client, reason_code_t reason, bool disconnect)
+{
+    /* Scenario 4 - no DISCONNECT */
+    if (disconnect_if_malformed(client, disconnect) == -1)
+        return;
+
+    client->disconnect_reason = reason;
+
+    if (disconnect) {
+        /* Scenario 1 - can reconnect */
+        client->state = CS_DISCONNECTED;
+    } else {
+        /* Scenario 3 */
+        client->send_disconnect = true;
+        client->state = CS_CLOSING;
+    }
+}
 
 static void client_tick(void)
 {
@@ -6684,8 +6741,13 @@ static void client_tick(void)
                     }
                 }
 
-                if (clnt->write_ok && clnt->po_buf)
-                    handle_outbound(clnt);
+                if (clnt->write_ok && clnt->po_buf) {
+                    /* avoid two threads attempting to send random data */
+#ifdef FEATURE_THREADS
+                    if (pthread_rwlock_trywrlock(&clnt->po_lock) == 0)
+#endif
+                        handle_outbound(clnt);
+                }
 
                 break;
 
@@ -6733,6 +6795,7 @@ static void client_tick(void)
                     DEC_REFCNT(&clnt->session->refcnt); /* handle_cp_connect */
                     clnt->session = NULL;
                 }
+                clnt->send_disconnect = false;
                 goto skip_send_disconnect;
 
             case CS_CLOSING:
@@ -6740,12 +6803,12 @@ static void client_tick(void)
                     warnx("[%2d] client_tick: session present in CS_CLOSING",
                             clnt->session->id);
 
-                if (clnt->disconnect_reason) {
+                if (clnt->send_disconnect) {
                     logger(LOG_NOTICE, clnt,
                             "client_tick: disconnecting client with reason %s",
                             reason_codes_str[clnt->disconnect_reason]);
                     send_cp_disconnect(clnt, clnt->disconnect_reason);
-                    clnt->disconnect_reason = 0;
+                    clnt->send_disconnect = false;
                 }
 
 skip_send_disconnect:
@@ -7265,8 +7328,9 @@ static RETURN_TYPE om_loop(void *start_args)
 static RETURN_TYPE main_loop(void *start_args)
 {
     fd_set fds_in, fds_out, fds_exc;
-    int mother_fd = ((const struct start_args *)start_args)->fd;
-    int om_fd = ((const struct start_args *)start_args)->om_fd;
+    const int mother_fd = ((const struct start_args *)start_args)->fd;
+    const int om_fd = ((const struct start_args *)start_args)->om_fd;
+    const pthread_t self = pthread_self();
 
     while (running)
     {
@@ -7278,7 +7342,8 @@ static RETURN_TYPE main_loop(void *start_args)
         FD_ZERO(&fds_out);
         FD_ZERO(&fds_exc);
 
-        FD_SET(mother_fd, &fds_in);
+        if (mother_fd > 0)
+            FD_SET(mother_fd, &fds_in);
         if (om_fd > 0)
             FD_SET(om_fd, &fds_in);
 
@@ -7293,7 +7358,7 @@ static RETURN_TYPE main_loop(void *start_args)
                     continue;
 
 #ifdef FEATURE_THREADS
-                if (clnt->owner != pthread_self())
+                if (clnt->owner != self)
                     continue;
 #endif
                 if (clnt->fd > max_fd)
@@ -7359,59 +7424,63 @@ static RETURN_TYPE main_loop(void *start_args)
             }
         }
 
-        if (FD_ISSET(mother_fd, &fds_in)) {
-            struct sockaddr_in sin_client;
-            socklen_t sin_client_len = sizeof(sin_client);
-            int child_fd;
-            struct client *new_client;
+        if (mother_fd > 0) {
+            if (FD_ISSET(mother_fd, &fds_in)) {
+                struct sockaddr_in sin_client;
+                socklen_t sin_client_len = sizeof(sin_client);
+                int child_fd;
+                struct client *new_client;
 
-            dbg_printf("     main_loop: new connection\n");
-            if ((child_fd = accept(mother_fd,
-                            (struct sockaddr *)&sin_client,
-                            &sin_client_len)) == -1) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK)
-                    warn("main_loop: accept failed");
-                continue;
-            }
+                FD_CLR(mother_fd, &fds_in);
 
-            int flags;
+                dbg_printf("     main_loop: new connection\n");
+                if ((child_fd = accept(mother_fd,
+                                (struct sockaddr *)&sin_client,
+                                &sin_client_len)) == -1) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        warn("main_loop: accept failed");
+                        continue;
+                    }
+                }
 
-            if ((flags = fcntl(child_fd, F_GETFL)) == -1) {
-                warn("main_loop: fcntl: F_GETFL");
-                goto shit_fd;
-            }
+                int flags;
 
-            flags |= O_NONBLOCK;
+                if ((flags = fcntl(child_fd, F_GETFL)) == -1) {
+                    warn("main_loop: fcntl: F_GETFL");
+                    goto shit_fd;
+                }
 
-            if (fcntl(child_fd, F_SETFL, flags) == -1) {
-                warn("main_loop: fcntl: F_SETFL");
-                goto shit_fd;
-            }
+                flags |= O_NONBLOCK;
 
-            if ((new_client = alloc_client()) == NULL) {
+                if (fcntl(child_fd, F_SETFL, flags) == -1) {
+                    warn("main_loop: fcntl: F_SETFL");
+                    goto shit_fd;
+                }
+
+                if ((new_client = alloc_client()) == NULL) {
 shit_fd:
-                close_socket(&child_fd);
-                warn("main_loop: alloc_client");
-                continue;
-            }
+                    close_socket(&child_fd);
+                    warn("main_loop: alloc_client");
+                    continue;
+                }
 
 #ifdef FEATURE_THREADS
-            new_client->owner = pthread_self();
+                new_client->owner = self;
 #endif
+                if (inet_ntop(AF_INET, &sin_client.sin_addr.s_addr,
+                            new_client->hostname, sin_client_len) == NULL)
+                    warn("inet_ntop");
 
-            if (inet_ntop(AF_INET, &sin_client.sin_addr.s_addr,
-                        new_client->hostname, sin_client_len) == NULL)
-                warn("inet_ntop");
+                new_client->fd = child_fd;
+                new_client->tcp_accepted_at = time(NULL);
+                new_client->remote_port = ntohs(sin_client.sin_port);
+                new_client->remote_addr = ntohl(sin_client.sin_addr.s_addr);
 
-            new_client->fd = child_fd;
-            new_client->tcp_accepted_at = time(NULL);
-            new_client->remote_port = ntohs(sin_client.sin_port);
-            new_client->remote_addr = ntohl(sin_client.sin_addr.s_addr);
-
-            dbg_printf("     main_loop: new client from [%s:%u]\n",
-                    new_client->hostname, new_client->remote_port);
-            logger(LOG_INFO, new_client, "main_loop: new connection");
-            new_client->state = CS_ACTIVE;
+                dbg_printf("     main_loop: new client from [%s:%u]\n",
+                        new_client->hostname, new_client->remote_port);
+                logger(LOG_INFO, new_client, "main_loop: new connection");
+                new_client->state = CS_ACTIVE;
+            }
         }
 
         if (num_clients) {
@@ -7422,7 +7491,7 @@ shit_fd:
                     continue;
 
 #ifdef FEATURE_THREADS
-                if (clnt->owner != pthread_self())
+                if (clnt->owner != self)
                     continue;
 #endif
                 if (clnt->fd == -1)
@@ -7450,6 +7519,7 @@ shit_fd:
                 if (FD_ISSET(clnt->fd, &fds_exc)) {
                     dbg_printf("     main_loop exception event on %p[%d]\n",
                             (void *)clnt, clnt->fd);
+                    close_socket(&clnt->fd);
                     /* TODO close? */
                 }
             }
@@ -7846,8 +7916,13 @@ int main(int argc, char *argv[])
     }
 
 #ifdef FEATURE_THREADS
-    struct start_args start_args = {
+    struct start_args start_args0 = {
         .fd = global_mother_fd,
+        .om_fd = -1,
+    };
+    
+    struct start_args start_argsn = {
+        .fd = -1,
         .om_fd = -1,
     };
 
@@ -7864,7 +7939,7 @@ int main(int argc, char *argv[])
     running = true;
 
 #ifdef FEATURE_THREADS
-#define NUM_THREADS 2
+#define NUM_THREADS 16
     pthread_t main_thread[NUM_THREADS], tick_thread[NUM_THREADS], om_thread;
 
     if (opt_openmetrics &&
@@ -7873,7 +7948,7 @@ int main(int argc, char *argv[])
 
 
     for (unsigned idx = 0; idx < NUM_THREADS; idx++)
-        if (pthread_create(&main_thread[idx], NULL, main_loop, &start_args) == -1)
+        if (pthread_create(&main_thread[idx], NULL, main_loop, idx == 0 ? &start_args0 : &start_argsn) == -1)
             err(EXIT_FAILURE, "pthread_create: main_thread[%u]", idx);
 
     for (unsigned idx = 0; idx < NUM_THREADS; idx++)
