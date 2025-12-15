@@ -778,6 +778,11 @@ static int openmetrics_export(int fd)
         "HTTP/1.1 200 OK\r\n"
         "content-type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n"
         "connection: close\r\n"
+        "cache-control: max-age=5, must-revalidate\r\n"
+        "last-modified: %s\r\n"
+        "content-language: en-GB\r\n"
+        "allow: GET, HEAD\r\n"
+        "retry-after: 5\r\n"
         "date: %s\r\n"
         "content-length: %lu\r\n"
         "\r\n";
@@ -856,28 +861,12 @@ static int openmetrics_export(int fd)
             total_control_packets_processed - total_control_packets_processed_ok
            );
 
-#if 0
-    fprintf(mem, "# TYPE topic_subscribers gauge\n");
-    pthread_rwlock_rdlock(&global_topics_lock);
-    for (struct topic *topic = global_topic_list; topic; topic = topic->next)
-    {
-        fprintf(mem,
-                "topic_subscribers{topic_name=\"%s\",topic_id=\"%u\"} %u\n"
-                ,
-                topic->name,
-                topic->id,
-                topic->num_subscribers
-               );
-    }
-    pthread_rwlock_unlock(&global_topics_lock);
-#endif
-
     fprintf(mem, "# EOF\n");
 
     fclose(mem);
     mem = NULL;
 
-    len = snprintf(hdrbuf, sizeof(hdrbuf), http_response, date, size);
+    len = snprintf(hdrbuf, sizeof(hdrbuf), http_response, date, date, size);
 
     alarm(5);
     if (fwrite(hdrbuf, 1, len, in) != len) {
@@ -1057,7 +1046,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
     return rc;
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static void close_socket(int *fd)
 {
     if (*fd != -1) {
@@ -1134,7 +1123,7 @@ static void free_subscription(struct subscription *sub)
     free(sub);
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static void free_topic_subs(struct topic_sub_request *request)
 {
     if (request->topics) {
@@ -1192,6 +1181,7 @@ static void free_topic(struct topic *topic)
     }
     pthread_rwlock_unlock(&topic->pending_queue_lock);
 
+    /* handle any retained message */
     if (topic->retained_message) {
         struct message *msg = topic->retained_message;
         dbg_printf("     free_topic: freeing retained_message id=%d\n", msg->id);
@@ -1437,16 +1427,8 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
         pck->payload = NULL;
     }
 
-    /*if (pck->will_props) {
-        free_properties(pck->will_props, pck->num_will_props);
-
-        pck->num_will_props = 0;
-        pck->will_props = NULL;
-    }*/
-
     if (pck->properties) {
         free_properties(pck->properties, pck->property_count);
-
         pck->property_count = 0;
         pck->properties = NULL;
     }
@@ -1547,7 +1529,7 @@ static void free_message(struct message *msg, bool need_lock)
     free(msg);
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static void free_client(struct client *client, bool needs_lock)
 {
     struct client *tmp;
@@ -1600,6 +1582,9 @@ static void free_client(struct client *client, bool needs_lock)
 
     client->next = NULL;
 
+    if (client->fd != -1)
+        close_socket(&client->fd);
+
     pthread_rwlock_wrlock(&client->active_packets_lock);
     for (struct packet *p = client->active_packets, *next; p; p = next)
     {
@@ -1618,8 +1603,22 @@ static void free_client(struct client *client, bool needs_lock)
     }
     pthread_rwlock_unlock(&global_packets_lock);
 
-    if (client->fd != -1)
-        close_socket(&client->fd);
+    if (client->clnt_topic_aliases) {
+        for (unsigned idx = 0; idx < client->topic_alias_maximum; idx++)
+            if (client->clnt_topic_aliases[idx]) {
+                free((void *)client->clnt_topic_aliases[idx]);
+                client->clnt_topic_aliases[idx] = NULL;
+            }
+        free((void *)client->clnt_topic_aliases);
+        client->clnt_topic_aliases = NULL;
+    }
+
+
+    if (client->session) {
+        client->session->client = NULL;
+        DEC_REFCNT(&client->session->refcnt); /* handle_cp_connect */
+        client->session = NULL;
+    }
 
     if (client->client_id) {
         free ((void *)client->client_id);
@@ -1646,28 +1645,13 @@ static void free_client(struct client *client, bool needs_lock)
         client->po_buf = NULL;
     }
 
-    if (client->session) {
-        client->session->client = NULL;
-        DEC_REFCNT(&client->session->refcnt); /* handle_cp_connect */
-        client->session = NULL;
-    }
-
     if (client->svr_topic_aliases) {
         free((void *)client->svr_topic_aliases);
         client->svr_topic_aliases = NULL;
     }
 
-    if (client->clnt_topic_aliases) {
-        for (unsigned idx = 0; idx < client->topic_alias_maximum; idx++)
-            if (client->clnt_topic_aliases[idx]) {
-                free((void *)client->clnt_topic_aliases[idx]);
-                client->clnt_topic_aliases[idx] = NULL;
-            }
-        free((void *)client->clnt_topic_aliases);
-        client->clnt_topic_aliases = NULL;
-    }
-
     pthread_rwlock_destroy(&client->active_packets_lock);
+    pthread_rwlock_destroy(&client->po_lock);
 
     num_clients--;
     free(client);
@@ -1808,18 +1792,18 @@ fail:
 static int remove_session_from_shared_sub(struct subscription *sub,
         struct session *session)
 {
-    void *tmp = NULL, *tmp_qos = NULL;
-    unsigned old_idx, new_idx;
+    struct session **tmp = NULL;
+    uint8_t *tmp_qos = NULL;
     bool found = false;
     size_t new_size;
 
     assert(session != NULL);
-
-    dbg_printf("     remove_session_from_shared_sub: subscription.id=%d session.id=%d\n",
-            sub->id, session->id);
     assert(sub->type == SUB_SHARED);
     assert(sub->shared.sessions != NULL);
     assert(sub->shared.qos_levels != NULL);
+
+    dbg_printf("     remove_session_from_shared_sub: subscription.id=%d session.id=%d\n",
+            sub->id, session->id);
 
     new_size = sizeof(struct subscription *) * (sub->shared.num_sessions - 1);
     if ((tmp = malloc(new_size)) == NULL)
@@ -1829,7 +1813,7 @@ static int remove_session_from_shared_sub(struct subscription *sub,
     if ((tmp_qos = malloc(new_size)) == NULL)
         goto fail;
 
-    for (old_idx = 0, new_idx = 0; old_idx < sub->shared.num_sessions; old_idx++)
+    for (unsigned old_idx = 0, new_idx = 0; old_idx < sub->shared.num_sessions; old_idx++)
     {
         if (sub->shared.sessions[old_idx] == session) {
             found = true;
@@ -1839,8 +1823,8 @@ static int remove_session_from_shared_sub(struct subscription *sub,
         if (new_idx == sub->shared.num_sessions - 1)
             break;
 
-        ((struct session **)tmp)[new_idx] = sub->shared.sessions[old_idx];
-        ((uint8_t *)tmp_qos)[new_idx] = sub->shared.qos_levels[old_idx];
+        tmp[new_idx] = sub->shared.sessions[old_idx];
+        tmp_qos[new_idx] = sub->shared.qos_levels[old_idx];
         new_idx++;
     }
 
@@ -4768,7 +4752,9 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     uint8_t remlen[4]; int remlen_len;
 
     errno = 0;
-    dbg_printf("[%2d] send_cp_pubcomp: packet_id=%u reason_code=%d <%s> client.id=%d\n", client->session ? client->session->id : (id_t)-1, packet_id, reason_code, reason_codes_str[reason_code], client->id);
+    dbg_printf("[%2d] send_cp_pubcomp: packet_id=%u reason_code=%d <%s> client.id=%d\n",
+            client->session ? client->session->id : (id_t)-1, packet_id, reason_code,
+            reason_codes_str[reason_code], client->id);
 
     length = 0;
     length +=2; /* Packet Identifier */
@@ -4849,7 +4835,9 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     uint16_t tmp;
     uint8_t remlen[4]; int remlen_len = 0;
 
-    dbg_printf("[%2d] send_cp_pubrel: packet_id=%u reason_code=%d <%s> client.id=%d\n", client->session ? client->session->id : (id_t)-1, packet_id, reason_code, reason_codes_str[reason_code], client->id);
+    dbg_printf("[%2d] send_cp_pubrel: packet_id=%u reason_code=%d <%s> client.id=%d\n",
+            client->session ? client->session->id : (id_t)-1, packet_id,
+            reason_code, reason_codes_str[reason_code], client->id);
 
     errno = 0;
 
@@ -5540,7 +5528,6 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     }
 
     struct message *msg;
-    dbg_printf("     about to register_message with payload_len of %u\n", packet->payload_len);
     if ((msg = register_message(topic_name, payload_format, packet->payload_len,
                     packet->payload, qos, client->session, flag_retain,
                     MSG_NORMAL)) == NULL) {
@@ -5814,9 +5801,8 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
             goto fail;
 
         /* QoS can't be 3 */
-        if ((*ptr & MQTT_SUBOPT_QOS_MASK) == MQTT_SUBOPT_QOS_MASK) {
+        if ((*ptr & MQTT_SUBOPT_QOS_MASK) == MQTT_SUBOPT_QOS_MASK)
             goto fail;
-        }
 
         /* retain handling can't be 3 */
         if ((*ptr & MQTT_SUBOPT_RETAIN_HANDLING_MASK) == MQTT_SUBOPT_RETAIN_HANDLING_MASK)
@@ -5827,12 +5813,6 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
                     (const char *)request->topics[request->num_topics]);
             if ((*ptr & MQTT_SUBOPT_NO_LOCAL))
                 goto fail;
-            /*
-            request->reason_codes[request->num_topics] = MQTT_SHARED_SUBSCRIPTIONS_NOT_SUPPORTED;
-            free((void *)request->topics[request->num_topics]);
-            request->topics[request->num_topics] = NULL;
-            goto next;
-            */
         }
 
         if (is_valid_topic_filter(request->topics[request->num_topics]) == -1) {
@@ -5909,27 +5889,6 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
         pthread_rwlock_unlock(&global_topics_lock);
     }
 
-#if 0
-    if ((msg = request->topic_refs[idx]->retained_message) == NULL)
-        continue;
-
-    if (msg->state != MSG_ACTIVE)
-        continue;
-
-    dbg_printf("[%2d] handle_cp_subscribe: handling retain message\n",
-            client->session->id);
-
-    if (enqueue_one_mds(msg, client->session) == -1)
-        continue;
-
-    dbg_printf("[%2d] handle_cp_subscribe: added retained message\n",
-            client->session->id);
-    msg->next_queue = msg->topic->pending_queue;
-    msg->topic->pending_queue = msg;
-
-    /* TODO */
-#endif
-
 skip_retain_check:
 
     free_topic_subs(request);
@@ -5944,7 +5903,7 @@ fail:
     return -1;
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static int handle_cp_disconnect(struct client *client, struct packet *packet,
         const void *remain)
 {
@@ -6023,7 +5982,6 @@ static int handle_cp_pingreq(struct client *client,
     if (packet->remaining_length > 0) {
         errno = EINVAL;
         close_client(client, MQTT_MALFORMED_PACKET, false);
-        //disconnect_if_malformed(client, MQTT_MALFORMED_PACKET);
         return -1;
     }
 
@@ -6044,7 +6002,7 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     uint16_t connect_header_length, keep_alive = 0;
     uint8_t protocol_version, connect_flags;
     uint8_t protocol_name[PROTOCOL_NAME_LEN];
-    const struct property *prop;
+    const struct property *prop = NULL;
     bool reconnect = false;
     bool clean = false;
     bool unlock = false;
@@ -6512,10 +6470,10 @@ static const struct {
     [MQTT_CP_PUBREC]      = { handle_cp_pubrec      , true  },
     [MQTT_CP_PUBREL]      = { handle_cp_pubrel      , true  },
     [MQTT_CP_PUBCOMP]     = { handle_cp_pubcomp     , true  },
+    [MQTT_CP_PINGREQ]     = { handle_cp_pingreq     , true  },
     [MQTT_CP_SUBSCRIBE]   = { handle_cp_subscribe   , true  },
     [MQTT_CP_UNSUBSCRIBE] = { handle_cp_unsubscribe , true  },
     [MQTT_CP_CONNECT]     = { handle_cp_connect     , false },
-    [MQTT_CP_PINGREQ]     = { handle_cp_pingreq     , true  },
     [MQTT_CP_DISCONNECT]  = { handle_cp_disconnect  , true  },
     [MQTT_CP_AUTH]        = { handle_cp_auth        , false },
 };
@@ -6861,9 +6819,9 @@ static void close_client(struct client *client, reason_code_t reason, bool disco
 
 static void client_tick(void)
 {
-    const struct property *prop;
-    uint32_t will_delay = 0;
+    const struct property *prop = NULL;
     const time_t now = time(NULL);
+    uint32_t will_delay = 0;
 
     pthread_rwlock_wrlock(&global_clients_lock);
     for (struct client *clnt = global_client_list, *next; clnt; clnt = next)
@@ -7010,14 +6968,7 @@ static void tick_msg(struct message *msg)
 
     const time_t now = time(NULL);
 
-    /*
-    dbg_printf(NGRN "     tick_msg: id=%u sender.id=%d #mds=%u"CRESET"\n",
-            msg->id, msg->sender ? msg->sender->id : (id_t)-1,
-            msg->num_message_delivery_states);
-            */
-
     pthread_rwlock_wrlock(&msg->delivery_states_lock);
-
     for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
     {
         mds = msg->delivery_states[idx];
@@ -7138,14 +7089,6 @@ again:
                 dbg_printf(BYEL"     tick_msg: mds.idx=%u is NULL"CRESET"\n", idx-1);
                 break;
             }
-
-            /*
-            dbg_printf(NGRN"     tick_msg: mds.idx=%u acc=%lu ack=%lu rel=%lu cmp=%lu"CRESET"\n",
-                    idx - 1,
-                    mds->accepted_at,
-                    mds->acknowledged_at,
-                    mds->released_at,
-                    mds->completed_at);*/
 
             if (mds->completed_at == 0)
                 goto again;
