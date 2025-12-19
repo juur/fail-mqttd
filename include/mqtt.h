@@ -555,6 +555,74 @@ struct uuid_build {
     uint32_t node25;
 };
 
+typedef enum {
+    RAFT_HELLO = 0,
+    RAFT_APPEND_ENTRIES,
+    RAFT_REQUEST_VOTE,
+    RAFT_ADD_SERVER,
+    RAFT_REMOVE_SERVER,
+    RAFT_CLIENT_REQUEST,
+    RAFT_REGISTER_CLIENT,
+    RAFT_CLIENT_QUERY,
+    RAFT_INSTALL_SNAPSHOT,
+
+    RAFT_APPEND_ENTRIES_REPLY,
+    RAFT_REQUEST_VOTE_REPLY,
+    RAFT_ADD_SERVER_REPLY,
+    RAFT_REMOVE_SERVER_REPLY,
+    RAFT_CLIENT_REQUEST_REPLY,
+    RAFT_REGISTER_CLIENT_REPLY,
+    RAFT_CLIENT_QUERY_REPLY,
+    RAFT_INSTALL_SNAPSHOT_REPLY,
+
+    RAFT_MAX_RPC
+} raft_rpc_t;
+
+typedef enum {
+    RAFT_OK = 0,
+    RAFT_TRUE,
+    RAFT_FALSE,
+    RAFT_NOT_LEADER,
+    RAFT_SESSION_EXPIRED,
+    RAFT_TIMEOUT,
+    RAFT_MAX_STATUS
+} raft_status_t;
+
+typedef enum {
+    RAFT_FOLLOWER = 0,
+    RAFT_CANDIDATE,
+    RAFT_LEADER,
+    RAFT_MAX_MODE,
+} raft_mode_t;
+
+struct raft_log {
+    struct raft_log *next;
+    unsigned long index;
+    unsigned long term;
+};
+
+struct raft_state {
+    raft_mode_t mode;
+    uint32_t current_term;
+    uint32_t voted_for;
+    struct raft_log *log_head;
+    uint32_t election_timer;
+    uint32_t self_id;
+
+    uint32_t commit_index;
+    uint32_t last_applied;
+
+    /* for leaders - both are [] num_server entries */
+    uint32_t *next_index;
+    uint32_t *match_index;
+};
+
+struct raft_packet {
+    raft_rpc_t rpc; /* uint8_t */
+    uint8_t flags;
+    uint32_t length;
+};
+
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
 extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
 extern const type_t property_to_type[MQTT_PROPERTY_IDENT_MAX];
@@ -571,5 +639,6 @@ extern const char *const reason_codes_str[MQTT_REASON_CODE_MAX];
 extern const char *const message_type_str[MSG_TYPE_MAX];
 extern const char *const subscription_type_str[SUB_TYPE_MAX];
 extern const char *const packet_dir_str[PACKET_DIR_MAX];
+extern const char *const raft_rpc_str[RAFT_MAX_RPC];
 
 #endif
