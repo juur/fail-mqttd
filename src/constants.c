@@ -251,6 +251,15 @@ const char *const reason_codes_str[MQTT_REASON_CODE_MAX] =
     [MQTT_WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED] = "WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED",
 };
 
+const char *const raft_status_str[RAFT_MAX_STATUS] = {
+    [RAFT_OK] = "OK",
+    [RAFT_TRUE] = "TRUE",
+    [RAFT_FALSE] = "FALSE",
+    [RAFT_NOT_LEADER] = "NOT_LEADER",
+    [RAFT_SESSION_EXPIRED] = "SESSION_EXPIRED",
+    [RAFT_TIMEOUT] = "TIMEOUT",
+};
+
 const char *const raft_rpc_str[RAFT_MAX_RPC] = {
     [RAFT_HELLO]           = "HELLO",
     [RAFT_APPEND_ENTRIES]  = "APPEND_ENTRIES",
@@ -268,4 +277,10 @@ const char *const raft_rpc_str[RAFT_MAX_RPC] = {
     [RAFT_CLIENT_REQUEST_REPLY]  = "CLIENT_REQUEST_REPLY",
     [RAFT_REGISTER_CLIENT_REPLY] = "REGISTER_CLIENT_REPLY",
     [RAFT_CLIENT_QUERY_REPLY]    = "CLIENT_QUERY_REPLY",
+};
+
+const char *const raft_mode_str[RAFT_MAX_MODE] = {
+    [RAFT_FOLLOWER] = "FOLLOWER",
+    [RAFT_CANDIDATE] = "CANDIDATE",
+    [RAFT_LEADER] = "LEADER",
 };

@@ -18,6 +18,8 @@
 # endif
 #endif
 
+typedef long timems_t;
+
 struct mqtt_fixed_header {
     unsigned flags:4;
     unsigned type:4;
@@ -606,21 +608,31 @@ struct raft_state {
     uint32_t current_term;
     uint32_t voted_for;
     struct raft_log *log_head;
-    uint32_t election_timer;
     uint32_t self_id;
 
     uint32_t commit_index;
     uint32_t last_applied;
+    
+    timems_t election_timer;
 
     /* for leaders - both are [] num_server entries */
     uint32_t *next_index;
     uint32_t *match_index;
+    timems_t last_ping;
 };
 
 struct raft_packet {
     raft_rpc_t rpc; /* uint8_t */
     uint8_t flags;
     uint32_t length;
+};
+
+struct raft_host_entry {
+    struct in_addr address;
+    in_port_t port;
+    int peer_fd;
+    uint32_t server_id;
+    uint32_t voted_for;
 };
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
@@ -640,5 +652,7 @@ extern const char *const message_type_str[MSG_TYPE_MAX];
 extern const char *const subscription_type_str[SUB_TYPE_MAX];
 extern const char *const packet_dir_str[PACKET_DIR_MAX];
 extern const char *const raft_rpc_str[RAFT_MAX_RPC];
+extern const char *const raft_status_str[RAFT_MAX_STATUS];
+extern const char *const raft_mode_str[RAFT_MAX_MODE];
 
 #endif
