@@ -284,3 +284,8 @@ const char *const raft_mode_str[RAFT_MAX_MODE] = {
     [RAFT_CANDIDATE] = "CANDIDATE",
     [RAFT_LEADER] = "LEADER",
 };
+
+const char *const raft_conn_str[RAFT_MAX_CONN] = {
+    [RAFT_PEER] = "PEER",
+    [RAFT_CLIENT] = "CLIENT",
+};

@@ -104,6 +104,7 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 static int global_mother_fd = -1;
 static int global_om_fd = -1;
 static int global_raft_fd = -1;
+//static int global_raft_client_fd = -1;
 static uint8_t global_hwaddr[8];
 static _Atomic bool running;
 
@@ -198,6 +199,7 @@ static _Atomic bool has_clients = false;
 static struct raft_host_entry *raft_peers = NULL;
 static unsigned raft_num_peers = 0;
 static _Atomic int raft_active_peers = 0;
+static _Atomic int raft_active_clients = 0;
 
 /*
  * databases
@@ -215,6 +217,7 @@ static   bool        opt_logstdout     = true;
 static   in_port_t   opt_port          = 1883;
 static   in_port_t   opt_om_port       = 1773;
 static   in_port_t   opt_raft_port     = 0;
+//static   in_port_t   opt_raft_client_port = 0;
 static   int         opt_backlog       = 50;
 static   int         opt_loglevel      = LOG_INFO;
 static   bool        opt_logsyslog     = false;
@@ -230,6 +233,7 @@ static   uint8_t     opt_raft_id       = 0;
 static struct in_addr opt_listen;
 static struct in_addr opt_om_listen;
 static struct in_addr opt_raft_listen;
+//static struct in_addr opt_raft_client_listen;
 
 static char *logfile_name = NULL;
 
@@ -256,6 +260,7 @@ static char *logfile_name = NULL;
         const struct topic_sub_request *request);
 [[gnu::nonnull]] static int unsubscribe_session_from_all(struct session *session);
 [[gnu::nonnull]] static int find_str(const char *const *lookup, const char *value, int max);
+static int raft_log_append(raft_log_t event, ...);
 
 /*
  * command line stuff
@@ -482,7 +487,9 @@ static void parse_cmdline(int argc, char *argv[])
         RAFT_ENABLE,
         RAFT_PORT,
         RAFT_BIND,
-        RAFT_ID
+        RAFT_ID,
+        RAFT_CLIENT_BIND,
+        RAFT_CLIENT_PORT,
     };
 
     char *const raft_token[] = {
@@ -491,11 +498,14 @@ static void parse_cmdline(int argc, char *argv[])
         [RAFT_PORT] = "port",
         [RAFT_BIND] = "bind",
         [RAFT_ID] = "server_id",
+        [RAFT_CLIENT_BIND] = "client_bind",
+        [RAFT_CLIENT_PORT] = "client_port",
         NULL
     };
 
     while ((opt = getopt(argc, argv, "hVp:H:l:do:nD:r:")) != -1)
     {
+        int tmp;
         switch (opt)
         {
             case 'D':
@@ -517,6 +527,10 @@ static void parse_cmdline(int argc, char *argv[])
                             opt_raft_id = atoi(value);
                             if (opt_raft_id == 0 || opt_raft_id >= 0xff)
                                 goto shit_usage;
+                            if (opt_raft_port == 0)
+                                opt_raft_port = 1800 + opt_raft_id;
+//                            if (opt_raft_client_port == 0)
+//                                opt_raft_client_port = 1700 + opt_raft_id;
                             break;
                         case RAFT_ENABLE:
                             opt_raft = true;
@@ -524,17 +538,35 @@ static void parse_cmdline(int argc, char *argv[])
                         case RAFT_PORT:
                             if (value == NULL)
                                 goto shit_usage;
-                            int tmp = atoi(value);
+                            tmp = atoi(value);
                             if (tmp == 0 || tmp > USHRT_MAX)
                                 goto shit_usage;
                             opt_raft_port = tmp;
                             break;
-                        case OM_BIND:
+#if 0
+                        case RAFT_CLIENT_PORT:
+                            if (value == NULL)
+                                goto shit_usage;
+                            tmp = atoi(value);
+                            if (tmp == 0 || tmp > USHRT_MAX)
+                                goto shit_usage;
+                            opt_raft_client_port = tmp;
+                            break;
+#endif
+                        case RAFT_BIND:
                             if (value == NULL)
                                 goto shit_usage;
                             if (inet_pton(AF_INET, value, &opt_raft_listen) == -1)
                                 goto shit_usage;
                             break;
+#if 0
+                        case RAFT_CLIENT_BIND:
+                            if (value == NULL)
+                                goto shit_usage;
+                            if (inet_pton(AF_INET, value, &opt_raft_client_listen) == -1)
+                                goto shit_usage;
+                            break;
+#endif
                         case RAFT_CLUSTER_ADDRS:
                             if ((raft_num_peers = parse_cmdline_host_list(value, &raft_peers)) <= 0)
                                 goto shit_usage;
@@ -1168,6 +1200,10 @@ static void logger(int priority, const struct client *client,
  * Misc functions
  */
 
+/*static inline void *mempcpy(void *dest, const void *src, size_t n)
+{
+    return (void *)(((uintptr_t)memcpy(dest, src, n)) + n);
+}*/
 
 static inline long rnd(int from, int to)
 {
@@ -3392,9 +3428,14 @@ static void close_all_sockets(void)
     }
 
     if (opt_raft) {
-        dbg_printf("     close_socket: closing raft_fd %u\n", global_raft_fd);
+        dbg_printf("     close_socket: closing raft_fd %d\n",
+                global_raft_fd/*, global_raft_client_fd*/);
         if (global_raft_fd != -1)
             close_socket(&global_raft_fd);
+#if 0
+        if (global_raft_client_fd != -1)
+            close_socket(&global_raft_client_fd);
+#endif
     }
 }
 
@@ -3648,6 +3689,7 @@ static struct topic *register_topic(const uint8_t *name,
     pthread_rwlock_wrlock(&global_topics_lock);
     ret->next = global_topic_list;
     global_topic_list = ret;
+    raft_log_append(RAFT_LOG_REGISTER_TOPIC, ret->name, ret->uuid);
     pthread_rwlock_unlock(&global_topics_lock);
 
     return ret;
@@ -7459,37 +7501,38 @@ static void close_session(struct session *session)
 
 static struct raft_state raft_state;
 
-static int raft_new_client(int new_client_fd)
+static int raft_new_conn(int new_fd)
 {
     unsigned idx;
     ssize_t rc;
-    uint8_t hello_packet[2 + 4 + 4];
+    uint8_t hello_packet[2 + 4 + 4 + 1];
     uint16_t pck_type;
     uint32_t pck_len, id;
+    raft_conn_t type;
 
     errno = 0;
 
     struct sockaddr_in sin;
     socklen_t sin_len = sizeof(sin);
 
-    dbg_printf("RAFT raft_new_client on fd %u\n", new_client_fd);
+    dbg_printf("RAFT raft_new_peer on fd %u\n", new_fd);
 
-    if (getpeername(new_client_fd, (struct sockaddr *)&sin, &sin_len) == -1) {
-        warn("raft_new_client: getpeername");
+    if (getpeername(new_fd, (struct sockaddr *)&sin, &sin_len) == -1) {
+        warn("raft_new_conn: getpeername");
         goto fail;
     }
 
-    sock_nonblock(new_client_fd);
-    sock_linger(new_client_fd);
-    sock_nodelay(new_client_fd);
-    sock_keepalive(new_client_fd);
+    sock_nonblock(new_fd);
+    sock_linger(new_fd);
+    sock_nodelay(new_fd);
+    sock_keepalive(new_fd);
 
-    if ((rc = read(new_client_fd, hello_packet, sizeof(hello_packet))) != sizeof(hello_packet)) {
+    if ((rc = read(new_fd, hello_packet, sizeof(hello_packet))) != sizeof(hello_packet)) {
         if (rc == -1) {
-            warn("raft_new_client: read");
+            warn("raft_new_conn: read");
             goto fail;
         }
-        warn("raft_new_client: short read (%ld != %lu)", rc, sizeof(hello_packet));
+        warn("raft_new_conn: short read (%ld != %lu)", rc, sizeof(hello_packet));
         goto fail;
     }
 
@@ -7514,17 +7557,17 @@ static int raft_new_client(int new_client_fd)
     memcpy(&id, hello_packet + 2 + 4, sizeof(id));
     id = ntohl(id);
 
-    dbg_printf("RAFT raft_new_client: read id %u\n", id);
+    type = hello_packet[2 + 4 + 4];
+
+    if (id == raft_state.self_id)
+        goto fail;
+
+    dbg_printf("RAFT raft_new_client: read id %u type %s\n", id, raft_conn_str[type]);
 
     for (idx = 0; idx < raft_num_peers; idx++)
     {
-        if (id == raft_state.self_id)
-            continue;
-
-        if (raft_peers[idx].port == 0)
-            continue;
-
-        if (id != raft_peers[idx].server_id)
+        if ( (raft_peers[idx].port == 0) ||
+                (id != raft_peers[idx].server_id) )
             continue;
 
         goto found_one;
@@ -7535,19 +7578,39 @@ static int raft_new_client(int new_client_fd)
 
 found_one:
 
-    dbg_printf("RAFT raft_new_client: new fd=%d from %08x:%u\n",
-            new_client_fd, ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port));
+    dbg_printf("RAFT raft_new_client: new fd=%d from %08x:%u [%s]\n",
+            new_fd, ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port),
+            raft_conn_str[type]);
 
-    if (raft_peers[idx].peer_fd > 0) {
-        dbg_printf("RAFT raft_new_client: already connected on fd %u, closing\n",
-                raft_peers[idx].peer_fd);
-        close_socket(&new_client_fd);
-        return idx;
+    switch (type)
+    {
+        case RAFT_PEER:
+            if (raft_peers[idx].peer_fd > 0) {
+                dbg_printf("RAFT raft_new_client: already connected on fd %u, closing\n",
+                        raft_peers[idx].peer_fd);
+                close_socket(&new_fd);
+                return idx;
+            }
+
+            raft_peers[idx].peer_fd = new_fd;
+            raft_active_peers++;
+            return idx;
+
+        case RAFT_CLIENT:
+            if (raft_state.clients[idx].fd > 0) {
+                dbg_printf("RAFT raft_new_client: already_connected on fd %u, closing existing\n",
+                        raft_state.clients[idx].fd);
+                close_socket(&raft_state.clients[idx].fd);
+                raft_active_clients--;
+            }
+
+            raft_state.clients[idx].fd = new_fd;
+            raft_active_clients++;
+            return idx;
+
+        default:
+            break;
     }
-
-    raft_peers[idx].peer_fd = new_client_fd;
-    raft_active_peers++;
-    return idx;
 
 fail:
     return -1;
@@ -7562,16 +7625,21 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
     uint32_t packet_len;
     uint16_t packet_type;
     uint32_t arg_id;
-    uint32_t arg_term, arg_candidate_id, arg_last_log_index, arg_log_term;
-    uint8_t arg_status;
-    uint32_t arg_leader_id, arg_prev_log_index, arg_prev_log_term, arg_leader_commit;
-    uint32_t arg_num_entries;
-    [[maybe_unused]] void *arg_entries;
+    uint32_t arg_term = 0, arg_candidate_id, arg_last_log_index, arg_log_term;
+    uint8_t arg_status, arg_conn_type;
+    uint32_t arg_leader_id = 0, arg_prev_log_index = 0, arg_prev_log_term = 0, arg_leader_commit = 0;
+    uint32_t arg_num_entries = 0;
+    uint32_t arg_client_id = 0, arg_leader_hint = 0;
+    struct raft_log *arg_entries = NULL;
 
     va_list ap;
 
-    if (target != -1 && raft_peers[target].peer_fd <= 0)
+    errno = 0;
+
+    if (target != -1 && raft_peers[target].peer_fd <= 0) {
+        errno = EBADF;
         return -1;
+    }
     if (target == -1 && raft_active_peers == 0)
         return 0;
 
@@ -7583,9 +7651,18 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
 
     switch (rpc)
     {
+        case RAFT_REGISTER_CLIENT_REPLY:
+            length += 3 * sizeof(uint32_t);
+            arg_status = (uint8_t)(va_arg(ap, raft_status_t));
+            arg_client_id = htonl(va_arg(ap, uint32_t));
+            arg_leader_hint = htonl(va_arg(ap, uint32_t));
+            break;
+
         case RAFT_HELLO:
             length += sizeof(uint32_t);
+            length++;
             arg_id = htonl(va_arg(ap, uint32_t));
+            arg_conn_type = (uint8_t)(va_arg(ap, raft_conn_t));
             break;
 
         case RAFT_REQUEST_VOTE:
@@ -7609,8 +7686,28 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
             arg_prev_log_term = htonl(va_arg(ap, uint32_t));
             arg_leader_commit = htonl(va_arg(ap, uint32_t));
             arg_num_entries = va_arg(ap, uint32_t);
-            /* TODO length += something for arg_entries */
-            arg_entries = va_arg(ap, void *);
+            if (arg_num_entries) {
+                /* TODO length += something for arg_entries */
+                arg_entries = va_arg(ap, struct raft_log *);
+                struct raft_log *tmp = arg_entries;
+                unsigned idx;
+                for (idx = 0; tmp && idx < arg_num_entries; idx++)
+                {
+                    length++; /* type */
+                    length += 2 * sizeof(uint32_t); /* index and term */
+                    switch (tmp->event)
+                    {
+                        case RAFT_LOG_REGISTER_TOPIC:
+                            /* TODO */
+                            break;
+
+                        default:
+                            break;
+                    }
+                    tmp = tmp->next;
+                }
+                assert(idx == arg_num_entries);
+            }
             break;
 
         case RAFT_APPEND_ENTRIES_REPLY:
@@ -7637,6 +7734,14 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
         case RAFT_HELLO:
             memcpy(ptr, &arg_id, sizeof(arg_id));
             ptr += sizeof(arg_id);
+            memcpy(ptr, &arg_conn_type, 1);
+            ptr++;
+            break;
+
+        case RAFT_REGISTER_CLIENT_REPLY:
+            memcpy(ptr, &arg_status, 1); ptr++;
+            memcpy(ptr, &arg_client_id, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+            memcpy(ptr, &arg_leader_hint, sizeof(uint32_t)); ptr += sizeof(uint32_t);
             break;
 
         case RAFT_REQUEST_VOTE:
@@ -7658,7 +7763,19 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
             memcpy(ptr, &arg_leader_commit, sizeof(uint32_t)); ptr += sizeof(uint32_t);
             uint32_t tmp32 = htonl(arg_num_entries);
             memcpy(ptr, &tmp32, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-            /* TODO arg_entries */
+            if (arg_num_entries) {
+                struct raft_log *tmp = arg_entries;
+                uint32_t index, term;
+                for (unsigned idx = 0; tmp && idx < arg_num_entries; idx++)
+                {
+                    *ptr = (uint8_t)tmp->event;
+                    ptr++;
+                    index = htonl(tmp->index);
+                    term = htonl(tmp->term);
+                    memcpy(ptr, &index, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                    memcpy(ptr, &term, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                }
+            }
             raft_state.last_ping = timems();
             break;
 
@@ -7667,6 +7784,7 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
             break;
 
         default:
+            errno = EINVAL;
             dbg_printf("RAFT raft_send: unknown type %s\n", raft_rpc_str[rpc]);
             goto fail;
     }
@@ -7677,12 +7795,10 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
         for (unsigned idx = 0; idx < raft_num_peers; idx++) {
             if (raft_peers[idx].peer_fd > 0) {
                 if ((rc = write(raft_peers[idx].peer_fd, packet_buffer, length)) != length) {
-                    warn("raft_send: write(%u on fd %u)", idx, raft_peers[idx].peer_fd);
-                    if (rc == -1 && errno == EPIPE) {
-                        raft_active_peers--;
+                    if (rc == -1) {
+                        warn("raft_send: write(%u on fd %u)", idx, raft_peers[idx].peer_fd);
                         close_socket(&raft_peers[idx].peer_fd);
-                    } else if (rc == -1) {
-                        warn("raft_send: write");
+                        raft_active_peers--;
                     } else {
                         dbg_printf("RAFT raft_send: short-write on fd %u\n",
                                 raft_peers[idx].peer_fd);
@@ -7696,13 +7812,14 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
         //dbg_printf("RAFT raft_send: sent %lub to %u peers\n", length, sent);
     } else {
         if ((rc = write(raft_peers[target].peer_fd, packet_buffer, length)) != length) {
-            warn("raft_sent: write(%u on fd %u)", target, raft_peers[target].peer_fd);
-            if (rc == -1 && errno == EPIPE) {
-                raft_active_peers--;
-                close_socket(&raft_peers[target].peer_fd);
-            } else if (rc == -1) {
+            if (rc == -1) {
+                warn("raft_sent: write(%u on fd %u)", target, raft_peers[target].peer_fd);
                 warn("raft_send: write");
+                close_socket(&raft_peers[target].peer_fd);
+                raft_active_peers--;
+                goto fail;
             } else {
+                errno = ENOSPC;
                 dbg_printf("RAFT raft_send: short-write on fd %u\n",
                         raft_peers[target].peer_fd);
                 goto fail;
@@ -7732,7 +7849,7 @@ static void raft_change_to(raft_mode_t mode)
 
     dbg_printf(BBLU "RAFT raft_change_to: %s (from %s)"CRESET"\n",
             raft_mode_str[mode], raft_mode_str[raft_state.mode]);
-    
+
     uint32_t log_index, log_term;
     log_index = raft_state.log_head ? raft_state.log_head->index : 0;
     log_term = raft_state.log_head ? raft_state.log_head->term : 0;
@@ -7740,6 +7857,30 @@ static void raft_change_to(raft_mode_t mode)
     switch (mode)
     {
         case RAFT_FOLLOWER:
+            if (raft_state.leader_fd == -1) {
+                int new_fd;
+                if ((new_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+                    warn("raft_change_to: socket");
+                    break;
+                }
+
+                struct sockaddr_in sin;
+
+                memset(&sin, 0, sizeof(sin));
+
+                sin.sin_family = AF_INET;
+                sin.sin_addr.s_addr = raft_peers[raft_state.voted_for].address.s_addr;
+                sin.sin_port = raft_peers[raft_state.voted_for].port;
+                socklen_t sin_len = sizeof(sin);
+
+                if (connect(new_fd, (struct sockaddr *)&sin, sin_len) == -1) {
+                    warn("raft_change_to: connect");
+                    close_socket(&new_fd);
+                    break;
+                }
+
+                raft_send(raft_state.voted_for, RAFT_HELLO, raft_state.self_id, RAFT_CLIENT);
+            }
             raft_state.voted_for = 0;
             break;
 
@@ -7747,7 +7888,7 @@ static void raft_change_to(raft_mode_t mode)
             raft_state.current_term++;
             raft_state.voted_for = raft_state.self_id;
             raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
-            
+
             for (unsigned idx = 0; idx < raft_num_peers; idx++)
                 raft_peers[idx].voted_for = 0;
 
@@ -7763,6 +7904,9 @@ static void raft_change_to(raft_mode_t mode)
             break;
 
         case RAFT_LEADER:
+            if (raft_state.leader_fd != -1)
+                close_socket(&raft_state.leader_fd);
+
             if (raft_send(-1, RAFT_APPEND_ENTRIES,
                         raft_state.current_term,
                         raft_state.self_id,
@@ -7779,7 +7923,7 @@ static void raft_change_to(raft_mode_t mode)
         default:
             break;
     }
-    
+
     raft_state.mode = mode;
 }
 
@@ -7835,50 +7979,39 @@ static void raft_tick(void)
     errno = 0;
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
     {
-        if (idx == raft_state.self_id)
+        if ( (idx == raft_state.self_id) ||
+                    (raft_peers[idx].port == 0) ||
+                    (raft_peers[idx].peer_fd > 0) )
             continue;
-
-        if (raft_peers[idx].port == 0)
-            continue;
-
-        if (raft_peers[idx].peer_fd > 0)
-            continue;
-
-        //dbg_printf("RAFT raft_tick: attempting to connect to peer=%u\n", idx);
 
         if ((new_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
             goto conn_fail;
 
+        memset(&sin, 0, sizeof(sin));
         sin.sin_family = AF_INET;
         sin.sin_addr = raft_peers[idx].address;
         sin.sin_port = raft_peers[idx].port;
-
         sin_len = sizeof(sin);
+
+        sock_linger(new_fd);
+        sock_nodelay(new_fd);
+        sock_keepalive(new_fd);
 
         if (connect(new_fd, (struct sockaddr *)&sin, sin_len) == -1)
             goto conn_fail;
 
         sock_nonblock(new_fd);
-        sock_linger(new_fd);
-        sock_nodelay(new_fd);
-        sock_keepalive(new_fd);
-
-        dbg_printf("RAFT raft_tick: connected to %08x:%u\n", ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port));
-
-        if (raft_peers[idx].peer_fd > 0) {
-            dbg_printf("RAFT raft_tick: already connected on %u, closing\n",
-                    raft_peers[idx].peer_fd);
-            close_socket(&new_fd);
-            continue;
-        }
 
         raft_peers[idx].peer_fd = new_fd;
         raft_active_peers++;
 
-        if (raft_send(idx, RAFT_HELLO, raft_state.self_id) == -1) {
+        dbg_printf("RAFT raft_tick: connected to %08x:%u (idx=%u, fd=%d)\n",
+                ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port), idx, new_fd);
+
+        if (raft_send(idx, RAFT_HELLO, raft_state.self_id, RAFT_PEER) == -1) {
             warn("raft_tick: connect: write(id), closing");
-            raft_active_peers--;
             close_socket(&raft_peers[idx].peer_fd);
+            raft_active_peers--;
         }
 
     }
@@ -7908,7 +8041,7 @@ conn_fail:
     if (errno) {
         //dbg_printf("     raft_tick: conn_fail: %s\n", strerror(errno));
     }
-    if (new_fd > 0) {
+    if (new_fd != -1) {
         //dbg_printf("     raft_tick: conn_fail: closing\n");
         close_socket(&new_fd);
     }
@@ -7948,12 +8081,10 @@ shit_packet:
 
     if (rpk_size)
         if ((rc = read(*fd, packet, rpk_size)) != rpk_size) {
-            if (rc == -1 && errno == EPIPE) {
-                dbg_printf("RAFT raft_recv: EPIPE, closing\n");
-                raft_active_peers--;
-                close_socket(fd);
-            } else if (rc == -1) {
+            if (rc == -1) {
                 warn("raft_recv: read(body)");
+                close_socket(fd);
+                raft_active_peers--;
             } else
                 dbg_printf("RAFT raft_recv: short-read: %lu < %u\n", rc, rpk_size);
             goto shit_packet;
@@ -7965,6 +8096,27 @@ shit_packet:
 
     switch((raft_rpc_t)rpk_type)
     {
+        case RAFT_REGISTER_CLIENT:
+            if (raft_state.mode != RAFT_LEADER) {
+                raft_send(sender, RAFT_REGISTER_CLIENT_REPLY, RAFT_NOT_LEADER, 0, raft_state.leader_id);
+                break;
+            }
+            /* append register command to log, replicate and commit */
+            /* TODO */
+            /* apply command in log order, allocting session for new client */
+            /* TODO */
+            /* reply ok with unique client id, log index can be used */
+            raft_send(sender, RAFT_REGISTER_CLIENT_REPLY, RAFT_OK, raft_state.last_applied, raft_state.leader_id);
+            break;
+
+        case RAFT_CLIENT_REQUEST:
+            {
+                uint32_t client_id, sequence_num;
+                memcpy(&client_id, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); client_id = ntohl(client_id);
+                memcpy(&sequence_num, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); sequence_num = ntohl(sequence_num);
+            }
+            break;
+
         case RAFT_REQUEST_VOTE:
             {
                 uint32_t term, candidate_id, last_log_index, last_log_term;
@@ -7991,23 +8143,43 @@ shit_packet:
         case RAFT_APPEND_ENTRIES:
             {
                 uint32_t term, leader_id, prev_log_index, prev_log_term, leader_commit, num_entries;
-                memcpy(&term, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); term = ntohl(term);
-                memcpy(&leader_id, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); leader_id = ntohl(leader_id);
-                memcpy(&prev_log_index, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); prev_log_index = ntohl(prev_log_index);
-                memcpy(&prev_log_term, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); prev_log_term = ntohl(prev_log_term);
-                memcpy(&leader_commit, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); leader_commit = ntohl(leader_commit);
-                memcpy(&num_entries, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); num_entries = ntohl(num_entries);
+
+                memcpy(&term, ptr, sizeof(uint32_t));
+                ptr += sizeof(uint32_t);
+                term = ntohl(term);
+
+                memcpy(&leader_id, ptr, sizeof(uint32_t));
+                ptr += sizeof(uint32_t);
+                leader_id = ntohl(leader_id);
+
+                memcpy(&prev_log_index, ptr, sizeof(uint32_t));
+                ptr += sizeof(uint32_t);
+                prev_log_index = ntohl(prev_log_index);
+
+                memcpy(&prev_log_term, ptr, sizeof(uint32_t));
+                ptr += sizeof(uint32_t);
+                prev_log_term = ntohl(prev_log_term);
+
+                memcpy(&leader_commit, ptr, sizeof(uint32_t));
+                ptr += sizeof(uint32_t);
+                leader_commit = ntohl(leader_commit);
+
+                memcpy(&num_entries, ptr, sizeof(uint32_t));
+                ptr += sizeof(uint32_t);
+                num_entries = ntohl(num_entries);
 
                 if (num_entries) {
                     dbg_printf("RAFT raft_recv: APPEND_ENTRIES: term=%u leader_id=%u prev_log_index=%u prev_log_term=%u leader_commit=%u num_entries=%u\n",
                             term, leader_id, prev_log_index, prev_log_term, leader_commit, num_entries);
                 } else {
-                    dbg_printf("RAFT raft_recv: APPEND_ENTRIES: term=%u leader_id=%u prev_log_index=%u prev_log_term=%u leader_commit=%u PING\n",
-                            term, leader_id, prev_log_index, prev_log_term, leader_commit);
+                    //dbg_printf("RAFT raft_recv: APPEND_ENTRIES: term=%u leader_id=%u prev_log_index=%u prev_log_term=%u leader_commit=%u PING\n",
+                      //      term, leader_id, prev_log_index, prev_log_term, leader_commit);
                 }
-                
-                if (term > raft_state.current_term)
+
+                if (term > raft_state.current_term) {
                     raft_change_to(RAFT_FOLLOWER);
+                    raft_state.leader_id = leader_id;
+                }
 
                 assert(raft_state.mode != RAFT_LEADER);
 
@@ -8025,14 +8197,22 @@ shit_packet:
                 /* reply false if log doesn't contain an entry at
                  * prev_log_index whose term matches prev_log_term */
 
+                /* TODO */
+
                 /* of an existing entry conflicts, replace it and all
                  * subsequent entries */
 
+                /* TODO */
+
                 /* append any new entries */
+
+                /* TODO */
 
                 /* if leader_commit > commit_index, then set
                  * commit_index = min(leader_commit, index of last entry) */
-                
+
+                /* TODO */
+
                 raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
                 raft_send(sender, RAFT_APPEND_ENTRIES_REPLY, reply);
             }
@@ -8041,12 +8221,12 @@ shit_packet:
         case RAFT_APPEND_ENTRIES_REPLY:
             {
                 uint8_t tmp;
-                raft_status_t status;
+                [[maybe_unused]] raft_status_t status;
 
                 memcpy(&tmp, ptr, 1); ptr++;
                 status = tmp;
-                dbg_printf("RAFT raft_recv: APPEND_ENTRIES_REPLY %s from %u\n",
-                        raft_status_str[status], sender);
+                //dbg_printf("RAFT raft_recv: APPEND_ENTRIES_REPLY %s from %u\n",
+                  //      raft_status_str[status], sender);
 
                 /* TODO wtf to do if RAFT_FALSE ? */
             }
@@ -8062,7 +8242,7 @@ shit_packet:
 
                 dbg_printf("RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: %u voted %s\n",
                         sender, raft_status_str[status]);
-                
+
                 if (status == RAFT_TRUE)
                     raft_peers[sender].voted_for = raft_state.self_id;
                 else
@@ -8110,26 +8290,80 @@ static void raft_clean(void)
 {
     if (raft_peers) {
         for (unsigned idx = 0; idx < raft_num_peers; idx++)
-            if (raft_peers[idx].peer_fd > 0)
+            if (raft_peers[idx].peer_fd != -1)
                 close_socket(&raft_peers[idx].peer_fd);
         free(raft_peers);
     }
+    if (raft_state.clients)
+        free(raft_state.clients);
 }
 
 static int raft_init(void)
 {
     errno = 0;
     memset(&raft_state, 0, sizeof(raft_state));
+
     raft_state.mode = RAFT_FOLLOWER;
     raft_state.self_id = opt_raft_id;
     raft_state.election_timer = timems() + (RAFT_PING_DELAY * 2);
+
+    if ((raft_state.clients = calloc(raft_num_peers, sizeof(struct raft_client))) == NULL)
+        goto fail;
+
+    for (unsigned idx = 0; idx < raft_num_peers; idx++)
+    {
+        raft_peers[idx].peer_fd = -1;
+        raft_state.clients[idx].fd = -1;
+        raft_state.leader_fd = -1;
+    }
 
     atexit(raft_clean);
 
     dbg_printf("RAFT init: raft_num_peers=%u\n", raft_num_peers);
 
     return 0;
+
+fail:
+    return -1;
 }
+
+static int raft_log_append(raft_log_t event, ...)
+{
+    struct raft_log *new_log = NULL;
+    struct raft_log *prev_log;
+
+    if ((new_log = malloc(sizeof(struct raft_log))) == NULL)
+        goto fail;
+
+    prev_log = raft_state.log_head;
+
+    new_log->event = event;
+    new_log->term = raft_state.current_term;
+    new_log->index = ++raft_state.last_applied;
+    new_log->next = prev_log;
+    raft_state.log_head = new_log;
+
+    if (raft_send(-1, RAFT_APPEND_ENTRIES, raft_state.current_term, raft_state.self_id,
+            prev_log ? prev_log->index : 0,
+            prev_log ? prev_log->term : 0,
+            raft_state.commit_index,
+            1,
+            new_log) == -1) {
+        ;
+    }
+
+    return 0;
+
+fail:
+    if (new_log)
+        free(new_log);
+
+    return -1;
+}
+
+/*
+ * Tick functions
+ */
 
 static void session_tick(void)
 {
@@ -8257,6 +8491,7 @@ struct start_args {
     int fd;
     int om_fd;
     int raft_fd;
+    //int raft_client_fd;
 };
 
 #ifdef FEATURE_THREADS
@@ -8327,6 +8562,7 @@ static RETURN_TYPE openmetrics_loop(void *start_args)
 static RETURN_TYPE raft_loop(void *start_args)
 {
     const int raft_fd = ((const struct start_args *)start_args)->raft_fd;
+    //const int raft_client_fd = ((const struct start_args *)start_args)->raft_client_fd;
 
     raft_init();
 
@@ -8334,16 +8570,20 @@ static RETURN_TYPE raft_loop(void *start_args)
     {
         int fd, rc;
         fd_set fds_in;
+        int max_fd = 0;
 
         FD_ZERO(&fds_in);
         FD_SET(raft_fd, &fds_in);
+        //FD_SER(raft_client_fd, &fds_in);
+
+        max_fd = raft_fd; //MAX(raft_fd, raft_client_fd);
 
         struct timeval timeout = {
             .tv_sec = 1,
             .tv_usec = 0,
         };
 
-        if ((rc = select(raft_fd + 1, &fds_in, NULL, NULL, &timeout)) == -1) {
+        if ((rc = select(max_fd + 1, &fds_in, NULL, NULL, &timeout)) == -1) {
             if (errno == EINTR)
                 continue;
             logger(LOG_WARNING, NULL, "raft_loop: select: %s", strerror(errno));
@@ -8353,6 +8593,7 @@ static RETURN_TYPE raft_loop(void *start_args)
         if (rc == 0)
             continue;
 
+        /* update for raft_fd/raft_client_fd */
         if ((fd = accept(raft_fd, NULL, NULL)) == -1) {
             if (errno != EWOULDBLOCK && errno != EAGAIN)
                 logger(LOG_WARNING, NULL, "raft_loop: accept: %s", strerror(errno));
@@ -8381,6 +8622,7 @@ static RETURN_TYPE main_loop(void *start_args)
     const int mother_fd = ((const struct start_args *)start_args)->fd;
     const int om_fd = ((const struct start_args *)start_args)->om_fd;
     const int raft_fd = ((const struct start_args *)start_args)->raft_fd;
+    //const int raft_client_fd = ((const struct start_args *)start_args)->raft_client_fd;
 #ifdef FEATURE_THREADS
     const pthread_t self = pthread_self();
 #endif
@@ -8391,17 +8633,20 @@ static RETURN_TYPE main_loop(void *start_args)
         struct timeval tv;
         int max_fd = MAX(mother_fd, om_fd);
         max_fd = MAX(max_fd, raft_fd);
+        //max_fd = MAX(max_fd, raft_client_fd);
 
         FD_ZERO(&fds_in);
         FD_ZERO(&fds_out);
         FD_ZERO(&fds_exc);
 
-        if (mother_fd > 0)
+        if (mother_fd != -1)
             FD_SET(mother_fd, &fds_in);
-        if (om_fd > 0)
+        if (om_fd != -1)
             FD_SET(om_fd, &fds_in);
-        if (raft_fd > 0)
+        if (raft_fd != -1)
             FD_SET(raft_fd, &fds_in);
+        //if (raft_client_fd > 0)
+        //    FD_SET(raft_client_fd, &fds_in);
 
         has_clients = false;
 
@@ -8433,16 +8678,21 @@ static RETURN_TYPE main_loop(void *start_args)
             pthread_rwlock_unlock(&global_clients_lock);
         }
 
-        if (raft_fd > 0) {
+        if (raft_fd != -1) {
             for (unsigned idx = 0; idx < raft_num_peers; idx++)
             {
-                if (raft_peers[idx].peer_fd > 0) {
+                if (raft_peers[idx].peer_fd != -1) {
                     max_fd = MAX(max_fd, raft_peers[idx].peer_fd);
                     FD_SET(raft_peers[idx].peer_fd, &fds_in);
                     FD_SET(raft_peers[idx].peer_fd, &fds_exc);
                 }
             }
         }
+
+        /*
+        if (raft_client_fd > 0) {
+        }
+        */
 
         tv.tv_sec = 0;
 
@@ -8494,7 +8744,7 @@ static RETURN_TYPE main_loop(void *start_args)
             }
         }
 
-        if (raft_fd > 0) {
+        if (raft_fd != -1) {
             for (unsigned idx = 0; idx < raft_num_peers; idx++)
             {
                 if (raft_peers[idx].peer_fd <= 0)
@@ -8505,7 +8755,7 @@ static RETURN_TYPE main_loop(void *start_args)
                     close_socket(&raft_peers[idx].peer_fd);
                     continue;
                 }
-                
+
                 if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
                     raft_packet_in(idx);
             }
@@ -8515,14 +8765,30 @@ static RETURN_TYPE main_loop(void *start_args)
 
                 if ((tmp_fd = accept(raft_fd, NULL, NULL)) != -1) {
                     dbg_printf("RAFT main_loop: accept fd %u\n", tmp_fd);
-                    if (raft_new_client(tmp_fd) == -1) {
-                        dbg_printf("RAFT main_loop: raft_new_client: failed: %s\n", strerror(errno));
+                    if (raft_new_conn(tmp_fd) == -1) {
+                        dbg_printf("RAFT main_loop: raft_new_conn: failed: %s\n", strerror(errno));
                         close_socket(&tmp_fd);
                     }
                 } else
                     warn("main_loop: raft accept failed");
             }
         }
+
+#if 0
+        if (raft_client_fd > 0) {
+            if (FD_ISSET(raft_client_fd, &fds_in)) {
+                int tmp_fd;
+                if ((tmp_fd = accept(raft_client_fd, NULL, NULL)) != -1) {
+                    dbg_printf("RAFT main_loop: accept.client fd %u\n", tmp_fd);
+                    if (raft_new_conn(RAFT_CLIENT, tmp_fd) == -1) {
+                        dbg_printf("RAFT main_loop: raft_new_client: failed: %s\n", strerror(errno));
+                        close_socket(&tmp_fd);
+                    }
+                } else
+                    warn("main_loop: raft.client accept failed");
+            }
+        }
+#endif
 
         if (mother_fd > 0) {
             if (FD_ISSET(mother_fd, &fds_in)) {
@@ -8802,6 +9068,8 @@ int main(int argc, char *argv[])
 
     opt_listen.s_addr = htonl(INADDR_LOOPBACK);
     opt_om_listen.s_addr = htonl(INADDR_LOOPBACK);
+    opt_raft_listen.s_addr = htonl(INADDR_LOOPBACK);
+    //opt_raft_client_listen.s_addr = htonl(INADDR_LOOPBACK);
     opt_statepath = DEF_DB_PATH;
 
     parse_cmdline(argc, argv);
@@ -9011,9 +9279,14 @@ int main(int argc, char *argv[])
     if (opt_raft) {
         if ((global_raft_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
             logger(LOG_EMERG, NULL, "socket(raft): %s", strerror(errno));
+        //if ((global_raft_client_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
+        //    logger(LOG_EMERG, NULL, "socket(raft.client): %s", strerror(errno));
         sock_linger(global_raft_fd);
         sock_reuse(global_raft_fd, 1);
         sock_nonblock(global_raft_fd);
+        /*sock_linger(global_raft_client_fd);
+        sock_reuse(global_raft_client_fd, 1);
+        sock_nonblock(global_raft_client_fd);*/
     }
 
     struct sockaddr_in sin = {0};
@@ -9062,6 +9335,21 @@ int main(int argc, char *argv[])
 
         if (listen(global_raft_fd, 5) == -1)
             logger(LOG_EMERG, NULL, "listen(raft): %s", strerror(errno));
+#if 0
+        sin.sin_family = AF_INET;
+        sin.sin_port = htons(opt_raft_client_port);
+        sin.sin_addr.s_addr = opt_raft_client_listen.s_addr;
+        inet_ntop(AF_INET, &sin.sin_addr, bind_addr, sizeof(bind_addr));
+        logger(LOG_NOTICE, NULL, "main: raft binding client to %s:%u",
+                bind_addr, opt_raft_client_port);
+
+        if (bind(global_raft_client_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
+            logger(LOG_EMERG, NULL, "bind(raft.client): %s", strerror(errno));
+
+        if (listen(global_raft_client_fd, 5) == -1)
+            logger(LOG_EMERG, NULL, "listen(raft.client): %s", strerror(errno));
+#endif
+
     }
 
 #ifdef FEATURE_THREADS
@@ -9069,29 +9357,34 @@ int main(int argc, char *argv[])
         .fd = global_mother_fd,
         .om_fd = -1,
         .raft_fd = -1,
+        //.raft_client_fd = -1,
     };
 
     struct start_args start_argsn = {
         .fd = -1,
         .om_fd = -1,
         .raft_fd = -1,
+        //.raft_client_fd = -1,
     };
 
     struct start_args start_args_om = {
         .fd = -1,
         .om_fd = opt_openmetrics ? global_om_fd : 0,
         .raft_fd = -1,
+        //.raft_client_fd = -1,
     };
     struct start_args start_args_raft = {
         .fd = -1,
         .om_fd = opt_openmetrics ? global_om_fd : 0,
         .raft_fd = opt_raft ? global_raft_fd : 0,
+        //.raft_client_fd = opt_raft ? global_raft_client_fd : 0,
     };
 #else
     struct start_args start_args = {
         .fd = global_mother_fd,
         .om_fd = opt_openmetrics ? global_om_fd : 0,
         .raft_fd = opt_raft ? global_raft_fd : 0,
+        //.raft_client_fd = opt_raft ? global_raft_client_fd : 0,
     };
 #endif
     running = true;

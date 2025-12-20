@@ -597,17 +597,40 @@ typedef enum {
     RAFT_MAX_MODE,
 } raft_mode_t;
 
+typedef enum {
+    RAFT_PEER = 0,
+    RAFT_CLIENT,
+    RAFT_MAX_CONN,
+} raft_conn_t;
+
+typedef enum {
+    RAFT_LOG_REGISTER_TOPIC = 0,
+    RAFT_MAX_LOG,
+} raft_log_t;
+
 struct raft_log {
     struct raft_log *next;
-    unsigned long index;
-    unsigned long term;
+    uint32_t index;
+    uint32_t term;
+    raft_log_t event;
+};
+
+struct raft_client {
+    int fd;
+    uint32_t client_id;
+    uint32_t sequence_num;
 };
 
 struct raft_state {
+    struct raft_log *log_head;
+    struct raft_client *clients;
+
+    int leader_fd;
+    uint32_t leader_id;
+
     raft_mode_t mode;
     uint32_t current_term;
     uint32_t voted_for;
-    struct raft_log *log_head;
     uint32_t self_id;
 
     uint32_t commit_index;
@@ -654,5 +677,6 @@ extern const char *const packet_dir_str[PACKET_DIR_MAX];
 extern const char *const raft_rpc_str[RAFT_MAX_RPC];
 extern const char *const raft_status_str[RAFT_MAX_STATUS];
 extern const char *const raft_mode_str[RAFT_MAX_MODE];
+extern const char *const raft_conn_str[RAFT_MAX_CONN];
 
 #endif
