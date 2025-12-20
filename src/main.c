@@ -197,6 +197,7 @@ static _Atomic bool has_clients = false;
 
 static struct raft_host_entry *raft_peers = NULL;
 static unsigned raft_num_peers = 0;
+static _Atomic int raft_active_peers = 0;
 
 /*
  * databases
@@ -7545,6 +7546,7 @@ found_one:
     }
 
     raft_peers[idx].peer_fd = new_client_fd;
+    raft_active_peers++;
     return idx;
 
 fail:
@@ -7568,7 +7570,12 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
 
     va_list ap;
 
-    dbg_printf("RAFT raft_send: %s to %d\n", raft_rpc_str[rpc], target);
+    if (target != -1 && raft_peers[target].peer_fd <= 0)
+        return -1;
+    if (target == -1 && raft_active_peers == 0)
+        return 0;
+
+    dbg_printf("RAFT raft_send: %s to %d (active_peers=%d)\n", raft_rpc_str[rpc], target, raft_active_peers);
 
     va_start(ap, rpc);
 
@@ -7672,6 +7679,7 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
                 if ((rc = write(raft_peers[idx].peer_fd, packet_buffer, length)) != length) {
                     warn("raft_send: write(%u on fd %u)", idx, raft_peers[idx].peer_fd);
                     if (rc == -1 && errno == EPIPE) {
+                        raft_active_peers--;
                         close_socket(&raft_peers[idx].peer_fd);
                     } else if (rc == -1) {
                         warn("raft_send: write");
@@ -7690,6 +7698,7 @@ static int raft_send(int target, raft_rpc_t rpc, ...)
         if ((rc = write(raft_peers[target].peer_fd, packet_buffer, length)) != length) {
             warn("raft_sent: write(%u on fd %u)", target, raft_peers[target].peer_fd);
             if (rc == -1 && errno == EPIPE) {
+                raft_active_peers--;
                 close_socket(&raft_peers[target].peer_fd);
             } else if (rc == -1) {
                 warn("raft_send: write");
@@ -7781,9 +7790,10 @@ static void raft_tick(void)
     socklen_t sin_len;
     timems_t now = timems();
 
-#if 0
     static time_t last_run = 0;
-    if (time(NULL) != last_run)
+    if (time(NULL) != last_run) {
+        dbg_printf("RAFT raft_tick: raft_active_peers=%d\n", raft_active_peers);
+#if 0
         for (unsigned idx = 0; idx < raft_num_peers; idx++)
         {
             dbg_printf("RAFT raft_tick: idx[%2d] fd=%2u server_id=%2u addr=%08x:%u\n",
@@ -7795,6 +7805,7 @@ static void raft_tick(void)
                     );
         }
 #endif
+    }
 
     switch(raft_state.mode)
     {
@@ -7862,11 +7873,14 @@ static void raft_tick(void)
         }
 
         raft_peers[idx].peer_fd = new_fd;
+        raft_active_peers++;
 
         if (raft_send(idx, RAFT_HELLO, raft_state.self_id) == -1) {
             warn("raft_tick: connect: write(id), closing");
+            raft_active_peers--;
             close_socket(&raft_peers[idx].peer_fd);
         }
+
     }
 conn_skip:
 
@@ -7887,7 +7901,7 @@ conn_skip:
                 break;
         }
     }
-    //last_run = time(NULL);
+    last_run = time(NULL);
     return;
 
 conn_fail:
@@ -7916,6 +7930,7 @@ static int raft_recv(int *fd, int sender)
         warn("raft_recv: read(header): %ld", rc);
 shit_packet:
         dbg_printf("RAFT raft_recv: closing\n");
+        raft_active_peers--;
         close_socket(fd);
         goto fail;
     }
@@ -7935,6 +7950,7 @@ shit_packet:
         if ((rc = read(*fd, packet, rpk_size)) != rpk_size) {
             if (rc == -1 && errno == EPIPE) {
                 dbg_printf("RAFT raft_recv: EPIPE, closing\n");
+                raft_active_peers--;
                 close_socket(fd);
             } else if (rc == -1) {
                 warn("raft_recv: read(body)");
@@ -7958,7 +7974,7 @@ shit_packet:
                 memcpy(&candidate_id, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); candidate_id = ntohl(candidate_id);
                 memcpy(&last_log_index, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); last_log_index = ntohl(last_log_index);
                 memcpy(&last_log_term, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); last_log_term = ntohl(last_log_term);
-                dbg_printf("RAFT raft_recv: RAFT_REQUEST_VOTE: term=%u candidate_id=%u last_log_index=%u last_log_term=%u\n",
+                dbg_printf("RAFT raft_recv: REQUEST_VOTE: term=%u candidate_id=%u last_log_index=%u last_log_term=%u\n",
                         term, candidate_id, last_log_index, last_log_term);
 
                 if (term > raft_state.current_term)
@@ -8029,7 +8045,7 @@ shit_packet:
 
                 memcpy(&tmp, ptr, 1); ptr++;
                 status = tmp;
-                dbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES_REPLY %s from %u\n",
+                dbg_printf("RAFT raft_recv: APPEND_ENTRIES_REPLY %s from %u\n",
                         raft_status_str[status], sender);
 
                 /* TODO wtf to do if RAFT_FALSE ? */
