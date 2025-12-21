@@ -288,4 +288,5 @@ const char *const raft_mode_str[RAFT_MAX_MODE] = {
 const char *const raft_conn_str[RAFT_MAX_CONN] = {
     [RAFT_PEER] = "PEER",
     [RAFT_CLIENT] = "CLIENT",
+    [RAFT_SERVER] = "SERVER",
 };

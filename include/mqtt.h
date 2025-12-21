@@ -600,6 +600,7 @@ typedef enum {
 typedef enum {
     RAFT_PEER = 0,
     RAFT_CLIENT,
+    RAFT_SERVER,
     RAFT_MAX_CONN,
 } raft_conn_t;
 
@@ -619,18 +620,13 @@ struct raft_log {
     raft_log_t event;
 };
 
-struct raft_client {
-    int fd;
-    uint32_t client_id;
-    uint32_t sequence_num;
-};
-
 struct raft_state {
     struct raft_log *log_head;
-    struct raft_client *clients;
 
+    /* for client */
     int leader_fd;
     uint32_t leader_id;
+    uint32_t sequence_num;
 
     raft_mode_t mode;
     uint32_t current_term;

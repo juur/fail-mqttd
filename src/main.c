@@ -8086,7 +8086,7 @@ conn_fail:
     goto conn_skip;
 }
 
-static int raft_recv(int *fd, int sender)
+static int raft_recv(int *fd, int sender, raft_conn_t /* conn_type */)
 {
     uint8_t header[6];
     uint8_t *packet = NULL;
@@ -8323,9 +8323,20 @@ fail:
     return -1;
 }
 
-static int raft_packet_in(int idx)
+static int raft_packet_in(raft_conn_t type, int idx)
 {
-    return raft_recv(&raft_peers[idx].peer_fd, idx);
+    switch (type)
+    {
+        case RAFT_PEER:
+            return raft_recv(&raft_peers[idx].peer_fd, idx, type);
+        case RAFT_CLIENT:
+            return raft_recv(&raft_state.clients[idx].fd, idx, type);
+        case RAFT_SERVER:
+            return raft_recv(&raft_state.leader_fd, idx, type);
+        default:
+            errno = EINVAL;
+            return -1;
+    }
 }
 
 static void raft_clean(void)
@@ -8732,7 +8743,13 @@ static RETURN_TYPE main_loop(void *start_args)
                 if (raft_state.clients[idx].fd != -1) {
                     max_fd = MAX(max_fd, raft_state.clients[idx].fd);
                     FD_SET(raft_state.clients[idx].fd, &fds_in);
-                    FD_SET(raft_state.clients[idx].fd, &fds_in);
+                    FD_SET(raft_state.clients[idx].fd, &fds_exc);
+                }
+
+                if (raft_state.leader_fd != -1) {
+                    max_fd = MAX(max_fd, raft_state.leader_fd);
+                    FD_SET(raft_state.leader_fd, &fds_in);
+                    FD_SET(raft_state.leader_fd, &fds_exc);
                 }
             }
         }
@@ -8795,17 +8812,30 @@ static RETURN_TYPE main_loop(void *start_args)
         if (raft_fd != -1) {
             for (unsigned idx = 0; idx < raft_num_peers; idx++)
             {
-                if (raft_peers[idx].peer_fd <= 0)
-                    continue;
-
-                if (FD_ISSET(raft_peers[idx].peer_fd, &fds_exc)) {
-                    dbg_printf("RAFT main_loop: fds_exc, closing\n");
-                    close_socket(&raft_peers[idx].peer_fd);
-                    continue;
+                if (raft_peers[idx].peer_fd != -1) {
+                    if (FD_ISSET(raft_peers[idx].peer_fd, &fds_exc)) {
+                        dbg_printf("RAFT main_loop: fds_exc, closing peer\n");
+                        close_socket(&raft_peers[idx].peer_fd);
+                    } else if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
+                        raft_packet_in(RAFT_PEER, idx);
                 }
 
-                if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
-                    raft_packet_in(idx);
+                if (raft_state.clients[idx].fd != -1) {
+                    if (FD_ISSET(raft_state.clients[idx].fd, &fds_exc)) {
+                        dbg_printf("RAFT main_loop: fds_exc, closing client\n");
+                        close_socket(&raft_state.clients[idx].fd);
+                    } else if (FD_ISSET(raft_state.clients[idx].fd, &fds_in))
+                        raft_packet_in(RAFT_CLIENT, idx);
+                }
+
+            }
+
+            if (raft_state.leader_fd != -1) {
+                if (FD_ISSET(raft_state.leader_fd, &fds_exc)) {
+                    dbg_printf("RAFT main_loop: fds_exc, closing leader\n");
+                    close_socket(&raft_state.leader_fd);
+                } else if (FD_ISSET(raft_state.leader_fd, &fds_in))
+                    raft_packet_in(RAFT_SERVER, raft_state.leader_id);
             }
 
             if (FD_ISSET(raft_fd, &fds_in)) {
