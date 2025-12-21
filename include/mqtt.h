@@ -608,6 +608,10 @@ typedef enum {
     RAFT_MAX_LOG,
 } raft_log_t;
 
+enum {
+    NULL_ID = -1U
+};
+
 struct raft_log {
     struct raft_log *next;
     uint32_t index;
