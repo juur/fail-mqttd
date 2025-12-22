@@ -32,16 +32,11 @@ struct mqtt_connect_header {
     uint8_t version;
     uint8_t flags;
     uint16_t keep_alive;
-    //uint8_t properties_length; /* variable */
-    /* properties[] */
-    /* uint8_t payload[] */
 } __attribute__((packed));
 
 struct mqtt_connack_header {
     uint8_t ack_flags;
     uint8_t reason_code;
-    // uint8_t properties_length; /* variable */
-    /* properties[] */
 } __attribute__((packed));
 
 typedef enum {
@@ -604,6 +599,14 @@ typedef enum {
     RAFT_MAX_CONN,
 } raft_conn_t;
 
+/* wire-format used for client to send & log[] for server
+ *
+ * u8   type   (raft_log_t)
+ * u8   flags
+ * u16  length
+ * 0..n payload[length]
+ */
+
 typedef enum {
     RAFT_LOG_REGISTER_TOPIC = 0,
     RAFT_MAX_LOG,
@@ -624,7 +627,6 @@ struct raft_state {
     struct raft_log *log_head;
 
     /* for client */
-    int leader_fd;
     uint32_t leader_id;
     uint32_t sequence_num;
 
@@ -647,8 +649,12 @@ struct raft_state {
 struct raft_packet {
     raft_rpc_t rpc; /* uint8_t */
     uint8_t flags;
+    raft_conn_t role; /* uint8_t */
+    uint8_t res0;
     uint32_t length;
 };
+
+#define RAFT_HDR_SIZE   (1+1+1+1+4)
 
 struct raft_host_entry {
     struct in_addr address;
@@ -678,5 +684,16 @@ extern const char *const raft_rpc_str[RAFT_MAX_RPC];
 extern const char *const raft_status_str[RAFT_MAX_STATUS];
 extern const char *const raft_mode_str[RAFT_MAX_MODE];
 extern const char *const raft_conn_str[RAFT_MAX_CONN];
+extern const char *const raft_log_str[RAFT_MAX_LOG];
 
 #endif
+
+/**
+ * RAFT_HELLO
+ *
+ * Header
+ * u32 id   
+ * u8  type (raft_conn_t)
+ */
+
+#define RAFT_HELLO_SIZE (RAFT_HDR_SIZE + 4 + 1)

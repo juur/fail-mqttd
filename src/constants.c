@@ -290,3 +290,7 @@ const char *const raft_conn_str[RAFT_MAX_CONN] = {
     [RAFT_CLIENT] = "CLIENT",
     [RAFT_SERVER] = "SERVER",
 };
+
+const char *const raft_log_str[RAFT_MAX_LOG] = {
+    [RAFT_LOG_REGISTER_TOPIC] = "REGISTER_TOPIC",
+};
