@@ -621,6 +621,11 @@ struct raft_log {
     uint32_t index;
     uint32_t term;
     raft_log_t event;
+    union {
+        struct {
+            uint8_t *name;
+        } register_topic;
+    };
 };
 
 struct raft_state {
