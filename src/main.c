@@ -42,9 +42,11 @@
 #include "mqtt.h"
 
 #ifndef FEATURE_DEBUG
-# define dbg_printf(...)
+# define dbg_printf(...) { }
+# define dbg_cprintf(...) { }
 #else
 # define dbg_printf(...) { long dbg_now = timems(); printf("%lu.%04lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
+# define dbg_cprintf(...) { printf(__VA_ARGS__); }
 #endif
 
 #ifdef FEATURE_DEBUG
@@ -138,8 +140,8 @@ static const unsigned  MIN_KEEP_ALIVE        = 60;
 static const unsigned  MAX_CLIENTID_LEN      = 0x100;
 
 static const unsigned  RAFT_PING_DELAY       = 50;
-static const unsigned  RAFT_MIN_ELECTION     = 1000;
-static const unsigned  RAFT_MAX_ELECTION     = 2000;
+static const unsigned  RAFT_MIN_ELECTION     = 200;
+static const unsigned  RAFT_MAX_ELECTION     = 500;
 
 static const uint32_t  MAX_SUB_IDENTIFIER    = 0xfffffff;
 static const uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
@@ -1281,7 +1283,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
 static void close_socket(int *fd)
 {
     assert(*fd != -1);
-    dbg_printf("     close_socket on fd %d\n", *fd);
+    //dbg_printf("     close_socket on fd %d\n", *fd);
     if (*fd != -1) {
         shutdown(*fd, SHUT_RDWR);
         close(*fd);
@@ -5685,7 +5687,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     flag_retain = (packet->flags & MQTT_FLAG_PUBLISH_RETAIN) != 0;
     flag_dup = (packet->flags & MQTT_FLAG_PUBLISH_DUP) != 0;
 
-    dbg_printf("qos=%u ", qos);
+    dbg_cprintf("qos=%u ", qos);
 
     if (qos > 2) {
         reason_code = MQTT_PROTOCOL_ERROR;
@@ -5702,7 +5704,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
             reason_code = MQTT_PROTOCOL_ERROR;
             goto fail;
         }
-        dbg_printf("packet_ident=%u ", packet_identifier);
+        dbg_cprintf("packet_ident=%u ", packet_identifier);
     }
 
     uint8_t payload_format = 0; /* TODO extract from properties */
@@ -5710,15 +5712,15 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
                 &packet->property_count, MQTT_CP_PUBLISH) == -1)
         goto fail;
-    dbg_printf("payload_format=%u [%lub] ", payload_format, bytes_left);
+    dbg_cprintf("payload_format=%u [%lub] ", payload_format, bytes_left);
 
     packet->payload_len = bytes_left;
     if ((packet->payload = malloc(bytes_left)) == NULL)
         goto fail;
     memcpy(packet->payload, ptr, bytes_left);
-    dbg_printf("payload_len=%u ", packet->payload_len);
+    dbg_cprintf("payload_len=%u ", packet->payload_len);
 
-    dbg_printf("\n");
+    dbg_cprintf("\n");
 
     if (get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_SUBSCRIPTION_IDENTIFIER, &prop) == 0) {
@@ -6366,16 +6368,16 @@ version_fail:
             (char *)client->client_id);
 
     if (connect_flags & MQTT_CONNECT_FLAG_CLEAN_START) {
-        dbg_printf("clean_start ");
+        dbg_cprintf("clean_start ");
     }
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) {
-        dbg_printf("will_properties ");
+        dbg_cprintf("will_properties ");
         if (parse_properties(&ptr, &bytes_left, &will_props,
                     &num_will_props, MQTT_CP_INVALID) == -1)
             goto fail;
 
-        dbg_printf("[%d props] will_topic ", num_will_props);
+        dbg_cprintf("[%d props] will_topic ", num_will_props);
 
         will_topic = read_utf8(&ptr, &bytes_left);
         if (will_topic == NULL)
@@ -6385,12 +6387,12 @@ version_fail:
                         &will_payload_len)) == NULL)
             goto fail;
 
-        dbg_printf("[%ub] ", will_payload_len);
+        dbg_cprintf("[%ub] ", will_payload_len);
         will_retain = (connect_flags & MQTT_CONNECT_FLAG_WILL_RETAIN);
     }
 
     if (connect_flags & MQTT_CONNECT_FLAG_WILL_RETAIN) {
-        dbg_printf("will_retain ");
+        dbg_cprintf("will_retain ");
         if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) == 0) {
             reason_code = MQTT_PROTOCOL_ERROR;
             warn("handle_cp_connect: Will Retain set without Will Flag");
@@ -6399,20 +6401,20 @@ version_fail:
     }
 
     if (connect_flags & MQTT_CONNECT_FLAG_USERNAME) {
-        dbg_printf("username ");
+        dbg_cprintf("username ");
         if ((client->username = read_utf8(&ptr, &bytes_left)) == NULL)
             goto fail;
 
-        dbg_printf("<%s> ", (char *)client->username);
+        dbg_cprintf("<%s> ", (char *)client->username);
     }
 
     if (connect_flags & MQTT_CONNECT_FLAG_PASSWORD) {
-        dbg_printf("password ");
+        dbg_cprintf("password ");
         if ((client->password = read_binary(&ptr, &bytes_left,
                         &client->password_len)) == NULL)
             goto fail;
 
-        dbg_printf("[%ub] ", client->password_len);
+        dbg_cprintf("[%ub] ", client->password_len);
     }
 
     if (bytes_left)
@@ -6429,11 +6431,11 @@ version_fail:
         goto fail;
 
     if ((connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG)) {
-        dbg_printf("will_qos [%u] ", will_qos);
+        dbg_cprintf("will_qos [%u] ", will_qos);
     }
 
-    dbg_printf("keep_alive=%u ", keep_alive);
-    dbg_printf("\n");
+    dbg_cprintf("keep_alive=%u ", keep_alive);
+    dbg_cprintf("\n");
 
     /* FIXME */
     if (client->username && client->password)
@@ -6795,7 +6797,8 @@ static int parse_incoming(struct client *client)
     switch (client->parse_state)
     {
         case READ_STATE_NEW:
-            dbg_printf("\n[%2d] parse_incoming: READ_STATE_NEW client=%d <%s>\n",
+            dbg_cprintf("\n");
+            dbg_printf("[%2d] parse_incoming: READ_STATE_NEW client=%d <%s>\n",
                     client->session ? client->session->id : (id_t)-1,
                     client->id,
                     client->client_id ? (char *)client->client_id : "");
@@ -7621,11 +7624,11 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     errno = 0;
     memset(&packet, 0, sizeof(packet));
 
-    if (mode == RAFT_CLIENT && client == NULL) {
+    /*if (mode == RAFT_CLIENT && client == NULL) {
         warnx("raft_send: RAFT_CLIENT and target == BROADCAST_ID");
         errno = EINVAL;
         return -1;
-    } else if (mode == RAFT_PEER && client != NULL && client->peer_fd == -1) {
+    } else*/ if (mode == RAFT_PEER && client != NULL && client->peer_fd == -1) {
         errno = EBADF;
         return -1;
     } else if (mode == RAFT_PEER && client == NULL && raft_active_peers == 0) {
@@ -7703,6 +7706,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             break;
 
         case RAFT_APPEND_ENTRIES:
+            /* term, leader_id, prev_log_index, prev_log_term, leader_commit, num_entries */
             packet.length += 6 * sizeof(uint32_t);
             arg_term = htonl(va_arg(ap, uint32_t));
             arg_leader_id = htonl(va_arg(ap, uint32_t));
@@ -7714,6 +7718,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             if (arg_num_entries) {
                 /* TODO length += something for arg_entries */
                 arg_entries = va_arg(ap, struct raft_log *);
+                assert(arg_entries != NULL);
                 struct raft_log *tmp = arg_entries;
                 unsigned idx;
                 arg_req_len = 0;
@@ -7833,8 +7838,8 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                 uint32_t index, term;
                 for (unsigned idx = 0; tmp && idx < arg_num_entries; idx++)
                 {
-                    *ptr = (uint8_t)tmp->event;
-                    ptr++;
+                    *ptr++ = (uint8_t)tmp->event;
+                    *ptr++ = 0;
                     index = htonl(tmp->index);
                     term = htonl(tmp->term);
                     memcpy(ptr, &index, sizeof(uint32_t)) ; ptr += sizeof(uint32_t) ;
@@ -7843,14 +7848,17 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
                             strcpy((void *)ptr, (char *)tmp->register_topic.name);
-                            ptr += strlen((void *)tmp->register_topic.name) + 1;
+                            ptr += strlen((void *)tmp->register_topic.name);
+                            *ptr++ = 0;
                             break;
                         default:
+                            warnx("raft_send: tmp->event unknown inside RAFT_APPEND_ENTRIES");
                             break;
                     }
                     tmp = tmp->next;
                 }
             }
+            assert(ptr == packet_buffer + sendsz);
             break;
 
         case RAFT_APPEND_ENTRIES_REPLY:
@@ -8339,7 +8347,9 @@ shit_packet: /* common with the packet read */
                       //      term, leader_id, prev_log_index, prev_log_term, leader_commit);
                 }
 
-                assert(raft_state.mode != RAFT_MODE_LEADER);
+                /* 'discovers server with higher term' is valid exit from
+                 * Leader state */
+                //assert(raft_state.mode != RAFT_MODE_LEADER);
 
                 if (num_entries > 0) {
                     /* TODO */
@@ -8457,6 +8467,7 @@ shit_packet: /* common with the packet read */
                 if (votes >= need) {
                     dbg_printf(BYEL "RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: i have won!" CRESET "\n");
                     raft_change_to(RAFT_MODE_LEADER);
+                    raft_stop_election();
                 }
             }
             break;
