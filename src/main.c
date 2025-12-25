@@ -44,7 +44,7 @@
 #ifndef FEATURE_DEBUG
 # define dbg_printf(...)
 #else
-# define dbg_printf(...) printf(__VA_ARGS__)
+# define dbg_printf(...) { long dbg_now = timems(); printf("%lu.%04lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
 #endif
 
 #ifdef FEATURE_DEBUG
@@ -137,9 +137,9 @@ static const unsigned  MAX_TOPIC_ALIAS       = 0x20;
 static const unsigned  MIN_KEEP_ALIVE        = 60;
 static const unsigned  MAX_CLIENTID_LEN      = 0x100;
 
-static const unsigned  RAFT_PING_DELAY = 150;
-static const unsigned  RAFT_MIN_ELECTION = RAFT_PING_DELAY * 5;
-static const unsigned  RAFT_MAX_ELECTION = RAFT_MIN_ELECTION * 4;
+static const unsigned  RAFT_PING_DELAY       = 50;
+static const unsigned  RAFT_MIN_ELECTION     = 1000;
+static const unsigned  RAFT_MAX_ELECTION     = 2000;
 
 static const uint32_t  MAX_SUB_IDENTIFIER    = 0xfffffff;
 static const uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
@@ -407,7 +407,7 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
         entry[cnt].port = port;
         entry[cnt].address = addr;
         entry[cnt].server_id = id;
-        entry[cnt].peer_fd = 0;
+        entry[cnt].peer_fd = -1;
         tmp_entry = NULL;
 
         cnt++;
@@ -1280,12 +1280,14 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
 [[gnu::nonnull]]
 static void close_socket(int *fd)
 {
-    //dbg_printf("     close_socket on fd %u\n", *fd);
+    assert(*fd != -1);
+    dbg_printf("     close_socket on fd %d\n", *fd);
     if (*fd != -1) {
         shutdown(*fd, SHUT_RDWR);
         close(*fd);
         *fd = -1;
     }
+    //abort();
 }
 
 [[gnu::nonnull]]
@@ -7476,6 +7478,21 @@ static void close_session(struct session *session)
 
 static struct raft_state raft_state;
 
+static int raft_close(struct raft_host_entry *client)
+{
+    dbg_printf("RAFT raft_close: id=%u,fd=%u\n", client->server_id, client->peer_fd);
+    if (client->peer_fd == -1)
+        return 0;
+
+    close_socket(&client->peer_fd);
+    client->next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
+
+    if (client->server_id != raft_state.self_id)
+        raft_active_peers--;
+
+    return 0;
+}
+
 static int raft_new_conn(int new_fd, const struct sockaddr_in *sin, socklen_t /*sin_len*/)
 {
     unsigned idx;
@@ -7540,7 +7557,7 @@ static int raft_new_conn(int new_fd, const struct sockaddr_in *sin, socklen_t /*
         }
     }
 
-    dbg_printf(BGRN "RAFT raft_new_conn: read id %u type %s" CRESET "\n", id, raft_conn_str[type]);
+    dbg_printf("RAFT raft_new_conn: read id %u type %s\n", id, raft_conn_str[type]);
 
     for (idx = 0; idx < raft_num_peers; idx++)
     {
@@ -7556,14 +7573,18 @@ static int raft_new_conn(int new_fd, const struct sockaddr_in *sin, socklen_t /*
 
 found_one:
 
-    dbg_printf("RAFT raft_new_conn: new fd=%d from %08x:%u [%s]\n",
-            new_fd, ntohl(sin->sin_addr.s_addr), ntohs(sin->sin_port),
-            raft_conn_str[type]);
+    dbg_printf(NGRN "RAFT raft_new_conn: new (fd=%d,idx=%d,id=%d) from %08x:%u [%s] [%s]" CRESET "\n",
+            new_fd, idx, raft_peers[idx].server_id,
+            ntohl(sin->sin_addr.s_addr), ntohs(sin->sin_port),
+            raft_conn_str[type],
+            raft_peers[idx].peer_fd == -1 ? "NEW" : "EXISTING");
 
     if (raft_peers[idx].peer_fd != -1) {
-        dbg_printf("RAFT raft_new_conn: already connected on fd %u, closing\n",
-                raft_peers[idx].peer_fd);
-        close_socket(&new_fd);
+        if (raft_peers[idx].server_id != raft_state.self_id) {
+            dbg_printf("RAFT raft_new_conn: already connected on fd %u, closing\n",
+                    raft_peers[idx].peer_fd);
+            close_socket(&new_fd);
+        }
         return idx;
     }
 
@@ -7577,7 +7598,7 @@ fail:
 }
 
 /* -1 = all */
-static int raft_send(raft_conn_t mode, int target, raft_rpc_t rpc, ...)
+static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...)
 {
     ssize_t rc, sendsz;
     uint8_t *packet_buffer = NULL, *ptr;
@@ -7600,14 +7621,14 @@ static int raft_send(raft_conn_t mode, int target, raft_rpc_t rpc, ...)
     errno = 0;
     memset(&packet, 0, sizeof(packet));
 
-    if (mode == RAFT_CLIENT && target == -1) {
-        warnx("raft_send: RAFT_CLIENT and target == -1");
+    if (mode == RAFT_CLIENT && client == NULL) {
+        warnx("raft_send: RAFT_CLIENT and target == BROADCAST_ID");
         errno = EINVAL;
         return -1;
-    } else if (mode == RAFT_PEER && target != -1 && raft_peers[target].peer_fd <= 0) {
+    } else if (mode == RAFT_PEER && client != NULL && client->peer_fd == -1) {
         errno = EBADF;
         return -1;
-    } else if (mode == RAFT_PEER && target == -1 && raft_active_peers == 0) {
+    } else if (mode == RAFT_PEER && client == NULL && raft_active_peers == 0) {
         return 0;
     } else if (mode == RAFT_CLIENT && raft_state.leader_id == NULL_ID) {
         errno = EBADF;
@@ -7615,7 +7636,11 @@ static int raft_send(raft_conn_t mode, int target, raft_rpc_t rpc, ...)
     }
 
     if (rpc != RAFT_APPEND_ENTRIES && rpc != RAFT_APPEND_ENTRIES_REPLY)
-        dbg_printf("RAFT raft_send: %s to %d (active_peers=%d)\n", raft_rpc_str[rpc], target, raft_active_peers);
+        dbg_printf("RAFT raft_send: %s to fd=%d,id=%d (active_peers=%d, leader_id=%d)\n",
+                raft_rpc_str[rpc],
+                client ? client->peer_fd : -1,
+                client ? (int)client->server_id : -1,
+                raft_active_peers, raft_state.leader_id);
 
     va_start(ap, rpc);
 
@@ -7826,7 +7851,6 @@ static int raft_send(raft_conn_t mode, int target, raft_rpc_t rpc, ...)
                     tmp = tmp->next;
                 }
             }
-            raft_state.last_ping = timems();
             break;
 
         case RAFT_APPEND_ENTRIES_REPLY:
@@ -7841,15 +7865,14 @@ static int raft_send(raft_conn_t mode, int target, raft_rpc_t rpc, ...)
 
     unsigned sent = 0;
 
-    if (target == -1) {
+    if (client == NULL) {
         for (unsigned idx = 1; idx < raft_num_peers; idx++) {
             if (raft_peers[idx].peer_fd == -1)
                 continue;
             if ((rc = write(raft_peers[idx].peer_fd, packet_buffer, sendsz)) != sendsz) {
                 if (rc == -1) {
-                    warn("raft_send: write(%u on fd %u)", idx, raft_peers[idx].peer_fd);
-                    close_socket(&raft_peers[idx].peer_fd);
-                    raft_active_peers--;
+                    warn("raft_send: bcast write(%u on fd %u)", idx, raft_peers[idx].peer_fd);
+                    raft_close(&raft_peers[idx]);
                 } else {
                     dbg_printf("RAFT raft_send: short-write on fd %u\n",
                             raft_peers[idx].peer_fd);
@@ -7861,21 +7884,33 @@ static int raft_send(raft_conn_t mode, int target, raft_rpc_t rpc, ...)
     } else {
         int *fd;
 
-        if (mode == RAFT_PEER)
-            fd = &raft_peers[target].peer_fd;
-        else if (raft_state.mode == RAFT_LEADER)
-            fd = &raft_peers[raft_state.self_id].peer_fd;
-        else
-            fd = &raft_peers[raft_state.leader_id].peer_fd;
+        if (mode == RAFT_PEER) {
+            fd = &client->peer_fd;
+        } else if (raft_state.mode == RAFT_MODE_LEADER) {
+            client = &raft_peers[0];
+            fd = &raft_peers[0].peer_fd;
+        } else {
+            for (unsigned target_idx = 0; target_idx < raft_num_peers; target_idx++)
+            {
+                if (raft_peers[target_idx].server_id != raft_state.leader_id)
+                    continue;
+                fd = &raft_peers[raft_state.leader_id].peer_fd;
+                client = &raft_peers[target_idx];
+                goto got_leader;
+            }
+            warnx("can't find leader?");
+            goto fail;
+got_leader:
+        }
 
         assert(fd != NULL);
         assert(*fd != -1);
 
         if ((rc = write(*fd, packet_buffer, sendsz)) != sendsz) {
             if (rc == -1) {
-                warn("raft_send: write(%u on fd %u)", target, *fd);
-                close_socket(fd);
-                if ((uint32_t)target != raft_state.self_id)
+                warn("raft_send: single write(%u on fd %u)", client->server_id, *fd);
+                raft_close(client);
+                if (client->server_id != raft_state.self_id)
                     raft_active_peers--;
                 goto fail;
             } else {
@@ -7901,10 +7936,19 @@ fail:
     return -1;
 }
 
+static void raft_reset_election_timer(void)
+{
+    raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
+}
+
+static void raft_reset_next_ping(void)
+{
+    raft_state.next_ping = timems() + RAFT_PING_DELAY;
+}
+
 static void raft_change_to(raft_mode_t mode)
 {
     uint32_t log_index, log_term;
-    ssize_t rc;
 
     if (raft_state.mode == mode)
         return;
@@ -7917,36 +7961,17 @@ static void raft_change_to(raft_mode_t mode)
 
     switch (mode)
     {
-        case RAFT_FOLLOWER:
-            raft_state.voted_for = 0;
-            raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
+        case RAFT_MODE_FOLLOWER:
+            raft_state.voted_for = NULL_ID;
+            raft_reset_election_timer();
             break;
 
-        case RAFT_CANDIDATE:
-            raft_state.current_term++;
-            raft_state.voted_for = raft_state.self_id;
-            raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
-
-            for (unsigned idx = 1; idx < raft_num_peers; idx++)
-                raft_peers[idx].voted_for = 0;
-
-            dbg_printf(BWHT "RAFT raft_change_to: starting election (new term will be %u)" CRESET "\n",
-                    raft_state.current_term);
-
-            if ((rc = raft_send(RAFT_PEER, -1, RAFT_REQUEST_VOTE,
-                        raft_state.current_term,
-                        raft_state.self_id,
-                        raft_state.log_head ? raft_state.log_head->index : 0,
-                        raft_state.log_head ? raft_state.log_head->term : 0
-                        )) <= 0) {
-                if (rc == -1)
-                    warn("raft_change_to: raft_send");
-                raft_change_to(RAFT_FOLLOWER);
-            }
+        case RAFT_MODE_CANDIDATE:
+            raft_reset_election_timer();
             break;
 
-        case RAFT_LEADER:
-            if (raft_send(RAFT_PEER, -1, RAFT_APPEND_ENTRIES,
+        case RAFT_MODE_LEADER:
+            if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
                         raft_state.current_term,
                         raft_state.self_id,
                         log_index,
@@ -7966,76 +7991,33 @@ static void raft_change_to(raft_mode_t mode)
     raft_state.mode = mode;
 }
 
-static void raft_tick(void)
+static void raft_tick_connection_check(void)
 {
     int new_fd = 0;
     struct sockaddr_in sin;
     socklen_t sin_len;
-    timems_t now = timems();
-
-    static time_t last_run = 0;
-
-    if (last_run == 0)
-        last_run = time(NULL) - 1;
-
-    if (time(NULL) != last_run) {
-        dbg_printf("RAFT raft_tick: raft_active_peers=%d\n", raft_active_peers);
-#if 0
-        for (unsigned idx = 0; idx < raft_num_peers; idx++)
-        {
-            dbg_printf("RAFT raft_tick: idx[%2d] fd=%2u server_id=%2u addr=%08x:%u\n",
-                    idx,
-                    raft_peers[idx].peer_fd,
-                    raft_peers[idx].server_id,
-                    ntohl(raft_peers[idx].address.s_addr),
-                    ntohs(raft_peers[idx].port)
-                    );
-        }
-#endif
-    }
-
-    switch(raft_state.mode)
-    {
-        case RAFT_FOLLOWER:
-            break;
-        case RAFT_LEADER:
-            if ( (now - raft_state.last_ping) > RAFT_PING_DELAY) {
-                uint32_t log_index, log_term;
-                log_index = raft_state.log_head ? raft_state.log_head->index : 0;
-                log_term = raft_state.log_head ? raft_state.log_head->term : 0;
-                if (raft_send(RAFT_PEER, -1, RAFT_APPEND_ENTRIES,
-                        raft_state.current_term,
-                        raft_state.self_id,
-                        log_index,
-                        log_term,
-                        raft_state.commit_index,
-                        (uint32_t)0,
-                        NULL
-                        ) <= 0) {
-                    ;
-                }
-            }
-            break;
-
-        default:
-            break;
-    }
-
     errno = 0;
+
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
     {
-        if ( /*(idx == raft_state.self_id) ||*/
-                    (raft_peers[idx].port == 0) ||
-                    (raft_peers[idx].peer_fd > 0) )
+        if (raft_peers[idx].port == 0)
+            continue;
+
+        if (raft_peers[idx].peer_fd != -1)
+            continue;
+
+        if (timems() < raft_peers[idx].next_conn_attempt)
             continue;
 
         if ((new_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
             continue;
 
         memset(&sin, 0, sizeof(sin));
+
         sin.sin_family = AF_INET;
         sin.sin_addr = raft_peers[idx].address;
         sin.sin_port = raft_peers[idx].port;
+
         sin_len = sizeof(sin);
 
         sock_linger(new_fd);
@@ -8043,9 +8025,12 @@ static void raft_tick(void)
         sock_keepalive(new_fd);
 
         if (connect(new_fd, (struct sockaddr *)&sin, sin_len) == -1) {
-            if (idx == 0)
+            if (idx == 0) {
                 warn("raft_tick: connect to self: %08x:%u", ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port));
-            close_socket(&new_fd);
+            } else {
+                close_socket(&new_fd);
+                raft_peers[idx].next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
+            }
             continue;
         }
 
@@ -8055,52 +8040,135 @@ static void raft_tick(void)
         if (idx != 0)
             raft_active_peers++;
 
-        dbg_printf("RAFT raft_tick: connected to %08x:%u (idx=%u, fd=%d)\n",
-                ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port), idx, new_fd);
+        dbg_printf("RAFT raft_tick: connected to %08x:%u (idx=%u, fd=%d, id=%u)\n",
+                ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port),
+                idx, new_fd, raft_peers[idx].server_id);
 
-        if (raft_send(RAFT_PEER, idx, RAFT_HELLO, raft_state.self_id, RAFT_PEER) == -1) {
+        if (raft_send(RAFT_PEER, &raft_peers[idx], RAFT_HELLO, raft_state.self_id, RAFT_PEER) == -1) {
             warn("raft_tick: connect: write(id), closing");
-            close_socket(&raft_peers[idx].peer_fd);
+            raft_close(&raft_peers[idx]);
             if (idx != 0)
                 raft_active_peers--;
         }
 
     }
-//conn_skip:
+}
 
-    if (timems() > raft_state.election_timer) {
-        switch (raft_state.mode)
-        {
-            case RAFT_FOLLOWER:
-                if (raft_state.voted_for == 0)
-                    raft_change_to(RAFT_CANDIDATE);
-                break;
+static void raft_stop_election(void)
+{
+    dbg_printf(NMAG "RAFT raft_stop_election" CRESET "\n");
+    raft_state.voted_for = NULL_ID;
+    raft_state.election = false;
+    for (unsigned idx = 0; idx < raft_num_peers; idx++)
+        raft_peers[idx].voted_for = NULL_ID;
+}
 
-            case RAFT_CANDIDATE:
-                raft_change_to(RAFT_FOLLOWER);
-                break;
+static void raft_start_election(void)
+{
+    int rc;
 
-            default:
-                break;
-        }
+    dbg_printf(BMAG "RAFT raft_start_election" CRESET "\n");
+
+    /* On conversion to candidate, start election: */
+
+    /* Increment currentTerm */
+    raft_state.current_term++;
+    /* Vote for self */
+    raft_state.voted_for = raft_state.self_id;
+    /* Reset election timer */
+    raft_reset_election_timer();
+
+    for (unsigned idx = 1; idx < raft_num_peers; idx++)
+        raft_peers[idx].voted_for = NULL_ID;
+
+    dbg_printf(BWHT "RAFT raft_change_to: starting election (new term will be %u)" CRESET "\n",
+            raft_state.current_term);
+
+    /* Send RequestVote RPCs to all other servers */
+    if ((rc = raft_send(RAFT_PEER, NULL, RAFT_REQUEST_VOTE,
+                    raft_state.current_term,
+                    raft_state.self_id,
+                    raft_state.log_head ? raft_state.log_head->index : 0,
+                    raft_state.log_head ? raft_state.log_head->term : 0
+                    )) == -1) {
+        warn("raft_change_to: raft_send");
+        raft_change_to(RAFT_MODE_FOLLOWER);
+    } else
+        raft_state.election = true;
+}
+
+static void raft_tick(void)
+{
+    timems_t now = timems();
+
+    static time_t last_run = 0;
+
+    if (last_run == 0)
+        last_run = time(NULL) - 1;
+
+    if (time(NULL) != last_run) {
+        dbg_printf("RAFT raft_tick: [%s] term=%u active_peers=%d leader=%d voted_for=%d\n",
+                raft_mode_str[raft_state.mode],
+                raft_state.current_term,
+                raft_active_peers, raft_state.leader_id,
+                raft_state.voted_for);
     }
+
+    switch(raft_state.mode)
+    {
+        case RAFT_MODE_NONE:
+            raft_change_to(RAFT_MODE_FOLLOWER);
+            break;
+
+        case RAFT_MODE_FOLLOWER:
+            if (now > raft_state.election_timer) {
+                raft_change_to(RAFT_MODE_CANDIDATE);
+                raft_start_election();
+            }
+            break;
+
+        case RAFT_MODE_CANDIDATE:
+            if (now > raft_state.election_timer) {
+                if (raft_state.election)
+                    raft_stop_election();
+                else
+                    raft_start_election();
+                raft_reset_election_timer();
+            }
+            break;
+
+        case RAFT_MODE_LEADER:
+            if ( now > raft_state.next_ping ) {
+                uint32_t log_index, log_term;
+                log_index = raft_state.log_head ? raft_state.log_head->index : 0;
+                log_term = raft_state.log_head ? raft_state.log_head->term : 0;
+                if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
+                        raft_state.current_term,
+                        raft_state.self_id,
+                        log_index,
+                        log_term,
+                        raft_state.commit_index,
+                        (uint32_t)0,
+                        NULL
+                        ) == -1) {
+                    warn("raft_tick: RAFT_LEADER: raft_send");
+                }
+                raft_reset_next_ping();
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    raft_tick_connection_check();
 
     last_run = time(NULL);
     return;
-
-/*
-    if (errno) {
-        //dbg_printf("     raft_tick: conn_fail: %s\n", strerror(errno));
-    }
-    if (new_fd != -1) {
-        //dbg_printf("     raft_tick: conn_fail: closing\n");
-        close_socket(&new_fd);
-    }
-    goto conn_skip;
-    */
 }
 
-static int raft_recv(int *fd, uint32_t sender)
+[[gnu::nonnull(1)]]
+static int raft_recv(int *fd, struct raft_host_entry *client)
 {
     uint8_t header[RAFT_HDR_SIZE];
     uint8_t *packet_buffer = NULL;
@@ -8108,15 +8176,23 @@ static int raft_recv(int *fd, uint32_t sender)
     struct raft_packet packet;
     ssize_t rc;
 
+    assert(*fd != -1);
+
     if ((rc = read(*fd, &header, sizeof(header))) != sizeof(header)) {
-        if (rc == 0)
+        if (rc == 0) {
+            if (client)
+                raft_close(client);
             return 0;
+        }
         warn("raft_recv: read(header): %ld", rc);
-shit_packet:
+
+shit_packet: /* common with the packet read */
         dbg_printf("RAFT raft_recv: closing\n");
-        if (sender != raft_state.self_id)
-            raft_active_peers--;
-        close_socket(fd);
+        if (client) {
+            raft_close(client);
+            if (client->server_id != raft_state.self_id)
+                raft_active_peers--;
+        }
         goto fail;
     }
 
@@ -8139,9 +8215,12 @@ shit_packet:
         if ((rc = read(*fd, packet_buffer, packet.length)) != packet.length) {
             if (rc == -1) {
                 warn("raft_recv: read(body)");
-                close_socket(fd);
-                if (sender != raft_state.self_id)
-                    raft_active_peers--;
+                if (client) {
+                    raft_close(client);
+                    if (client->server_id != raft_state.self_id)
+                        raft_active_peers--;
+                } else
+                    close_socket(fd);
             } else
                 dbg_printf("RAFT raft_recv: short-read: %lu < %u\n", rc, packet.length);
             goto shit_packet;
@@ -8157,8 +8236,8 @@ shit_packet:
     switch(packet.rpc)
     {
         case RAFT_REGISTER_CLIENT:
-            if (raft_state.mode != RAFT_LEADER) {
-                raft_send(RAFT_PEER, sender, RAFT_REGISTER_CLIENT_REPLY, RAFT_NOT_LEADER, 0, raft_state.leader_id);
+            if (raft_state.mode != RAFT_MODE_LEADER) {
+                raft_send(RAFT_PEER, client, RAFT_REGISTER_CLIENT_REPLY, RAFT_NOT_LEADER, 0, raft_state.leader_id);
                 break;
             }
             /* append register command to log, replicate and commit */
@@ -8166,7 +8245,7 @@ shit_packet:
             /* apply command in log order, allocting session for new client */
             /* TODO */
             /* reply ok with unique client id, log index can be used */
-            raft_send(RAFT_PEER, sender, RAFT_REGISTER_CLIENT_REPLY, RAFT_OK, raft_state.last_applied, raft_state.leader_id);
+            raft_send(RAFT_PEER, client, RAFT_REGISTER_CLIENT_REPLY, RAFT_OK, raft_state.last_applied, raft_state.leader_id);
             break;
 
         case RAFT_CLIENT_REQUEST:
@@ -8209,15 +8288,18 @@ shit_packet:
                 dbg_printf("RAFT raft_recv: REQUEST_VOTE: term=%u candidate_id=%u last_log_index=%u last_log_term=%u\n",
                         term, candidate_id, last_log_index, last_log_term);
 
-                if (term < raft_state.current_term)
+                if (term < raft_state.current_term) {
                     reply = RAFT_FALSE;
-                else if ( (raft_state.voted_for == 0 || raft_state.voted_for == candidate_id)
-                        && last_log_index >= log_index )
+                } else if (
+                        (raft_state.voted_for == NULL_ID || raft_state.voted_for == candidate_id)
+                        && last_log_index >= log_index ) {
                     reply = RAFT_TRUE;
-                else
+                    raft_state.voted_for = client->server_id;
+                } else {
                     reply = RAFT_FALSE;
+                }
 
-                raft_send(RAFT_PEER, sender, RAFT_REQUEST_VOTE_REPLY, reply);
+                raft_send(RAFT_PEER, client, RAFT_REQUEST_VOTE_REPLY, reply);
             }
             break;
 
@@ -8257,15 +8339,7 @@ shit_packet:
                       //      term, leader_id, prev_log_index, prev_log_term, leader_commit);
                 }
 
-                if (raft_state.mode == RAFT_CANDIDATE)
-                    raft_change_to(RAFT_FOLLOWER);
-
-                if (raft_state.leader_id != leader_id) {
-                    dbg_printf(BRED "RAFT raft_recv: APPEND_ENTRIES: setting leader_id to %d" CRESET "\n", leader_id);
-                    raft_state.leader_id = leader_id;
-                }
-
-                assert(raft_state.mode != RAFT_LEADER);
+                assert(raft_state.mode != RAFT_MODE_LEADER);
 
                 if (num_entries > 0) {
                     /* TODO */
@@ -8273,10 +8347,25 @@ shit_packet:
 
                 raft_status_t reply = RAFT_TRUE;
 
-                if (raft_state.current_term > term)
+                /* Reply false if term < currentTerm */
+                if (term < raft_state.current_term) {
                     reply = RAFT_FALSE;
-                else
+                } else if (term >= raft_state.current_term) {
+                    /* If RPC request or response contains term T > currentTerm,
+                     * set currentTerm to T, convert to follower.
+                     * BUT
+                     * If the leader’s term (included in its RPC) is at least as
+                     * large as the candidate’s current term, then the candidate
+                     * recognizes the leader as legitimate and returns to
+                     * follower state
+                     */
+
+                    /* TODO does this apply only if i'm in RAFT_MODE_CANDIDATE */
+                    if (raft_state.mode == RAFT_MODE_CANDIDATE)
+                        raft_stop_election();
                     raft_state.current_term = term;
+                    raft_change_to(RAFT_MODE_FOLLOWER);
+                }
 
                 /* reply false if log doesn't contain an entry at
                  * prev_log_index whose term matches prev_log_term */
@@ -8297,8 +8386,19 @@ shit_packet:
 
                 /* TODO */
 
-                raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
-                raft_send(RAFT_PEER, sender, RAFT_APPEND_ENTRIES_REPLY, reply);
+                if (reply == RAFT_TRUE) {
+
+                    if (raft_state.mode == RAFT_MODE_CANDIDATE)
+                        raft_change_to(RAFT_MODE_FOLLOWER);
+
+                    if (raft_state.leader_id != leader_id) {
+                        dbg_printf(BRED "RAFT raft_recv: APPEND_ENTRIES: setting leader_id to %d" CRESET "\n", leader_id);
+                        raft_state.leader_id = leader_id;
+                    }
+
+                    raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
+                }
+                raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, reply);
             }
             break;
 
@@ -8318,6 +8418,9 @@ shit_packet:
 
         case RAFT_REQUEST_VOTE_REPLY:
             {
+                if (raft_state.mode != RAFT_MODE_CANDIDATE)
+                    break;
+
                 uint8_t tmp;
                 raft_status_t status;
 
@@ -8325,29 +8428,36 @@ shit_packet:
                 status = tmp;
 
                 dbg_printf("RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: %u voted %s\n",
-                        sender, raft_status_str[status]);
+                        client->server_id, raft_status_str[status]);
 
                 if (status == RAFT_TRUE)
-                    raft_peers[sender].voted_for = raft_state.self_id;
+                    client->voted_for = raft_state.self_id;
                 else
-                    raft_peers[sender].voted_for = -1;
+                    client->voted_for = NULL_ID;
 
                 float votes = 0;
+                float has_voted = 1;
                 const float need = ceilf(raft_num_peers/2.0f);
                 const float total = raft_num_peers;
 
                 for (unsigned idx = 1; idx < raft_num_peers; idx++)
+                {
+                    if (raft_peers[idx].voted_for != NULL_ID)
+                        has_voted++;
                     if (raft_peers[idx].voted_for == raft_state.self_id)
                         votes++;
+                }
 
                 if (raft_state.self_id == raft_state.voted_for)
                     votes++;
 
-                dbg_printf("RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: i have %0.3f/%0.3f votes and need %0.3f\n",
-                        votes, total, need);
+                dbg_printf(BRED "RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: %0.1f/%0.1f votes. %0.1f voted. need %0.1f" CRESET "\n",
+                        votes, total, has_voted, need);
 
-                if (votes >= need)
-                    raft_change_to(RAFT_LEADER);
+                if (votes >= need) {
+                    dbg_printf(BYEL "RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: i have won!" CRESET "\n");
+                    raft_change_to(RAFT_MODE_LEADER);
+                }
             }
             break;
 
@@ -8365,9 +8475,9 @@ fail:
     return -1;
 }
 
-static int raft_packet_in(int idx)
+static int raft_packet_in(struct raft_host_entry *client)
 {
-    return raft_recv(&raft_peers[idx].peer_fd, idx);
+    return raft_recv(&client->peer_fd, client);
 }
 
 static void raft_clean(void)
@@ -8385,20 +8495,23 @@ static int raft_init(void)
     errno = 0;
     memset(&raft_state, 0, sizeof(raft_state));
 
-    raft_state.mode = RAFT_FOLLOWER;
+    raft_state.mode = RAFT_MODE_NONE;
     raft_state.self_id = opt_raft_id;
-    raft_state.election_timer = timems() + (RAFT_PING_DELAY * 2);
     raft_state.leader_id = NULL_ID;
+    raft_state.voted_for = NULL_ID;
 
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
     {
         raft_peers[idx].peer_fd = -1;
-        raft_peers[idx].voted_for = -1;
+        raft_peers[idx].voted_for = NULL_ID;
+        raft_peers[idx].next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
     }
 
+    /* Index 0 is 'self' */
     raft_peers[0].server_id = opt_raft_id;
     raft_peers[0].address = opt_raft_listen;
     raft_peers[0].port = htons(opt_raft_port);
+    raft_peers[0].next_conn_attempt = 0;
 
     dbg_printf("RAFT self   : id=%d url=%08x:%u\n", raft_state.self_id,
             htonl(opt_raft_listen.s_addr), htons(opt_raft_port));
@@ -8480,9 +8593,7 @@ static int raft_client_log_append(raft_log_t event, ...)
 
     va_end(ap);
 
-    if (raft_send(RAFT_PEER,
-                -1,
-                RAFT_APPEND_ENTRIES,
+    if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
                 raft_state.current_term, raft_state.self_id,
                 prev_log ? prev_log->index : 0,
                 prev_log ? prev_log->term : 0,
@@ -8890,7 +9001,7 @@ static RETURN_TYPE main_loop(void *start_args)
                         dbg_printf("RAFT main_loop: fds_exc, closing peer\n");
                         close_socket(&raft_peers[idx].peer_fd);
                     } else if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
-                        raft_packet_in(idx);
+                        raft_packet_in(&raft_peers[idx]);
                 }
             }
 

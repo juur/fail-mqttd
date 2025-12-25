@@ -586,9 +586,10 @@ typedef enum {
 } raft_status_t;
 
 typedef enum {
-    RAFT_FOLLOWER = 0,
-    RAFT_CANDIDATE,
-    RAFT_LEADER,
+    RAFT_MODE_NONE = 0,
+    RAFT_MODE_FOLLOWER,
+    RAFT_MODE_CANDIDATE,
+    RAFT_MODE_LEADER,
     RAFT_MAX_MODE,
 } raft_mode_t;
 
@@ -613,7 +614,8 @@ typedef enum {
 } raft_log_t;
 
 enum {
-    NULL_ID = -1U
+    NULL_ID = -1U,
+    BROADCAST_ID = -1,
 };
 
 struct raft_log {
@@ -644,11 +646,12 @@ struct raft_state {
     uint32_t last_applied;
     
     timems_t election_timer;
+    bool     election;
 
     /* for leaders - both are [] num_server entries */
     uint32_t *next_index;
     uint32_t *match_index;
-    timems_t last_ping;
+    timems_t next_ping;
 };
 
 struct raft_packet {
@@ -667,6 +670,7 @@ struct raft_host_entry {
     int peer_fd;
     uint32_t server_id;
     uint32_t voted_for;
+    timems_t next_conn_attempt;
 };
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];

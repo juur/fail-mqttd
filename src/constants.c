@@ -280,9 +280,10 @@ const char *const raft_rpc_str[RAFT_MAX_RPC] = {
 };
 
 const char *const raft_mode_str[RAFT_MAX_MODE] = {
-    [RAFT_FOLLOWER] = "FOLLOWER",
-    [RAFT_CANDIDATE] = "CANDIDATE",
-    [RAFT_LEADER] = "LEADER",
+    [RAFT_MODE_NONE] = "NONE",
+    [RAFT_MODE_FOLLOWER] = "FOLLOWER",
+    [RAFT_MODE_CANDIDATE] = "CANDIDATE",
+    [RAFT_MODE_LEADER] = "LEADER",
 };
 
 const char *const raft_conn_str[RAFT_MAX_CONN] = {
