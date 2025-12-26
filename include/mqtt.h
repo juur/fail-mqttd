@@ -620,11 +620,13 @@ enum {
 
 struct raft_log {
     struct raft_log *next;
+    raft_log_t event;
+    uint8_t flags;
     uint32_t index;
     uint32_t term;
-    raft_log_t event;
     union {
         struct {
+            uint16_t length;
             uint8_t *name;
         } register_topic;
     };
@@ -632,6 +634,7 @@ struct raft_log {
 
 struct raft_state {
     struct raft_log *log_head;
+    struct raft_log *log_tail;
 
     /* for client */
     uint32_t leader_id;
@@ -706,3 +709,33 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  */
 
 #define RAFT_HELLO_SIZE (RAFT_HDR_SIZE + 4 + 1)
+
+/**
+ * RAFT_APPEND_ENTRIES
+ *
+ * Header
+ * u32   term
+ * u32   leader_id
+ * u32   prev_log_index
+ * u32   prev_log_term
+ * u32   leader_commit
+ * u32   num_entries
+ * 0..n  log_entries[num_entries]
+ */
+
+#define RAFT_APPEND_ENTRIES_FIXED_SIZE  (RAFT_HDR_SIZE + (6 * sizeof(uint32_t)))
+
+/**
+ * RAFT_LOG_*
+ *
+ * u8    type
+ * u8    flags
+ * u32   index
+ * u32   term
+ * 0..n  (depends on type)
+ *
+ * RAFT_LOG_REGISTER_TOPIC
+ *
+ * u16   entry length
+ * 1..n  u8[n] (0 terminated uint8_t string)
+ */
