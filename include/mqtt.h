@@ -618,6 +618,8 @@ enum {
     BROADCAST_ID = -1,
 };
 
+struct raft_host_entry;
+
 struct raft_log {
     struct raft_log *next;
     raft_log_t event;
@@ -638,6 +640,7 @@ struct raft_state {
 
     /* for client */
     uint32_t leader_id;
+    struct raft_host_entry *leader;
     uint32_t sequence_num;
 
     raft_mode_t mode;
@@ -674,6 +677,8 @@ struct raft_host_entry {
     uint32_t server_id;
     uint32_t voted_for;
     timems_t next_conn_attempt;
+    struct in_addr mqtt_addr;
+    in_port_t mqtt_port;
 };
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
@@ -706,9 +711,11 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * Header
  * u32 id   
  * u8  type (raft_conn_t)
+ * u32 mqtt-addr in_addr_t
+ * u16 mqtt-port in_port_t
  */
 
-#define RAFT_HELLO_SIZE (RAFT_HDR_SIZE + 4 + 1)
+#define RAFT_HELLO_SIZE (RAFT_HDR_SIZE + 4 + 1 + 4 + 2)
 
 /**
  * RAFT_APPEND_ENTRIES

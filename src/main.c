@@ -240,6 +240,12 @@ static struct in_addr opt_raft_listen;
 static char *logfile_name = NULL;
 
 /*
+ * Raft
+ */
+
+static struct raft_state raft_state;
+
+/*
  * forward declarations
  */
 
@@ -326,7 +332,7 @@ static void show_usage(FILE *fp, const char *name)
             "The default is disabled.\n"
             "\n"
             "Each RAFTOPTION may be:\n"
-            "  addrs=HOST[;HOST...]  semi-colon separated list of id:host:port peers\n"
+            "  addrs=HOST[/HOST...]  forward-slash separated list of id:host:port peers\n"
             "\n"
             ,
         name,
@@ -4855,24 +4861,48 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     dbg_printf("     send_cp_connack: %s to client <%s>\n",
             reason_codes_str[reason_code], (const char *)client->client_id);
 
-    num_tmp_connack_props = num_connack_props;
-    if (client->keep_alive_override)
-        num_tmp_connack_props++;
+    if (reason_code < MQTT_MALFORMED_PACKET) {
+        num_tmp_connack_props = num_connack_props;
+        if (client->keep_alive_override)
+            num_tmp_connack_props++;
 
-    if ((tmp_connack_props = calloc(num_tmp_connack_props, sizeof(struct property))) == NULL)
-        return -1;
+        if ((tmp_connack_props = calloc(num_tmp_connack_props, sizeof(struct property))) == NULL)
+            return -1;
 
-    for (unsigned idx = 0; idx < num_connack_props; idx++)
-        memcpy(&(*tmp_connack_props)[idx], &connack_props[idx], sizeof(struct property));
+        for (unsigned idx = 0; idx < num_connack_props; idx++)
+            memcpy(&(*tmp_connack_props)[idx], &connack_props[idx], sizeof(struct property));
 
-    if (client->keep_alive_override) {
-        (*tmp_connack_props)[num_connack_props].byte2 = client->keep_alive;
-        (*tmp_connack_props)[num_connack_props].ident = MQTT_PROP_SERVER_KEEP_ALIVE;
+        if (client->keep_alive_override) {
+            (*tmp_connack_props)[num_connack_props].byte2 = client->keep_alive;
+            (*tmp_connack_props)[num_connack_props].ident = MQTT_PROP_SERVER_KEEP_ALIVE;
+        }
+    } else if (reason_code == MQTT_USE_ANOTHER_SERVER && raft_state.leader) {
+        num_tmp_connack_props = 1;
+
+        if ((tmp_connack_props = calloc(num_tmp_connack_props, sizeof(struct property))) == NULL)
+            return -1;
+
+        char name[INET_ADDRSTRLEN];
+        char tmpbuf[INET_ADDRSTRLEN + 1 + 5 + 1];
+        memset(tmpbuf, 0, sizeof(tmpbuf));
+
+        if (inet_ntop(AF_INET, &raft_state.leader->mqtt_addr, name, INET_ADDRSTRLEN) == NULL)
+            return -1;
+
+        snprintf(tmpbuf, sizeof(tmpbuf), "%s:%u", name, ntohs(raft_state.leader->mqtt_port));
+        dbg_printf("     send_cp_connack: setting MQTT_PROP_SERVER_REFERENCE to <%s>\n", tmpbuf);
+
+        (*tmp_connack_props)[0].utf8_string = (void *)strdup(tmpbuf);
+        (*tmp_connack_props)[0].ident = MQTT_PROP_SERVER_REFERENCE;
     }
 
-    /* Calculate the Property[] Length */
-    if ((prop_len = get_properties_size(tmp_connack_props, num_tmp_connack_props)) == -1)
-        return -1;
+    if (num_tmp_connack_props) {
+        /* Calculate the Property[] Length */
+        if ((prop_len = get_properties_size(tmp_connack_props, num_tmp_connack_props)) == -1)
+            return -1;
+    } else {
+        prop_len = 0;
+    }
 
     /* Calculate the length of Property Length */
     if ((proplen_len = encode_var_byte(prop_len, proplen)) == -1)
@@ -4912,8 +4942,9 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     memcpy(ptr, proplen, proplen_len);
     ptr += proplen_len;
 
-    if (build_properties(tmp_connack_props, num_tmp_connack_props, &ptr) == -1)
-        goto fail;
+    if (num_tmp_connack_props)
+        if (build_properties(tmp_connack_props, num_tmp_connack_props, &ptr) == -1)
+            goto fail;
 
     /* Now send the packet */
     if ((wr_len = write(client->fd, packet, length)) != length) {
@@ -6462,6 +6493,11 @@ version_fail:
     client->protocol_version = protocol_version;
     client->keep_alive = keep_alive;
 
+    if (opt_raft && raft_state.mode != RAFT_MODE_LEADER) {
+        reason_code = MQTT_USE_ANOTHER_SERVER;
+        goto fail;
+    }
+
     if ((client->session = find_session(client)) == NULL) {
         /* New Session */
         dbg_printf(BWHT"     handle_cp_connect: no existing session"CRESET"\n");
@@ -6630,9 +6666,8 @@ fail:
 
     bool connack_failed = false;
 
-    if (send_cp_connack(client, reason_code) == -1) {
+    if (send_cp_connack(client, reason_code) == -1)
         connack_failed = true;
-    }
 
     if (will_topic)
         free(will_topic);
@@ -7488,7 +7523,20 @@ static void close_session(struct session *session)
  * Raft
  */
 
-static struct raft_state raft_state;
+static void update_leader_id(uint32_t leader_id)
+{
+    if (leader_id == NULL_ID) {
+        raft_state.leader_id = NULL_ID;
+        raft_state.leader = NULL;
+        return;
+    }
+
+    for (unsigned idx = 0; idx < raft_num_peers; idx++)
+        if (raft_peers[idx].server_id == leader_id) {
+            raft_state.leader_id = leader_id;
+            raft_state.leader = &raft_peers[idx];
+        }
+}
 
 [[gnu::nonnull]]
 static int raft_close(struct raft_host_entry *client)
@@ -7510,7 +7558,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
 {
     struct raft_log *new_log = NULL;
     struct raft_log *prev_log;
-    
+
     dbg_printf("RAFT raft_leader_log_appendv: %s\n",
             raft_log_str[event]);
 
@@ -7600,7 +7648,6 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
             break;
     }
 
-    va_end(ap);
     return rc;
 }
 
@@ -7636,7 +7683,7 @@ static int raft_client_log_append(struct raft_log *raft_log, uint32_t leader_com
          */
 
         struct raft_log *next;
-        
+
         while(tmp)
         {
             next = tmp->next;
@@ -7668,6 +7715,8 @@ static int raft_new_conn(int new_fd, const struct sockaddr_in *sin, socklen_t /*
     unsigned idx;
     ssize_t rc;
     uint32_t id;
+    uint32_t mqtt_addr;
+    uint16_t mqtt_port;
     uint8_t hello_packet[RAFT_HELLO_SIZE];
     uint8_t *ptr = hello_packet;
     struct raft_packet packet;
@@ -7715,19 +7764,26 @@ static int raft_new_conn(int new_fd, const struct sockaddr_in *sin, socklen_t /*
 
     memcpy(&id, ptr, sizeof(id));
     id = ntohl(id);
-    ptr += sizeof(uint32_t);
+    ptr += sizeof(id);
 
     type = *ptr++;
 
+    memcpy(&mqtt_addr, ptr, sizeof(mqtt_addr));
+    ptr += sizeof(mqtt_addr);
+
+    memcpy(&mqtt_port, ptr, sizeof(mqtt_port));
+    ptr += sizeof(mqtt_port);
+
     if (id == raft_state.self_id) {
-        if (packet.role == RAFT_PEER && packet.rpc != RAFT_HELLO) {
+        if (packet.role == RAFT_PEER) {
             errno = EINVAL;
             warnx("raft_new_conn: attempt to read from self?");
             goto fail;
         }
     }
 
-    dbg_printf("RAFT raft_new_conn: read id %u type %s\n", id, raft_conn_str[type]);
+    dbg_printf("RAFT raft_new_conn: read id %u type %s (addr=%08x:%u)\n",
+            id, raft_conn_str[type], ntohl(mqtt_addr), ntohs(mqtt_port));
 
     for (idx = 0; idx < raft_num_peers; idx++)
     {
@@ -7759,6 +7815,9 @@ found_one:
     }
 
     raft_peers[idx].peer_fd = new_fd;
+    raft_peers[idx].mqtt_addr.s_addr = mqtt_addr;
+    raft_peers[idx].mqtt_port = mqtt_port;
+
     if (idx != 0)
         raft_active_peers++;
     return idx;
@@ -7828,6 +7887,8 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
         case RAFT_HELLO:
             packet.length += sizeof(uint32_t);
             packet.length++;
+            packet.length += sizeof(uint32_t);
+            packet.length += sizeof(uint16_t);
             arg_id = htonl(va_arg(ap, uint32_t));
             arg_conn_type = (uint8_t)(va_arg(ap, raft_conn_t));
             break;
@@ -7951,8 +8012,11 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     switch(rpc)
     {
         case RAFT_HELLO:
-            memcpy(ptr, &arg_id, sizeof(arg_id)) ; ptr += sizeof(arg_id) ;
-            memcpy(ptr, &arg_conn_type, 1)       ; ptr++                 ;
+            memcpy(ptr, &arg_id, sizeof(arg_id)) ; ptr += sizeof(arg_id)   ;
+            memcpy(ptr, &arg_conn_type, 1)       ; ptr++                   ;
+            memcpy(ptr, &opt_listen.s_addr, 4)   ; ptr += sizeof(uint32_t) ;
+            uint16_t tmp_port = htons(opt_port);
+            memcpy(ptr, &tmp_port, 2)            ; ptr += sizeof(uint16_t) ;
             break;
 
         case RAFT_CLIENT_REQUEST:
@@ -8090,7 +8154,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             {
                 if (raft_peers[target_idx].server_id != raft_state.leader_id)
                     continue;
-                fd = &raft_peers[raft_state.leader_id].peer_fd;
+                fd = &raft_peers[target_idx].peer_fd;
                 client = &raft_peers[target_idx];
                 goto got_leader;
             }
@@ -8418,7 +8482,12 @@ shit_packet: /* common with the packet read */
     packet.res0 = *ptr++;
     memcpy(&packet.length, ptr, 4); ptr += 4;
 
-    packet.length = ntohl(packet.length) - RAFT_HDR_SIZE;
+    packet.length = ntohl(packet.length);
+
+    if (packet.length < RAFT_HDR_SIZE)
+        goto fail;
+
+    packet.length -= RAFT_HDR_SIZE;
 
     //dbg_printf("RAFT raft_recv: type=%u length=%u\n", packet.rpc, packet.length);
 
@@ -8548,12 +8617,14 @@ shit_packet: /* common with the packet read */
                 if (num_entries) {
                     dbg_printf("RAFT raft_recv: APPEND_ENTRIES: term=%u leader_id=%u prev_log_index=%u prev_log_term=%u leader_commit=%u num_entries=%u\n",
                             term, leader_id, prev_log_index, prev_log_term, leader_commit, num_entries);
-                } 
+                }
 
                 /* 'discovers server with higher term' is valid exit from
                  * Leader state */
                 //assert(raft_state.mode != RAFT_MODE_LEADER);
 
+                /* go over each log entry, building a temporary list starting with
+                 * log_entry_head */
                 for (unsigned idx = 0; idx < num_entries; idx++)
                 {
                     uint8_t type, flags;
@@ -8606,6 +8677,7 @@ shit_packet: /* common with the packet read */
                         log_entry_head = log_entry;
 
                     prev_log_entry = log_entry;
+                    /* NULL the valid entry, so that fail doesn't double-free */
                     log_entry = NULL;
                 }
 
@@ -8628,9 +8700,13 @@ shit_packet: /* common with the packet read */
                     reply = RAFT_FALSE;
                     goto append_reply;
 got_prev_log:
-                    if ((reply = raft_client_log_append(log_entry, leader_commit)) == -1U) {
-                        warn("raft_recv: APPEND_ENTRIES: raft_client_log_append");
-                        goto fail;
+                    /* we have a valid list, so append them all */
+                    for (struct raft_log *tmp = log_entry_head; tmp; tmp = tmp->next)
+                    {
+                        if ((reply = raft_client_log_append(tmp, leader_commit)) == -1U) {
+                            warn("raft_recv: APPEND_ENTRIES: raft_client_log_append");
+                            goto fail;
+                        }
                     }
                 }
 
@@ -8651,25 +8727,22 @@ got_prev_log:
                     raft_change_to(RAFT_MODE_FOLLOWER);
                 }
 
-                /* TODO */
+                /* This state may never happen, but just in case */
+                if (reply == RAFT_FALSE)
+                    goto append_reply;
 
-                /* if leader_commit > commit_index, then set
-                 * commit_index = min(leader_commit, index of last entry) */
+                /* If AppendEntries RPC received from new leader:
+                 * convert to follower §3.4 */
+                if (raft_state.mode == RAFT_MODE_CANDIDATE)
+                    raft_change_to(RAFT_MODE_FOLLOWER);
 
-                /* TODO */
-
-                if (reply == RAFT_TRUE) {
-
-                    if (raft_state.mode == RAFT_MODE_CANDIDATE)
-                        raft_change_to(RAFT_MODE_FOLLOWER);
-
-                    if (raft_state.leader_id != leader_id) {
-                        dbg_printf(BRED "RAFT raft_recv: APPEND_ENTRIES: setting leader_id to %d" CRESET "\n", leader_id);
-                        raft_state.leader_id = leader_id;
-                    }
-
-                    raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
+                if (raft_state.leader_id != leader_id) {
+                    dbg_printf(BRED "RAFT raft_recv: APPEND_ENTRIES: setting leader_id to %d" CRESET "\n",
+                            leader_id);
+                    update_leader_id(leader_id);
                 }
+
+                raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
 append_reply:
                 raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, reply);
             }
@@ -8686,7 +8759,7 @@ append_reply:
                 memcpy(&client_term, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
                 client_term = ntohl(client_term);
                 //dbg_printf("RAFT raft_recv: APPEND_ENTRIES_REPLY %s from %u\n",
-                  //      raft_status_str[status], sender);
+                //      raft_status_str[status], sender);
 
                 /* TODO wtf to do if RAFT_FALSE ? */
             }
@@ -8713,7 +8786,7 @@ append_reply:
 
                 float votes = 0;
                 float has_voted = 1;
-                const float need = ceilf(raft_num_peers/2.0f);
+                const float need = floorf(raft_num_peers/2.0f) + 1;
                 const float total = raft_num_peers;
 
                 for (unsigned idx = 1; idx < raft_num_peers; idx++)
@@ -8754,7 +8827,7 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]]
+    [[gnu::nonnull]]
 static int raft_packet_in(struct raft_host_entry *client)
 {
     return raft_recv(&client->peer_fd, client);
@@ -8792,6 +8865,8 @@ static int raft_init(void)
     raft_peers[0].address = opt_raft_listen;
     raft_peers[0].port = htons(opt_raft_port);
     raft_peers[0].next_conn_attempt = 0;
+    raft_peers[0].mqtt_addr.s_addr = opt_listen.s_addr;
+    raft_peers[0].mqtt_port = opt_port;
 
     dbg_printf("RAFT self   : id=%d url=%08x:%u\n", raft_state.self_id,
             htonl(opt_raft_listen.s_addr), htons(opt_raft_port));
@@ -9877,7 +9952,8 @@ int main(int argc, char *argv[])
         else
             logger(LOG_INFO, NULL, "main: pthread_join(main_thread[%u]): OK", idx);
 #else
-    raft_init();
+    if (opt_raft)
+        raft_init();
     if (main_loop(&start_args) == -1)
         logger(LOG_EMERG, NULL, "main_loop returned an error: %s",
                 strerror(errno));
