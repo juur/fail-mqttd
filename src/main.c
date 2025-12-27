@@ -448,6 +448,7 @@ fail:
     return -1;
 }
 
+[[gnu::nonnull]]
 static void parse_cmdline(int argc, char *argv[])
 {
     int opt;
@@ -717,6 +718,10 @@ static const char *uuid_to_string(const uint8_t uuid[const static UUID_SIZE])
      return buf;
 }
 #endif
+
+/*
+ * socket related helpers
+ */
 
 static void sock_linger(int fd)
 {
@@ -7493,7 +7498,7 @@ static int raft_close(struct raft_host_entry *client)
         return 0;
 
     close_socket(&client->peer_fd);
-    client->next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
+    client->next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 4);
 
     if (client->server_id != raft_state.self_id)
         raft_active_peers--;
@@ -7616,18 +7621,42 @@ static int raft_client_log_send(raft_log_t event, ...)
 [[gnu::nonnull]]
 static int raft_client_log_append(struct raft_log *raft_log, uint32_t leader_commit)
 {
-    /* If an existing entry conflicts (same index, different term)
-     * delete the existing entry, and all that follow it
-     */
+    for (struct raft_log *tmp = raft_state.log_head; tmp; tmp = tmp->next)
+    {
+        if (tmp->index == raft_log->index && tmp->term == raft_log->term) {
+            /* 4. Append any new entries *not* already in the log */
+            return 0;
+        }
+
+        if (tmp->index != raft_log->index)
+            continue;
+
+        /* If an existing entry conflicts (same index, different term)
+         * delete the existing entry, and all that follow it
+         */
+
+        struct raft_log *next;
+        
+        while(tmp)
+        {
+            next = tmp->next;
+            /* TODO */
+            free(tmp);
+            tmp = next;
+        }
+    }
 
     if (raft_state.log_tail)
         raft_state.log_tail->next = raft_log;
     raft_state.log_tail = raft_log;
+
     if (raft_state.log_head == NULL)
         raft_state.log_head = raft_log;
 
+    /* 5. If leaderCommit > commitIndex, set commitIndex =
+     * min(leaderCommit, index of last new entry */
     if (leader_commit > raft_state.commit_index) {
-        raft_state.commit_index = MAX(leader_commit, raft_log->index);
+        raft_state.commit_index = MIN(leader_commit, raft_log->index);
     }
 
     return 0;
@@ -7889,7 +7918,8 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             break;
 
         case RAFT_APPEND_ENTRIES_REPLY:
-            packet.length += 1;
+            packet.length += 1; /* success */
+            packet.length += sizeof(uint32_t); /* currentTerm */
             arg_status = (uint8_t)(va_arg(ap, raft_status_t));
             break;
 
@@ -8018,7 +8048,9 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             break;
 
         case RAFT_APPEND_ENTRIES_REPLY:
-            memcpy(ptr, &arg_status, 1); ptr++;
+            *ptr++ = arg_status;
+            uint32_t term = htonl(raft_state.current_term);
+            memcpy(ptr, &term, sizeof(uint32_t)); ptr+= sizeof(uint32_t);
             break;
 
         default:
@@ -8646,10 +8678,13 @@ append_reply:
         case RAFT_APPEND_ENTRIES_REPLY:
             {
                 uint8_t tmp;
+                uint32_t client_term;
                 [[maybe_unused]] raft_status_t status;
 
                 memcpy(&tmp, ptr, 1); ptr++;
                 status = tmp;
+                memcpy(&client_term, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                client_term = ntohl(client_term);
                 //dbg_printf("RAFT raft_recv: APPEND_ENTRIES_REPLY %s from %u\n",
                   //      raft_status_str[status], sender);
 
