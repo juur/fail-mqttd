@@ -4953,7 +4953,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     }
 
     free(packet);
-    free(tmp_connack_props);
+    free_properties(tmp_connack_props, num_tmp_connack_props);
 
 #if 0
     /* TODO check caller has called close_socket() correctly */
@@ -8266,7 +8266,7 @@ static void raft_tick_connection_check(void)
     socklen_t sin_len;
     errno = 0;
 
-    for (unsigned idx = 0; idx < raft_num_peers; idx++)
+    for (unsigned idx = 1; idx < raft_num_peers; idx++)
     {
         if (raft_peers[idx].port == 0)
             continue;
