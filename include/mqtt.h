@@ -650,6 +650,7 @@ struct raft_state {
 
     uint32_t commit_index;
     uint32_t last_applied;
+    uint32_t log_index;
     
     timems_t election_timer;
     bool     election;
