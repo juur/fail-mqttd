@@ -719,6 +719,20 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
 #define RAFT_HELLO_SIZE (RAFT_HDR_SIZE + 4 + 1 + 4 + 2)
 
 /**
+ * RAFT_CLIENT_REQUEST
+ *
+ * Header
+ * u32   client_id
+ * u32   sequence_num
+ * u8    type
+ * u8    flags
+ * u16   len
+ * 0..n  log_entries[1]
+ */
+
+#define RAFT_CLIENT_REQUEST_SIZE (RAFT_HDR_SIZE + 4 + 4 + 1 + 1 + 2)
+
+/**
  * RAFT_APPEND_ENTRIES
  *
  * Header
@@ -746,4 +760,5 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  *
  * u16   entry length
  * 1..n  u8[n] (0 terminated uint8_t string)
+ *
  */

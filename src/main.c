@@ -140,6 +140,7 @@ static const unsigned  MAX_SESSIONS          = 0x100;
 static const unsigned  MAX_TOPIC_ALIAS       = 0x20;
 static const unsigned  MIN_KEEP_ALIVE        = 60;
 static const unsigned  MAX_CLIENTID_LEN      = 0x100;
+static const unsigned  RAFT_MAX_PACKET_SIZE  = 0x1000000U;
 
 static const unsigned  RAFT_PING_DELAY       = 50;
 static const unsigned  RAFT_MIN_ELECTION     = 200;
@@ -7572,6 +7573,11 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
     struct raft_log *new_log = NULL;
     struct raft_log *prev_log;
 
+    if (event >= RAFT_MAX_LOG) {
+        errno = EINVAL;
+        return -1;
+    }
+
     dbg_printf("RAFT raft_leader_log_appendv: %s\n",
             raft_log_str[event]);
 
@@ -7638,6 +7644,11 @@ static int raft_leader_log_append(raft_log_t event, ...)
 static int raft_client_log_sendv(raft_log_t event, va_list ap)
 {
     int rc = -1;
+
+    if (event >= RAFT_MAX_LOG) {
+        errno = EINVAL;
+        return -1;
+    }
 
     dbg_printf("RAFT raft_client_log_sendv: %s\n",
             raft_log_str[event]);
@@ -7806,6 +7817,11 @@ static int raft_new_conn(int new_fd, const struct sockaddr_in *sin, socklen_t /*
         }
     }
 
+    if (type >= RAFT_MAX_CONN) {
+        errno = EINVAL;
+        goto fail;
+    }
+
     dbg_printf("RAFT raft_new_conn: read id %u type %s (addr=%08x:%u)\n",
             id, raft_conn_str[type], ntohl(mqtt_addr), ntohs(mqtt_port));
 
@@ -7878,13 +7894,19 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
         warnx("raft_send: RAFT_CLIENT and target == BROADCAST_ID");
         errno = EINVAL;
         return -1;
-    } else*/ if (mode == RAFT_PEER && client != NULL && client->peer_fd == -1) {
+    } else*/
+    if (mode == RAFT_PEER && client != NULL && client->peer_fd == -1) {
         errno = EBADF;
         return -1;
     } else if (mode == RAFT_PEER && client == NULL && raft_active_peers == 0) {
         return 0;
     } else if (mode == RAFT_CLIENT && raft_state.leader_id == NULL_ID) {
         errno = EBADF;
+        return -1;
+    }
+
+    if (rpc >= RAFT_MAX_RPC) {
+        errno = EINVAL;
         return -1;
     }
 
@@ -8016,7 +8038,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             break;
 
         default:
-            dbg_printf("RAFT raft_send: unknown type %s\n", raft_rpc_str[rpc]);
+            dbg_printf("RAFT raft_send: unknown type %d\n", rpc);
             errno = EINVAL;
             goto fail;
     }
@@ -8152,7 +8174,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 
         default:
             errno = EINVAL;
-            dbg_printf("RAFT raft_send: unknown type %s\n", raft_rpc_str[rpc]);
+            dbg_printf("RAFT raft_send: unknown type %d\n", rpc);
             goto fail;
     }
 
@@ -8192,7 +8214,12 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
         }
 
         assert(fd != NULL);
-        assert(*fd != -1);
+
+        if (*fd == -1) {
+            errno = EBADF;
+            raft_close(client);
+            goto fail;
+        }
 
         if ((rc = write(*fd, packet_buffer, sendsz)) != sendsz) {
             if (rc == -1) {
@@ -8494,7 +8521,12 @@ static int raft_recv(int *fd, struct raft_host_entry *client)
     ssize_t rc, bytes_remaining;
     struct raft_log *log_entry = NULL, *log_entry_head = NULL, *prev_log_entry = NULL;
 
-    assert(*fd != -1);
+    if (*fd == -1) {
+        errno = EBADF;
+        if (client)
+            raft_close(client);
+        return -1;
+    }
 
     if ((rc = read(*fd, &header, sizeof(header))) != sizeof(header)) {
         if (rc == 0) {
@@ -8521,8 +8553,15 @@ shit_packet: /* common with the packet read */
 
     packet.length = ntohl(packet.length);
 
-    if (packet.length < RAFT_HDR_SIZE)
+    if (packet.length < RAFT_HDR_SIZE) {
+        errno = EINVAL;
         goto fail;
+    }
+
+    if (packet.length > RAFT_MAX_PACKET_SIZE) {
+        errno = ENOSPC;
+        goto fail;
+    }
 
     packet.length -= RAFT_HDR_SIZE;
 
@@ -8572,7 +8611,7 @@ shit_packet: /* common with the packet read */
                 uint32_t client_id, sequence_num;
                 uint8_t type/*, flags*/;
                 uint16_t len;
-                if (bytes_remaining < (4+4+1+2))
+                if (bytes_remaining < RAFT_CLIENT_REQUEST_SIZE)
                     goto fail;
                 memcpy(&client_id, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); client_id = ntohl(client_id);
                 memcpy(&sequence_num, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); sequence_num = ntohl(sequence_num);
@@ -8581,7 +8620,7 @@ shit_packet: /* common with the packet read */
 
                 /* TODO read the actual request */
                 memcpy(&len, ptr, sizeof(len)); ptr += sizeof(len); len = ntohs(len);
-                bytes_remaining -= (4+4+1+2);
+                bytes_remaining -= RAFT_CLIENT_REQUEST_SIZE;
                 switch (type)
                 {
                     case RAFT_LOG_REGISTER_TOPIC:
@@ -8598,7 +8637,8 @@ shit_packet: /* common with the packet read */
                         free(str);
                         break;
                     default:
-                        break;
+                        errno = EINVAL;
+                        goto fail;
                 }
             }
             break;
@@ -8643,7 +8683,7 @@ shit_packet: /* common with the packet read */
                     reply = RAFT_FALSE;
                 }
 
-                raft_send(RAFT_PEER, client, RAFT_REQUEST_VOTE_REPLY, reply);
+                raft_send(RAFT_PEER, client, RAFT_REQUEST_VOTE_REPLY, reply, raft_state.current_term);
             }
             break;
 
@@ -8713,6 +8753,11 @@ shit_packet: /* common with the packet read */
                     memcpy(&entry_length, ptr, sizeof(uint16_t));
                     ptr += sizeof(uint16_t);
                     entry_length = ntohs(entry_length);
+
+                    if (type >= RAFT_MAX_LOG) {
+                        errno = EINVAL;
+                        goto fail;
+                    }
 
                     dbg_printf("RAFT raft_recv: APPEND_ENTRIES: idx=%u type=%s flags=%u len=%u\n",
                             idx, raft_log_str[type], flags, entry_length);
@@ -8913,7 +8958,7 @@ append_reply:
             break;
 
         default:
-            warnx("raft_recv: unknown type: %s", raft_rpc_str[packet.rpc]);
+            warnx("raft_recv: unknown type: %d", packet.rpc);
     }
 
     free(packet_buffer);
