@@ -37,7 +37,6 @@
 #include <ndbm.h>
 #include <sys/stat.h>
 #include <endian.h>
-#include <math.h>
 
 #include "mqtt.h"
 
@@ -7523,19 +7522,33 @@ static void close_session(struct session *session)
  * Raft
  */
 
-static void update_leader_id(uint32_t leader_id)
+static int raft_update_leader_id(uint32_t leader_id)
 {
     if (leader_id == NULL_ID) {
         raft_state.leader_id = NULL_ID;
         raft_state.leader = NULL;
-        return;
+        return 0;
     }
 
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
         if (raft_peers[idx].server_id == leader_id) {
             raft_state.leader_id = leader_id;
             raft_state.leader = &raft_peers[idx];
+            return 0;
         }
+
+    errno = ENOENT;
+    return -1;
+}
+
+static int raft_update_term(uint32_t new_term)
+{
+    assert(new_term > raft_state.current_term);
+
+    raft_state.current_term = new_term;
+    raft_state.voted_for = NULL_ID;
+
+    return 0;
 }
 
 [[gnu::nonnull]]
@@ -7571,6 +7584,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
     new_log->term = raft_state.current_term;
     new_log->index = ++raft_state.log_index;
     new_log->next = NULL;
+    new_log->flags = 0;
 
     if (prev_log)
         prev_log->next = new_log;
@@ -7913,7 +7927,9 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 
         case RAFT_REQUEST_VOTE_REPLY:
             packet.length += 1;
+            packet.length += sizeof(uint32_t);
             arg_status = (uint8_t)(va_arg(ap, raft_status_t));
+            arg_term = htonl(va_arg(ap, uint32_t));
             break;
 
         case RAFT_CLIENT_REQUEST:
@@ -7963,6 +7979,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                 struct raft_log *tmp = arg_entries;
                 unsigned idx;
                 arg_req_len = 0;
+
                 for (idx = 0; tmp && idx < arg_num_entries; idx++)
                 {
                     packet.length++; /* type */
@@ -7979,12 +7996,16 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                             break;
 
                         default:
-                            break;
+                            errno = EINVAL;
+                            goto fail;
                     }
                     tmp = tmp->next;
                 }
-                packet.length += arg_req_len;
+
+                assert(tmp == NULL);
                 assert(idx == arg_num_entries);
+
+                packet.length += arg_req_len;
             }
             break;
 
@@ -8008,6 +8029,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     packet.rpc = (uint8_t)rpc;
     packet.role = mode;
     packet.res0 = 0;
+    packet.flags = 0;
 
     packet.length = htonl(packet.length);
 
@@ -8067,6 +8089,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 
         case RAFT_REQUEST_VOTE_REPLY:
             memcpy(ptr, &arg_status, 1); ptr++;
+            memcpy(ptr, &arg_term, 4); ptr += 4;
             break;
 
         case RAFT_APPEND_ENTRIES:
@@ -8234,7 +8257,7 @@ static void raft_change_to(raft_mode_t mode)
             break;
 
         case RAFT_MODE_LEADER:
-            update_leader_id(raft_state.self_id);
+            raft_update_leader_id(raft_state.self_id);
             for (unsigned idx = 1; idx < raft_num_peers; idx++)
             {
                 /* reinitialize volatile state on leader TODO */
@@ -8446,6 +8469,21 @@ static void raft_tick(void)
     return;
 }
 
+[[gnu::nonnull]]
+static void raft_free_log(struct raft_log *entry)
+{
+    switch (entry->event)
+    {
+        case RAFT_LOG_REGISTER_TOPIC:
+            if (entry->register_topic.name)
+                free(entry->register_topic.name);
+            break;
+        default:
+            break;
+    }
+    free(entry);
+}
+
 [[gnu::nonnull(1)]]
 static int raft_recv(int *fd, struct raft_host_entry *client)
 {
@@ -8510,9 +8548,9 @@ shit_packet: /* common with the packet read */
         bytes_remaining = 0;
     }
 
-    uint32_t log_index/*, log_term*/;
+    uint32_t log_index, log_term;
     log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
-    //log_term = raft_state.log_head ? raft_state.log_head->term : 0;
+    log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
 
     switch(packet.rpc)
     {
@@ -8579,23 +8617,27 @@ shit_packet: /* common with the packet read */
                 dbg_printf("RAFT raft_recv: REQUEST_VOTE: term=%u candidate_id=%u last_log_index=%u last_log_term=%u\n",
                         term, candidate_id, last_log_index, last_log_term);
 
-                /* If RCP request or response contains term T > currentTerm:
+                /* If RPC request or response contains term T > currentTerm:
                  * set currentTerm = T, convert to follower */
                 if (term > raft_state.current_term) {
-                    raft_state.current_term = term;
+                    raft_update_term(term);
                     raft_change_to(RAFT_MODE_FOLLOWER);
-                } 
+                }
+
+                bool is_upto_date = (last_log_term > log_term) ||
+                    (last_log_term == log_term && last_log_index >= log_index);
 
                 if (term < raft_state.current_term) {
                     /* Reply false if term < currentTerm */
                     reply = RAFT_FALSE;
                 } else if (
                         (raft_state.voted_for == NULL_ID || raft_state.voted_for == candidate_id)
-                        && last_log_index >= log_index ) {
+                        && is_upto_date
+                        && candidate_id != NULL_ID ) {
                     /* If votedFor is NULL or candidateId, and candidate's log is at
                      * least as up-to-date as receivers log, grant vote */
                     reply = RAFT_TRUE;
-                    raft_state.voted_for = client->server_id;
+                    raft_state.voted_for = candidate_id;
                     raft_reset_election_timer();
                 } else {
                     reply = RAFT_FALSE;
@@ -8685,7 +8727,7 @@ shit_packet: /* common with the packet read */
                     log_entry->index = index;
                     log_entry->term = term;
                     log_entry->next = NULL;
-                   
+
                     switch((raft_log_t)type)
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
@@ -8723,21 +8765,31 @@ shit_packet: /* common with the packet read */
                 if (term < raft_state.current_term) {
                     reply = RAFT_FALSE;
                     goto append_reply;
+                } else {
+                    /* should we do this even if the rest fails? */
+                    raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
                 }
 
-                if (log_entry_head) {
-                    /* 2. reply false if log doesn't contain an entry at
-                     * prev_log_index whose term matches prev_log_term */
-                    for (struct raft_log *tmp = raft_state.log_head; tmp; tmp = tmp->next)
-                    {
-                        if (prev_log_index == 0)
-                            goto got_prev_log;
-                        if (tmp->index == prev_log_index && tmp->term == prev_log_term)
-                            goto got_prev_log;
-                    }
-                    reply = RAFT_FALSE;
-                    goto append_reply;
+                /* 2. reply false if log doesn't contain an entry at
+                 * prev_log_index whose term matches prev_log_term
+                 * TODO: check this applies to "ping"s */
+
+                if (raft_state.log_head == NULL)
+                    goto got_prev_log;
+
+                for (const struct raft_log *tmp = raft_state.log_head; tmp; tmp = tmp->next)
+                {
+                    if (prev_log_index == 0)
+                        goto got_prev_log;
+                    if (tmp->index == prev_log_index && tmp->term == prev_log_term)
+                        goto got_prev_log;
+                }
+                dbg_printf("RAFT no log matches\n");
+                reply = RAFT_FALSE;
+                goto append_reply;
+
 got_prev_log:
+                if (log_entry_head) {
                     /* we have a valid list, so append them all */
                     for (struct raft_log *tmp = log_entry_head; tmp; tmp = tmp->next)
                     {
@@ -8761,8 +8813,10 @@ got_prev_log:
                     /* TODO does this apply only if i'm in RAFT_MODE_CANDIDATE */
                     if (raft_state.mode == RAFT_MODE_CANDIDATE)
                         raft_stop_election();
-                    raft_state.current_term = term;
+                    if (term > raft_state.current_term)
+                        raft_update_term(term);
                     raft_change_to(RAFT_MODE_FOLLOWER);
+                    raft_update_leader_id(leader_id);
                 }
 
                 /* This state may never happen, but just in case */
@@ -8777,11 +8831,12 @@ got_prev_log:
                 if (raft_state.leader_id != leader_id) {
                     dbg_printf(BRED "RAFT raft_recv: APPEND_ENTRIES: setting leader_id to %d" CRESET "\n",
                             leader_id);
-                    update_leader_id(leader_id);
+                    raft_update_leader_id(leader_id);
                 }
-
-                raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
 append_reply:
+                if (reply != RAFT_TRUE)
+                    dbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: sending reply of %s\n",
+                            raft_status_str[reply]);
                 raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, reply);
             }
             break;
@@ -8809,10 +8864,18 @@ append_reply:
                     break;
 
                 uint8_t tmp;
+                uint32_t term;
                 raft_status_t status;
 
                 memcpy(&tmp, ptr, 1); ptr++;
                 status = tmp;
+
+                memcpy(&term, ptr, 4); ptr += 4;
+                term = ntohl(term);
+
+                /* TODO if reply term > currentTerm: update term and step down */
+                if (term > raft_state.current_term) {
+                }
 
                 dbg_printf("RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: %u voted %s\n",
                         client->server_id, raft_status_str[status]);
@@ -8822,10 +8885,10 @@ append_reply:
                 else
                     client->voted_for = NULL_ID;
 
-                float votes = 0;
-                float has_voted = 1;
-                const float need = floorf(raft_num_peers/2.0f) + 1;
-                const float total = raft_num_peers;
+                unsigned votes = 0;
+                unsigned has_voted = 1;
+                const unsigned need = (raft_num_peers/2) + 1;
+                const unsigned total = raft_num_peers;
 
                 for (unsigned idx = 1; idx < raft_num_peers; idx++)
                 {
@@ -8838,7 +8901,7 @@ append_reply:
                 if (raft_state.self_id == raft_state.voted_for)
                     votes++;
 
-                dbg_printf(BRED "RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: %0.1f/%0.1f votes. %0.1f voted. need %0.1f" CRESET "\n",
+                dbg_printf(BRED "RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: %d/%d votes. %d voted. need %d" CRESET "\n",
                         votes, total, has_voted, need);
 
                 if (votes >= need) {
@@ -8858,7 +8921,15 @@ append_reply:
 
 fail:
     if (log_entry)
-        free(log_entry); /* TODO free_log_entry() */
+        raft_free_log(log_entry);
+
+    while (log_entry_head)
+    {
+        struct raft_log *next = log_entry_head->next;
+        raft_free_log(log_entry_head);
+        log_entry_head = next;
+    }
+
     if (packet_buffer)
         free(packet_buffer);
 
@@ -8869,20 +8940,6 @@ fail:
 static int raft_packet_in(struct raft_host_entry *client)
 {
     return raft_recv(&client->peer_fd, client);
-}
-
-static void raft_free_log(struct raft_log *entry)
-{
-    switch (entry->event)
-    {
-        case RAFT_LOG_REGISTER_TOPIC:
-            if (entry->register_topic.name)
-                free(entry->register_topic.name);
-            break;
-        default:
-            break;
-    }
-    free(entry);
 }
 
 static void raft_clean(void)

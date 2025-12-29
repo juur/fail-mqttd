@@ -15,7 +15,7 @@ LFLAGS          := @@LFLAGS@@
 YFLAGS          := -d -t @@YFLAGS@@
 CFLAGS          := -std=c2x @@CFLAGS@@
 CPPFLAGS        := -DNDEBUG @@CPPFLAGS@@
-LDFLAGS         := -L$(srcdir)/src -L$(objdir) -L. -lm @@LDFLAGS@@
+LDFLAGS         := -L$(srcdir)/src -L$(objdir) -L. @@LDFLAGS@@
 CAT             := cat
 CP              := cp
 TAR             := tar
