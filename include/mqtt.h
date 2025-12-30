@@ -655,9 +655,6 @@ struct raft_state {
     timems_t election_timer;
     bool     election;
 
-    /* for leaders - both are [] num_server entries */
-    uint32_t *next_index;
-    uint32_t *match_index;
     timems_t next_ping;
 };
 
@@ -680,6 +677,9 @@ struct raft_host_entry {
     timems_t next_conn_attempt;
     struct in_addr mqtt_addr;
     in_port_t mqtt_port;
+    /* for server to store */
+    uint32_t match_index;
+    uint32_t next_index;
 };
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
@@ -730,7 +730,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * 0..n  log_entries[1]
  */
 
-#define RAFT_CLIENT_REQUEST_SIZE (RAFT_HDR_SIZE + 4 + 4 + 1 + 1 + 2)
+#define RAFT_CLIENT_REQUEST_SIZE (4 + 4 + 1 + 1 + 2)
 
 /**
  * RAFT_APPEND_ENTRIES
@@ -745,7 +745,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * 0..n  log_entries[num_entries]
  */
 
-#define RAFT_APPEND_ENTRIES_FIXED_SIZE  (RAFT_HDR_SIZE + (6 * sizeof(uint32_t)))
+#define RAFT_APPEND_ENTRIES_FIXED_SIZE  (6 * 4)
 
 /**
  * RAFT_LOG_*
@@ -755,10 +755,12 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   index
  * u32   term
  * 0..n  (depends on type)
+ * u16   entry length
  *
  * RAFT_LOG_REGISTER_TOPIC
  *
- * u16   entry length
  * 1..n  u8[n] (0 terminated uint8_t string)
  *
  */
+
+#define RAFT_LOG_FIXED_SIZE (1+1+4+4+2)
