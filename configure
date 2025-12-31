@@ -41,8 +41,14 @@ Optional features:
   --disable-dependency-tracking
   --enable-debugging              enable debugging (unset NDEBUG)
   --disable-debugging             disable debugging (set NDEBUG) (default)
+  --enable-raft-debugging         enable debugging of raft
+  --disable-raft-debugging        disable debugging of raft (default)
   --enable-threads                enable threads (EXPERIMENTAL)
   --disable-threads               disable threads (default)
+  --enable-raft                   enable Raft clustering
+  --disable-raft                  disable Raft clustering (default)
+  --enable-openmetrics            enable Openmetrics HTTP service
+  --disable-openmetrics           disable Openmetrics HTTP service (default)
 EOF
 }
 
@@ -57,6 +63,9 @@ QUIET=0
 DEPS=1
 FEATURE_DEBUG=0
 FEATURE_THREADS=0
+FEATURE_RAFT_DEBUG=0
+FEATURE_RAFT=0
+FEATURE_OM=0
 SAVED_ARGS="$*"
 
 while :; do
@@ -92,6 +101,10 @@ while :; do
 		--enable-dependency-tracking) DEPS=1 ;;
 		--enable-debugging) FEATURE_DEBUG=1 ;;
 		--disable-debugging) FEATURE_DEBUG=0 ;;
+		--enable-raft-debugging) FEATURE_RAFT_DEBUG=1 ;;
+		--disable-raft-debugging) FEATURE_RAFT_DEBUG=0 ;;
+		--enable-raft) FEATURE_RAFT=1 ;;
+		--disable-raft) FEATURE_RAFT=0 ;;
 		--enable-threads) FEATURE_THREADS=1 ;;
 		--disable-threads) FEATURE_THREADS=0 ;;
 		*) [[ -n "${1-}" ]] && { echo "Unknown argument ${1-}" >&2; exit 1; } ;;
@@ -108,6 +121,10 @@ fi
 
 OBJDIR=$(pwd)
 SRCDIR=$(dirname "${0}")
+
+if [[ "${FEATURE_RAFT_DEBUG}" -eq 1 && "${FEATURE_RAFT}" -eq 0 ]]; then
+	{ echo "Cannot --enable-raft-debugging without --enable-raft" >&2; exit 1; }
+fi
 
 if [[ "$(realpath "${OBJDIR}")" = "$(realpath "${SRCDIR}")" ]]; then
 	echo "Building inside source directory."
@@ -395,7 +412,7 @@ if [[ "${LEX}" ]]; then
 	fi
 fi
 
-if [[ "${FEATURE_DEBUG}" -eq 1 ]]; then
+if [[ "${FEATURE_DEBUG}" -eq 1 || "${FEATURE_RAFT_DEBUG}" -eq 1 ]]; then
 	echo "#undef NDEBUG" >> "${OBJDIR}"/config.h
 fi
 
@@ -409,6 +426,15 @@ fi
 	fi
 	if [[ "${FEATURE_DEBUG}" -eq 1 ]]; then
 		echo "#define FEATURE_DEBUG 1"
+	fi
+	if [[ "${FEATURE_RAFT_DEBUG}" -eq 1 ]]; then
+		echo "#define FEATURE_RAFT_DEBUG 1"
+	fi
+	if [[ "${FEATURE_RAFT}" -eq 1 ]]; then
+		echo "#define FEATURE_RAFT 1"
+	fi
+	if [[ "${FEATURE_OM}" -eq 1 ]]; then
+		echo "#define FEATURE_OM 1"
 	fi
 } >> "${OBJDIR}"/config.h
 
@@ -468,7 +494,7 @@ sed "${ARGS}" <"${SRCDIR}"/"${PACKAGE}".service.in > "${OBJDIR}"/"${PACKAGE}".se
 echo "Creating config.status"
 
 cat > "config.status" <<- __END
-	#!/usr/bin/env sh
+	#!/usr/bin/env bash
 
 	# Created via:
 	# $0 ${SAVED_ARGS}

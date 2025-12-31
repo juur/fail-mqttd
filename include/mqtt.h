@@ -742,10 +742,20 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   prev_log_term
  * u32   leader_commit
  * u32   num_entries
- * 0..n  log_entries[num_entries]
+ * 0..n  log_entries[num_entries] (see: RAFT_LOG_*)
  */
-
 #define RAFT_APPEND_ENTRIES_FIXED_SIZE  (6 * 4)
+
+
+/**
+ * RAFT_APPEND_ENTRIES_REPLY
+ *
+ * Header
+ * u8    reply (RAFT_TRUE/RAFT_FALSE)
+ * u32   current_term
+ * u32   new_match_index
+ */
+#define RAFT_APPEND_ENTRIES_REPLY_FIXED_SIZE (1+4+4)
 
 /**
  * RAFT_LOG_*
