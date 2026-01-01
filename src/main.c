@@ -216,6 +216,8 @@ static _Atomic unsigned long total_messages_sender_completed_at    = 0;
 static _Atomic bool has_clients = false;
 
 #ifdef FEATURE_RAFT
+/* raft_peers[0] is always "self" so is sometimes excluded
+ * from iteration */
 static struct raft_host_entry *raft_peers = NULL;
 static unsigned raft_num_peers = 0;
 static _Atomic int raft_active_peers = 0;
@@ -9100,6 +9102,7 @@ got_prev_log:
                         if (tmp->index > new_match_index)
                             new_match_index = tmp->index;
                     }
+                    /* we've added them all OK, don't free */
                     log_entry_head = NULL;
                 }
 
