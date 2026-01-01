@@ -457,6 +457,8 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
             goto fail;
 
         entry = tmp_entry;
+        
+        memset(&entry[cnt], 0, sizeof(struct raft_host_entry));
         entry[cnt].port = port;
         entry[cnt].address = addr;
         entry[cnt].server_id = id;
@@ -9331,7 +9333,6 @@ static int raft_init(void)
 
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
     {
-        memset(&raft_peers[idx], 0, sizeof(struct raft_host_entry));
         raft_peers[idx].peer_fd = -1;
         raft_peers[idx].voted_for = NULL_ID;
         raft_peers[idx].next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
