@@ -23,6 +23,7 @@
 #include <assert.h>
 #include <arpa/inet.h>
 #include <limits.h>
+/* Far too much code to #ifdef guard for FEATURE_THREADS */
 #ifdef HAVE_PTHREAD_H
 # include <pthread.h>
 #else
@@ -440,10 +441,11 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
             goto fail;
         }
 
-        port = htons(atoi(ptr2));
+        port = atoi(ptr2);
         if (port <= 0 || port >= USHRT_MAX) {
             goto fail;
         }
+        port = htons(port);
 
         free(single);
         single = NULL;
@@ -4935,7 +4937,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
             (*tmp_connack_props)[num_connack_props].ident = MQTT_PROP_SERVER_KEEP_ALIVE;
         }
 #ifdef FEATURE_RAFT
-    } else if (reason_code == MQTT_USE_ANOTHER_SERVER && raft_state.leader) {
+    } else if (reason_code == MQTT_USE_ANOTHER_SERVER && raft_state.leader && raft_state.leader->mqtt_addr.s_addr) {
         num_tmp_connack_props = 1;
 
         if ((tmp_connack_props = calloc(num_tmp_connack_props, sizeof(struct property))) == NULL)
@@ -7625,7 +7627,7 @@ static int raft_close(struct raft_host_entry *client)
 
     close_socket(&client->peer_fd);
     client->next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 4);
-    
+
     const uint32_t last = raft_state.log_tail ? raft_state.log_tail->index : 0;
 
     if (client->server_id != raft_state.self_id) {
@@ -7662,27 +7664,26 @@ static int raft_remove_log(struct raft_log *entry, struct raft_log **head, struc
 {
     struct raft_log *prev = NULL;
 
-    for (struct raft_log *cur = *head; cur; cur = cur->next)
-    {
-        if (cur->next == entry || cur == entry)
-            goto found;
-
-        prev = cur;
+    if (*head == entry) {
+        *head = entry->next;
+        goto found_head;
     }
+
+    for (prev = *head; prev; prev = prev->next)
+        if (prev->next == entry)
+            goto found;
 
     errno = ENOENT;
     return -1;
 
 found:
-    if (prev)
-        prev->next = entry->next;
-    if (*head == entry)
-        *head = entry->next;
+    prev->next = entry->next;
+
+found_head:
     if (*tail == entry)
         *tail = prev;
 
     entry->next = NULL;
-
     return 0;
 }
 
@@ -7717,18 +7718,18 @@ static int raft_check_commit_index(uint32_t best)
 
     const unsigned majority = (raft_num_peers/2) + 1;
 
-    for (uint32_t tmp = best; tmp > raft_state.commit_index; tmp--)
+    for (uint32_t current_best = best; current_best > raft_state.commit_index; current_best--)
     {
         unsigned cnt = 1;
 
         for (unsigned idx = 1; idx < raft_num_peers; idx++)
-            if (raft_peers[idx].match_index >= best)
+            if (raft_peers[idx].match_index >= current_best)
                 cnt++;
 
         if (cnt >= majority) {
-            raft_state.commit_index = tmp;
-            rdbg_printf("RAFT raft_check_commit_index: bumped commit_index to %u\n", tmp);
-            return tmp;
+            raft_state.commit_index = current_best;
+            rdbg_printf("RAFT raft_check_commit_index: bumped commit_index to %u\n", current_best);
+            return current_best;
         }
     }
 
@@ -7759,17 +7760,6 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
     new_log->next = NULL;
     new_log->flags = 0;
 
-    raft_append_log(new_log, &raft_state.log_head, &raft_state.log_tail);
-
-    /*
-       if (prev_log)
-       prev_log->next = new_log;
-       raft_state.log_tail = new_log;
-
-       if (raft_state.log_head == NULL)
-       raft_state.log_head = new_log;
-       */
-
     switch(event)
     {
         case RAFT_LOG_REGISTER_TOPIC:
@@ -7778,9 +7768,12 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
                 goto fail;
             new_log->register_topic.length = strlen((const void *)new_log->register_topic.name);
             break;
+
         default:
             break;
     }
+
+    raft_append_log(new_log, &raft_state.log_head, &raft_state.log_tail);
 
     if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
                 raft_state.current_term, raft_state.self_id,
@@ -7903,14 +7896,8 @@ static int raft_client_log_append_single(struct raft_log *raft_log, uint32_t lea
 
     raft_append_log(raft_log, &raft_state.log_head, &raft_state.log_tail);
 
-    /*
-       if (raft_state.log_tail)
-       raft_state.log_tail->next = raft_log;
-       raft_state.log_tail = raft_log;
-
-       if (raft_state.log_head == NULL)
-       raft_state.log_head = raft_log;
-       */
+    if (raft_state.log_tail)
+        raft_state.log_index = raft_state.log_tail->index;
 
     /* 5. If leaderCommit > commitIndex, set commitIndex =
      * min(leaderCommit, index of last new entry */
@@ -7918,7 +7905,7 @@ static int raft_client_log_append_single(struct raft_log *raft_log, uint32_t lea
         raft_state.commit_index = MIN(leader_commit, raft_log->index);
     }
 
-    return 0;
+    return 1;
 }
 
 [[gnu::nonnull]]
@@ -8215,6 +8202,11 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             goto fail;
     }
 
+    if (packet.length > RAFT_MAX_PACKET_SIZE) {
+        errno = EMSGSIZE;
+        goto fail;
+    }
+
     if ((ptr = packet_buffer = malloc(packet.length)) == NULL)
         goto fail;
 
@@ -8448,7 +8440,6 @@ static int raft_change_to(raft_mode_t mode)
     switch (mode)
     {
         case RAFT_MODE_FOLLOWER:
-            raft_state.voted_for = NULL_ID;
             raft_reset_election_timer();
             break;
 
@@ -8526,19 +8517,14 @@ static int raft_tick_connection_check(void)
 
         if (connect(new_fd, (struct sockaddr *)&sin, sin_len) == -1) {
             close_socket(&new_fd);
-            if (idx == 0) {
-                warn("raft_tick_connection_check: connect to self: %08x:%u", ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port));
-            } else {
-                raft_peers[idx].next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
-            }
+            raft_peers[idx].next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
             continue;
         }
 
         sock_nonblock(new_fd);
 
         raft_peers[idx].peer_fd = new_fd;
-        if (idx != 0)
-            raft_active_peers++;
+        raft_active_peers++;
 
         rdbg_printf("RAFT raft_tick: connected to %08x:%u (idx=%u, fd=%d, id=%u)\n",
                 ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port),
@@ -8557,7 +8543,6 @@ static int raft_tick_connection_check(void)
 static int raft_stop_election(void)
 {
     rdbg_printf(NMAG "RAFT raft_stop_election" CRESET "\n");
-    raft_state.voted_for = NULL_ID;
     raft_state.election = false;
 
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
@@ -8600,6 +8585,12 @@ static int raft_start_election(void)
     }
 
     raft_state.election = true;
+
+    if (raft_num_peers == 1) {
+        raft_change_to(RAFT_MODE_LEADER);
+        raft_stop_election();
+    }
+
     return 0;
 }
 
@@ -8682,8 +8673,12 @@ static int raft_tick(void)
         case RAFT_MODE_LEADER:
             if ( now > raft_state.next_ping ) {
                 uint32_t log_index, log_term;
+
+                /* FIXME check if this is wrong and log_index/log_term should be _per_
+                 * client, so broadcast will NOT work */
                 log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
                 log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
+                
                 if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
                         raft_state.current_term,
                         raft_state.self_id,
@@ -9091,19 +9086,30 @@ got_prev_log:
                     /* we have a valid list, so append them all */
                     for (struct raft_log *next = NULL, *tmp = log_entry_head; tmp; tmp = next)
                     {
+                        int rc;
+                        
                         next = tmp->next;
                         tmp->next = NULL;
-                        if (raft_client_log_append_single(tmp, leader_commit) == -1) {
+
+                        if ((rc = raft_client_log_append_single(tmp, leader_commit)) == -1) {
                             warn("raft_recv: APPEND_ENTRIES: raft_client_log_append");
                             reply = RAFT_FALSE;
                             log_entry_head = tmp; /* don't free the stuff already added? */
                             goto append_reply;
+                        } else if (rc == 0) {
+                            /* entry was a dupe */
+                            raft_free_log(tmp);
+                            /* TODO what should reply be here? */
+                        } else {
+                            if (tmp->index > new_match_index)
+                                new_match_index = tmp->index;
                         }
-                        if (tmp->index > new_match_index)
-                            new_match_index = tmp->index;
                     }
                     /* we've added them all OK, don't free */
                     log_entry_head = NULL;
+                } else if (reply == RAFT_TRUE && leader_commit > raft_state.commit_index) {
+                    /* Advance commit index on a heart beat (if acceptable) */
+                    raft_state.commit_index = MIN(leader_commit, raft_state.log_tail ? raft_state.log_tail->index : 0);
                 }
 
                 if (term >= raft_state.current_term) {
@@ -9160,6 +9166,14 @@ append_reply:
                 memcpy(&new_match_index, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
                 new_match_index = ntohl(new_match_index);
 
+                if (client_term > raft_state.current_term) {
+                    raft_update_term(client_term);
+                    raft_change_to(RAFT_MODE_FOLLOWER);
+                    raft_stop_election();
+                    raft_update_leader_id(NULL_ID);
+                    break;
+                }
+
                 if (status == RAFT_TRUE) {
                     /* TODO one of this match/next index should increase monotonically? */
                     if (new_match_index > client->match_index) {
@@ -9202,6 +9216,11 @@ append_reply:
 
                 /* TODO if reply term > currentTerm: update term and step down */
                 if (term > raft_state.current_term) {
+                    raft_update_term(term);
+                    raft_change_to(RAFT_MODE_FOLLOWER);
+                    raft_stop_election();
+                    raft_update_leader_id(NULL_ID);
+                    break;
                 }
 
                 rdbg_printf("RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: %u voted %s\n",
@@ -9302,6 +9321,7 @@ static void raft_clean(void)
 static int raft_init(void)
 {
     errno = 0;
+    rdbg_printf("RAFT init\n");
     memset(&raft_state, 0, sizeof(raft_state));
 
     raft_state.mode = RAFT_MODE_NONE;
@@ -9311,6 +9331,7 @@ static int raft_init(void)
 
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
     {
+        memset(&raft_peers[idx], 0, sizeof(struct raft_host_entry));
         raft_peers[idx].peer_fd = -1;
         raft_peers[idx].voted_for = NULL_ID;
         raft_peers[idx].next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
@@ -9685,10 +9706,6 @@ static RETURN_TYPE main_loop(void *start_args)
             }
         }
 
-        /*
-        if (raft_client_fd > 0) {
-        }
-        */
 #endif
 
         tv.tv_sec = 0;
@@ -9754,7 +9771,7 @@ static RETURN_TYPE main_loop(void *start_args)
                 if (raft_peers[idx].peer_fd != -1) {
                     if (FD_ISSET(raft_peers[idx].peer_fd, &fds_exc)) {
                         dbg_printf("RAFT main_loop: fds_exc, closing peer\n");
-                        close_socket(&raft_peers[idx].peer_fd);
+                        raft_close(&raft_peers[idx]);
                     } else if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
                         raft_packet_in(&raft_peers[idx]);
                 }
@@ -10381,14 +10398,14 @@ int main(int argc, char *argv[])
     running = true;
 
 #ifdef FEATURE_THREADS
-#define NUM_THREADS 16
+# define NUM_THREADS 16
     pthread_t main_thread[NUM_THREADS], tick_thread[NUM_THREADS], om_thread, raft_thread;
 
-#ifdef FEATURE_RAFT
+# ifdef FEATURE_RAFT
     if (opt_raft &&
             pthread_create(&raft_thread, NULL, raft_loop, &start_args_raft) == -1)
         err(EXIT_FAILURE, "pthread_create: raft_loop");
-#endif
+# endif
 
     if (opt_openmetrics &&
             pthread_create(&om_thread, NULL, openmetrics_loop, &start_args_om) == -1)
@@ -10402,10 +10419,10 @@ int main(int argc, char *argv[])
         if (pthread_create(&tick_thread[idx], NULL, tick_loop, NULL) == -1)
             err(EXIT_FAILURE, "pthread_create: tick[%u]", idx);
 
-#ifdef FEATURE_OM
+# ifdef FEATURE_OM
     if (opt_openmetrics)
         pthread_join(om_thread, NULL);
-#endif
+# endif
 
     for (unsigned idx = 0; idx < NUM_THREADS; idx++)
         if (pthread_join(tick_thread[idx], NULL) == -1)
@@ -10418,11 +10435,11 @@ int main(int argc, char *argv[])
             warn("main: pthread_join(tick_thread)");
         else
             logger(LOG_INFO, NULL, "main: pthread_join(main_thread[%u]): OK", idx);
-#else
-#ifdef FEATURE_RAFT
+#else /* FEATURE_THREADS */
+# ifdef FEATURE_RAFT
     if (opt_raft)
         raft_init();
-#endif
+# endif
     if (main_loop(&start_args) == -1)
         logger(LOG_EMERG, NULL, "main_loop returned an error: %s",
                 strerror(errno));
