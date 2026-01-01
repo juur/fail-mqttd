@@ -406,6 +406,7 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
     if ((tmp_entry = calloc(extra, sizeof(struct raft_host_entry))) == NULL)
         goto fail;
     entry = tmp_entry;
+    tmp_entry = NULL;
 
     while (ptr)
     {
@@ -442,9 +443,8 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
         }
 
         port = atoi(ptr2);
-        if (port <= 0 || port >= USHRT_MAX) {
+        if (port <= 0 || port >= USHRT_MAX)
             goto fail;
-        }
         port = htons(port);
 
         free(single);
@@ -455,15 +455,14 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
 
         if ((tmp_entry = realloc(entry, sizeof(struct raft_host_entry) * (cnt + 1))) == NULL)
             goto fail;
-
         entry = tmp_entry;
+        tmp_entry = NULL;
         
         memset(&entry[cnt], 0, sizeof(struct raft_host_entry));
         entry[cnt].port = port;
         entry[cnt].address = addr;
         entry[cnt].server_id = id;
         entry[cnt].peer_fd = -1;
-        tmp_entry = NULL;
 
         cnt++;
         ptr = strtok_r(NULL, "/", &save);
@@ -475,6 +474,7 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
     if ((tmp_entry = realloc(entry, sizeof(struct raft_host_entry) * (cnt + 1))) == NULL)
         goto fail;
     entry = tmp_entry;
+    tmp_entry = NULL;
 
     memset(&entry[cnt], 0, sizeof(struct raft_host_entry));
 
@@ -1257,7 +1257,7 @@ static void logger(int priority, const struct client *client,
 
 [[maybe_unused]] static inline long rnd(int from, int to)
 {
-    return random() % (from - to + 1) + from;
+    return random() % (to - from + 1) + from;
 }
 
 [[maybe_unused]] static int64_t timems(void)
@@ -1269,6 +1269,7 @@ static void logger(int priority, const struct client *client,
     return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
 }
 
+[[gnu::nonnull]]
 static int find_str(const char *const *lookup, const char *value, int max)
 {
     int ret;
@@ -1309,7 +1310,8 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
 
         if (GET_REFCNT(&mds->message->refcnt) > 0) {
             DEC_REFCNT(&mds->message->refcnt); /* alloc_message_delivery_state */
-            dbg_printf("     mds_detach_and_free: DEC_REFCNT on message.id=%d refcnt=%u\n", mds->message->id, mds->message->refcnt);
+            dbg_printf("     mds_detach_and_free: DEC_REFCNT on message.id=%d refcnt=%u\n",
+                    mds->message->id, mds->message->refcnt);
         }
 
         if (message_lock)
@@ -3740,15 +3742,22 @@ static struct topic *register_topic(const uint8_t *name,
 
     dbg_printf(BYEL "     register_topic: name=%s" CRESET "\n", (char *)name);
 
+#ifdef FEATURE_RAFT
+    if (raft_client_log_send(RAFT_LOG_REGISTER_TOPIC, ret->name) == -1)
+        goto fail;
+#endif
+
     pthread_rwlock_wrlock(&global_topics_lock);
     ret->next = global_topic_list;
     global_topic_list = ret;
-#ifdef FEATURE_RAFT
-    raft_client_log_send(RAFT_LOG_REGISTER_TOPIC, ret->name);
-#endif
     pthread_rwlock_unlock(&global_topics_lock);
 
     return ret;
+
+fail:
+    if (ret)
+        free_topic(ret);
+    return NULL;
 }
 
 [[gnu::nonnull, gnu::warn_unused_result]]
@@ -8664,10 +8673,14 @@ static int raft_tick(void)
 
         case RAFT_MODE_CANDIDATE:
             if (now > raft_state.election_timer) {
+                raft_stop_election();
+                raft_start_election();
+                /*
                 if (raft_state.election)
                     raft_stop_election();
                 else
                     raft_start_election();
+                    */
                 raft_reset_election_timer();
             }
             break;
@@ -9187,11 +9200,10 @@ append_reply:
                     if (new_match_index >= client->next_index) {
                         client->next_index = new_match_index + 1;
                     }
-                } else if (client->next_index > 0) {
+                } else if (client->next_index > 1) {
                     client->next_index--;
                 } else {
-                    warnx("RAFT raft_recv: APPEND_ENTRIES_REPLY: attempting to move next_index on %u below 0\n",
-                            client->server_id);
+                    client->next_index = 1;
                 }
 
                 //rdbg_printf("RAFT raft_recv: APPEND_ENTRIES_REPLY %s from %u\n",
@@ -9297,7 +9309,7 @@ fail:
     return -1;
 }
 
-    [[gnu::nonnull]]
+[[gnu::nonnull]]
 static int raft_packet_in(struct raft_host_entry *client)
 {
     return raft_recv(&client->peer_fd, client);
