@@ -457,7 +457,7 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
             goto fail;
         entry = tmp_entry;
         tmp_entry = NULL;
-        
+
         memset(&entry[cnt], 0, sizeof(struct raft_host_entry));
         entry[cnt].port = port;
         entry[cnt].address = addr;
@@ -1744,7 +1744,8 @@ static void free_packet(struct packet *pck, bool need_lock, bool need_owner_lock
 
     if (pck->message) {
         DEC_REFCNT(&pck->message->refcnt);
-        dbg_printf("     free_packet: DEC_REFCNT on message.id=%d refcnt=%u\n", pck->message->id, pck->message->refcnt);
+        dbg_printf("     free_packet: DEC_REFCNT on message.id=%d refcnt=%u\n",
+                pck->message->id, pck->message->refcnt);
         pck->message = NULL;
     }
 
@@ -7629,6 +7630,19 @@ static int raft_update_term(uint32_t new_term)
     return 0;
 }
 
+static uint32_t raft_term_at(uint32_t index)
+{
+    if (index == 0)
+        return 0;
+
+    for (const struct raft_log *tmp = raft_state.log_head; tmp; tmp = tmp->next)
+        if (tmp->index == index)
+            return tmp->term;
+
+    errno = ENOENT;
+    return -1U;
+}
+
 [[gnu::nonnull]]
 static int raft_close(struct raft_host_entry *client)
 {
@@ -7750,7 +7764,7 @@ static int raft_check_commit_index(uint32_t best)
 static int raft_leader_log_appendv(raft_log_t event, va_list ap)
 {
     struct raft_log *new_log = NULL;
-    struct raft_log *prev_log;
+    //struct raft_log *prev_log;
 
     if (event >= RAFT_MAX_LOG) {
         errno = EINVAL;
@@ -7763,7 +7777,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
     if ((new_log = malloc(sizeof(struct raft_log))) == NULL)
         goto fail;
 
-    prev_log = raft_state.log_tail;
+    //prev_log = raft_state.log_tail;
 
     new_log->event = event;
     new_log->term = raft_state.current_term;
@@ -7786,6 +7800,35 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
 
     raft_append_log(new_log, &raft_state.log_head, &raft_state.log_tail);
 
+    for (unsigned idx = 1; idx < raft_num_peers; idx++)
+    {
+        if (raft_peers[idx].peer_fd == -1)
+            continue;
+
+#if 0
+        if (raft_peers[idx].next_index != new_log->index)
+            continue; /* follower is 'behind' so needs to catch-up */
+#endif
+
+        const uint32_t prev_index = raft_peers[idx].next_index - 1;
+        const uint32_t prev_term = raft_term_at(prev_index);
+
+        if (prev_term == -1U) {
+            warnx("raft_leader_log_appendv: can't find term for index %u", prev_index);
+            continue;
+        }
+
+        if (raft_send(RAFT_PEER, &raft_peers[idx], RAFT_APPEND_ENTRIES,
+                    raft_state.current_term, raft_state.self_id,
+                    prev_index,
+                    prev_term,
+                    raft_state.commit_index,
+                    1,
+                    new_log) == -1) {
+            warn("raft_leader_log_appendv: raft_send(id=%u)", raft_peers[idx].server_id);
+        }
+    }
+    /*
     if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
                 raft_state.current_term, raft_state.self_id,
                 prev_log ? prev_log->index : 0,
@@ -7795,6 +7838,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
                 new_log) == -1) {
         warn("raft_leader_log_appendv: raft_send");
     }
+    */
 
     return 0;
 
@@ -7967,7 +8011,8 @@ static int raft_new_conn(int new_fd, [[maybe_unused]] const struct sockaddr_in *
     packet.length = ntohl(packet.length);
 
     if (packet.length != sizeof(hello_packet)) {
-        warnx("raft_new_conn: pck_len is %u not %lu", packet.length, sizeof(hello_packet));
+        warnx("raft_new_conn: pck_len is %u not %lu", packet.length,
+                sizeof(hello_packet));
         errno = EFBIG;
         goto fail;
     }
@@ -8055,8 +8100,8 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     uint32_t arg_id;
     uint32_t arg_term = 0, arg_candidate_id, arg_last_log_index, arg_log_term;
     uint8_t arg_status, arg_conn_type, arg_req_type, arg_req_flags;
-    uint32_t arg_leader_id = 0, arg_prev_log_index = 0, arg_prev_log_term = 0, arg_leader_commit = 0;
-    uint32_t arg_num_entries = 0, arg_new_match_index = 0;
+    uint32_t arg_leader_id = 0, arg_prev_log_index = 0, arg_prev_log_term = 0;
+    uint32_t arg_num_entries = 0, arg_new_match_index = 0, arg_leader_commit = 0;
     uint32_t arg_client_id = 0, arg_leader_hint = 0;
     uint32_t arg_sequence_num = 0;
     uint16_t arg_req_len;
@@ -8321,8 +8366,10 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
                             rdbg_printf("RAFT raft_send: APPEND_ENTRIES: REGISTER_TOPIC: str=<%s> len=%u\n",
-                                    tmp->register_topic.name, tmp->register_topic.length);
-                            memcpy(ptr, tmp->register_topic.name, tmp->register_topic.length);
+                                    tmp->register_topic.name,
+                                    tmp->register_topic.length);
+                            memcpy(ptr, tmp->register_topic.name,
+                                    tmp->register_topic.length);
                             ptr += tmp->register_topic.length;
                             *ptr++ = 0;
 
@@ -8399,7 +8446,8 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 
         if ((rc = write(*fd, packet_buffer, sendsz)) != sendsz) {
             if (rc == -1) {
-                warn("raft_send: single write(%u on fd %u)", client->server_id, *fd);
+                warn("raft_send: single write(%u on fd %u)",
+                        client->server_id, *fd);
                 raft_close(client);
                 goto fail;
             } else {
@@ -8425,7 +8473,8 @@ fail:
 
 static int raft_reset_election_timer(void)
 {
-    raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
+    raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION,
+            RAFT_MAX_ELECTION);
     return 0;
 }
 
@@ -8528,7 +8577,8 @@ static int raft_tick_connection_check(void)
 
         if (connect(new_fd, (struct sockaddr *)&sin, sin_len) == -1) {
             close_socket(&new_fd);
-            raft_peers[idx].next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
+            raft_peers[idx].next_conn_attempt = timems() +
+                rnd(RAFT_MIN_ELECTION * 2, RAFT_MAX_ELECTION * 3);
             continue;
         }
 
@@ -8541,7 +8591,8 @@ static int raft_tick_connection_check(void)
                 ntohl(sin.sin_addr.s_addr), ntohs(sin.sin_port),
                 idx, new_fd, raft_peers[idx].server_id);
 
-        if (raft_send(RAFT_PEER, &raft_peers[idx], RAFT_HELLO, raft_state.self_id, RAFT_PEER) == -1) {
+        if (raft_send(RAFT_PEER, &raft_peers[idx], RAFT_HELLO,
+                    raft_state.self_id, RAFT_PEER) == -1) {
             warn("raft_tick: connect: write(id), closing");
             raft_close(&raft_peers[idx]);
         }
@@ -8616,7 +8667,8 @@ static int raft_tick(void)
 
 #ifdef FEATURE_RAFT_DEBUG
     if (time(NULL) != last_run) {
-        const uint32_t log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
+        const uint32_t log_index = raft_state.log_tail ?
+            raft_state.log_tail->index : 0;
 
         rdbg_printf(
                 "RAFT [%s]: trm=%u/log.idx=%u/comm=%u/idx=%u peers=%d ldr=%d vte=%d\n",
@@ -8687,13 +8739,14 @@ static int raft_tick(void)
 
         case RAFT_MODE_LEADER:
             if ( now > raft_state.next_ping ) {
+#if 0
                 uint32_t log_index, log_term;
 
                 /* FIXME check if this is wrong and log_index/log_term should be _per_
                  * client, so broadcast will NOT work */
                 log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
                 log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
-                
+
                 if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
                         raft_state.current_term,
                         raft_state.self_id,
@@ -8705,6 +8758,34 @@ static int raft_tick(void)
                         ) == -1) {
                     warn("raft_tick: RAFT_LEADER: raft_send");
                 }
+#endif
+                for (unsigned idx = 1; idx < raft_num_peers; idx++)
+                {
+                    if (raft_peers[idx].peer_fd == -1)
+                        continue;
+
+                    const uint32_t log_index = raft_peers[idx].next_index - 1;
+                    const uint32_t log_term = raft_term_at(log_index);
+
+                    if (log_term == -1U) {
+                        warnx("raft_tick: can't find term for index %u",
+                                log_index);
+                        continue;
+                    }
+
+                    if (raft_send(RAFT_PEER, &raft_peers[idx],
+                                RAFT_APPEND_ENTRIES,
+                                raft_state.current_term,
+                                raft_state.self_id,
+                                log_index, log_term,
+                                raft_state.commit_index,
+                                (uint32_t)0, NULL
+                                ) == -1) {
+                        warn("raft_tick: RAFT_LEADER: raft_send(%u)",
+                                raft_peers[idx].server_id);
+                    }
+                }
+
                 raft_reset_next_ping();
             }
 
@@ -8720,18 +8801,25 @@ static int raft_tick(void)
                     continue;
                 /* else... [if] last logindex >= nextIndex[idx] for a follower */
 
-                for (struct raft_log *prev = NULL, *tmp = raft_state.log_head; tmp; tmp = tmp->next)
+                for (struct raft_log /* *prev = NULL, */*tmp = raft_state.log_head; tmp; tmp = tmp->next)
                 {
-                    if (prev) {
+                    /*if (prev) {
                         tmp_prev_index = raft_state.log_head->next->index;
                         tmp_prev_term = raft_state.log_head->next->term;
                     }
-
-                    prev = tmp;
+                    prev = tmp;*/
 
                     /* ... starting at nextIndex */
                     if (tmp->index < raft_peers[idx].next_index)
                         continue;
+
+                    tmp_prev_index = raft_peers[idx].next_index - 1;
+                    tmp_prev_term = raft_term_at(tmp_prev_index);
+
+                    if (tmp_prev_term == -1U) {
+                        warnx("raft_tick: can't find term for index %u", tmp_prev_index);
+                        continue;
+                    }
 
                     unsigned log_cnt = 0;
                     for (const struct raft_log *cnt_tmp = tmp; cnt_tmp; cnt_tmp = cnt_tmp->next)
@@ -8744,13 +8832,12 @@ static int raft_tick(void)
                                 raft_peers[idx].server_id,
                                 tmp->index);
 
-                        if (raft_send(RAFT_PEER, &raft_peers[idx], RAFT_APPEND_ENTRIES,
+                        if (raft_send(RAFT_PEER, &raft_peers[idx],
+                                    RAFT_APPEND_ENTRIES,
                                     raft_state.current_term,
                                     raft_state.self_id,
-                                    tmp_prev_index,
-                                    tmp_prev_term,
-                                    raft_state.commit_index,
-                                    log_cnt,
+                                    tmp_prev_index, tmp_prev_term,
+                                    raft_state.commit_index, log_cnt,
                                     (const struct raft_log *)tmp) == -1)
                             warn("raft_tick: RAFT_LEADER: raft_send");
                     }
@@ -9102,7 +9189,7 @@ got_prev_log:
                     for (struct raft_log *next = NULL, *tmp = log_entry_head; tmp; tmp = next)
                     {
                         int rc;
-                        
+
                         next = tmp->next;
                         tmp->next = NULL;
 
@@ -9208,8 +9295,6 @@ append_reply:
 
                 //rdbg_printf("RAFT raft_recv: APPEND_ENTRIES_REPLY %s from %u\n",
                 //      raft_status_str[status], sender);
-
-                /* TODO wtf to do if RAFT_FALSE ? */
             }
             break;
 
