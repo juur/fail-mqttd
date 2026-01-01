@@ -8604,6 +8604,7 @@ static int raft_start_election(void)
 static int raft_tick(void)
 {
     static time_t last_run = 0;
+    static uint32_t last_idx = 0, last_term = 0;
     timems_t now = timems();
 
     if (last_run == 0)
@@ -8611,31 +8612,44 @@ static int raft_tick(void)
 
 #ifdef FEATURE_RAFT_DEBUG
     if (time(NULL) != last_run) {
-        rdbg_printf("RAFT raft_tick: [%s] term=%u active_peers=%d leader=%d voted_for=%d\n",
+        const uint32_t log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
+
+        rdbg_printf(
+                "RAFT [%s]: trm=%u/log.idx=%u/comm=%u/idx=%u peers=%d ldr=%d vte=%d\n",
                 raft_mode_str[raft_state.mode],
                 raft_state.current_term,
+                log_index,
+                raft_state.commit_index,
+                raft_state.log_index,
                 raft_active_peers, raft_state.leader_id,
                 raft_state.voted_for);
 
-        for (struct raft_log *ent = raft_state.log_head; ent; ent = ent->next)
-        {
-            const char *name;
-            if (ent == raft_state.log_head)
-                name = "HEAD";
-            else if (ent == raft_state.log_tail)
-                name = "TAIL";
-            else
-                name = " -- ";
-            rdbg_printf("RAFT raft_tick: [%4s] [%s] idx=%u term=%u",
-                    name, raft_log_str[ent->event], ent->index, ent->term);
-            switch(ent->event)
+        if (last_term != raft_state.current_term || log_index != last_idx) {
+            last_term = raft_state.current_term;
+            last_idx = log_index;
+
+            for (const struct raft_log *ent = raft_state.log_head; ent; ent = ent->next)
             {
-                case RAFT_LOG_REGISTER_TOPIC:
-                    rdbg_cprintf(" <%s>", ent->register_topic.name);
-                default:
-                    break;
+                const char *name;
+                if (ent == raft_state.log_head)
+                    name = "HEAD";
+                else if (ent == raft_state.log_tail)
+                    name = "TAIL";
+                else
+                    name = " -- ";
+
+                rdbg_printf("RAFT raft_tick: [%4s] [%s] idx=%u term=%u",
+                        name, raft_log_str[ent->event], ent->index, ent->term);
+
+                switch(ent->event)
+                {
+                    case RAFT_LOG_REGISTER_TOPIC:
+                        rdbg_cprintf(" <%s>", ent->register_topic.name);
+                    default:
+                        break;
+                }
+                rdbg_cprintf("\n");
             }
-            rdbg_cprintf("\n");
         }
     }
 #endif
@@ -9053,8 +9067,11 @@ shit_packet: /* common with the packet read */
                  * prev_log_index whose term matches prev_log_term
                  * TODO: check this applies to "ping"s */
 
-                if (raft_state.log_head == NULL)
+                if (raft_state.log_head == NULL) {
+                    if (prev_log_index > 0)
+                        reply = RAFT_FALSE; /* signal we have nothing so we're at index=0 */
                     goto got_prev_log;
+                }
 
                 for (const struct raft_log *tmp = raft_state.log_head; tmp; tmp = tmp->next)
                 {
@@ -9077,11 +9094,13 @@ got_prev_log:
                         if (raft_client_log_append_single(tmp, leader_commit) == -1) {
                             warn("raft_recv: APPEND_ENTRIES: raft_client_log_append");
                             reply = RAFT_FALSE;
+                            log_entry_head = tmp; /* don't free the stuff already added? */
                             goto append_reply;
                         }
                         if (tmp->index > new_match_index)
                             new_match_index = tmp->index;
                     }
+                    log_entry_head = NULL;
                 }
 
                 if (term >= raft_state.current_term) {
@@ -9119,8 +9138,8 @@ got_prev_log:
                 }
 append_reply:
                 if (reply != RAFT_TRUE)
-                    rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: sending reply of %s\n",
-                            raft_status_str[reply]);
+                    rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: sending reply of %s idx=%u\n",
+                            raft_status_str[reply], new_match_index);
                 raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, reply, new_match_index);
             }
             break;
@@ -9223,6 +9242,15 @@ append_reply:
 
         default:
             warnx("raft_recv: unknown type: %d", packet.rpc);
+    }
+    if (log_entry)
+        raft_free_log(log_entry);
+
+    while (log_entry_head)
+    {
+        struct raft_log *next = log_entry_head->next;
+        raft_free_log(log_entry_head);
+        log_entry_head = next;
     }
 
     free(packet_buffer);
