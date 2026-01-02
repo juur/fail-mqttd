@@ -8613,6 +8613,8 @@ static int raft_stop_election(void)
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
         raft_peers[idx].voted_for = NULL_ID;
 
+    raft_reset_election_timer();
+
     return 0;
 }
 
@@ -9219,6 +9221,40 @@ got_prev_log:
                     raft_state.commit_index = MIN(leader_commit, raft_state.log_tail ? raft_state.log_tail->index : 0);
                 }
 
+                /*
+                 * ALL SERVERS:
+                 *
+                 * If RPC request or response contains term T > currentTerm, set currentTerm to T, convert to follower. §3.3
+                 *
+                 * CANDIDATES: §3.4
+                 *
+                 * If AppendEntries RPC received from new leader: convert to follower.
+                 *
+                 * If the leader’s term (included in its RPC) is at least as large as the candidate’s current term,
+                 * then the candidate recognizes the leader as legitimate and returns to follower state
+                 */
+
+                /* exit events from Candidate status:
+                 *
+                 * receives majority of votes --> LEADER
+                 * election times out, new election --> CANDIDATE
+                 * discovers current leader OR new term --> FOLLOWER
+                 */
+
+                if (term == raft_state.current_term && raft_state.mode == RAFT_MODE_CANDIDATE) {
+                    rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: received term matched leader ping from %u, stepping down.\n",
+                            client->server_id);
+                    goto step_down;
+                } else if (term > raft_state.current_term) {
+                    rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: received newer term from %u, stepping down.\n",
+                            client->server_id);
+                    raft_update_term(term);
+step_down:
+                    raft_change_to(RAFT_MODE_FOLLOWER);
+                    raft_stop_election();
+                    raft_update_leader_id(leader_id);
+                }
+#if 0
                 if (term >= raft_state.current_term) {
                     /* If RPC request or response contains term T > currentTerm,
                      * set currentTerm to T, convert to follower.
@@ -9244,11 +9280,11 @@ got_prev_log:
                         raft_change_to(RAFT_MODE_FOLLOWER);
                     }
                 }
-
+#endif
                 /* This state may never happen, but just in case */
                 if (reply == RAFT_FALSE)
                     goto append_reply;
-
+#if 0
                 /* If AppendEntries RPC received from new leader:
                  * convert to follower §3.4 */
                 if (raft_state.mode == RAFT_MODE_CANDIDATE) {
@@ -9262,6 +9298,7 @@ got_prev_log:
                             leader_id);
                     raft_update_leader_id(leader_id);
                 }
+#endif
 append_reply:
                 if (reply != RAFT_TRUE)
                     rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: sending reply of %s idx=%u\n",
