@@ -7828,18 +7828,6 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
             warn("raft_leader_log_appendv: raft_send(id=%u)", raft_peers[idx].server_id);
         }
     }
-    /*
-    if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
-                raft_state.current_term, raft_state.self_id,
-                prev_log ? prev_log->index : 0,
-                prev_log ? prev_log->term : 0,
-                raft_state.commit_index,
-                1,
-                new_log) == -1) {
-        warn("raft_leader_log_appendv: raft_send");
-    }
-    */
-
     return 0;
 
 fail:
@@ -8474,7 +8462,7 @@ fail:
 static int raft_reset_election_timer(void)
 {
     raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION,
-            RAFT_MAX_ELECTION);
+            RAFT_MAX_ELECTION) + 100;
     return 0;
 }
 
@@ -8495,11 +8483,9 @@ static int raft_change_to(raft_mode_t mode)
     switch (mode)
     {
         case RAFT_MODE_FOLLOWER:
-            raft_reset_election_timer();
             break;
 
         case RAFT_MODE_CANDIDATE:
-            raft_reset_election_timer();
             break;
 
         case RAFT_MODE_LEADER:
@@ -8513,25 +8499,8 @@ static int raft_change_to(raft_mode_t mode)
                 raft_peers[idx].next_index = last + 1;
             }
 
+            /* ensures a 'welcome' ping-style RAFT_APPEND_ENTRIES is sent swiftly */
             raft_state.next_ping = timems();
-
-            /* handle this in the ping
-            uint32_t log_index, log_term;
-            log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
-            log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
-
-
-            if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
-                        raft_state.current_term,
-                        raft_state.self_id,
-                        log_index,
-                        log_term,
-                        raft_state.commit_index,
-                        (uint32_t)0,
-                        NULL
-                        ) == -1) {
-                warn("raft_change_to: raft_send");
-            }*/
             break;
 
         default:
@@ -8614,7 +8583,6 @@ static int raft_stop_election(void)
         raft_peers[idx].voted_for = NULL_ID;
 
     raft_reset_election_timer();
-
     return 0;
 }
 
@@ -8723,6 +8691,7 @@ static int raft_tick(void)
 
         case RAFT_MODE_FOLLOWER:
             if (now > raft_state.election_timer) {
+                rdbg_printf("RAFT raft_tick: FOLLOWER election_timer expired\n");
                 raft_change_to(RAFT_MODE_CANDIDATE);
                 raft_start_election();
             }
@@ -8730,40 +8699,14 @@ static int raft_tick(void)
 
         case RAFT_MODE_CANDIDATE:
             if (now > raft_state.election_timer) {
+                rdbg_printf("RAFT raft_tick: CANDIDATE election_timer expired\n");
                 raft_stop_election();
                 raft_start_election();
-                /*
-                if (raft_state.election)
-                    raft_stop_election();
-                else
-                    raft_start_election();
-                    */
-                raft_reset_election_timer();
             }
             break;
 
         case RAFT_MODE_LEADER:
             if ( now > raft_state.next_ping ) {
-#if 0
-                uint32_t log_index, log_term;
-
-                /* FIXME check if this is wrong and log_index/log_term should be _per_
-                 * client, so broadcast will NOT work */
-                log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
-                log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
-
-                if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
-                        raft_state.current_term,
-                        raft_state.self_id,
-                        log_index,
-                        log_term,
-                        raft_state.commit_index,
-                        (uint32_t)0,
-                        NULL
-                        ) == -1) {
-                    warn("raft_tick: RAFT_LEADER: raft_send");
-                }
-#endif
                 for (unsigned idx = 1; idx < raft_num_peers; idx++)
                 {
                     if (raft_peers[idx].peer_fd == -1)
@@ -8808,12 +8751,6 @@ static int raft_tick(void)
 
                 for (struct raft_log /* *prev = NULL, */*tmp = raft_state.log_head; tmp; tmp = tmp->next)
                 {
-                    /*if (prev) {
-                        tmp_prev_index = raft_state.log_head->next->index;
-                        tmp_prev_term = raft_state.log_head->next->term;
-                    }
-                    prev = tmp;*/
-
                     /* ... starting at nextIndex */
                     if (tmp->index < raft_peers[idx].next_index)
                         continue;
@@ -9014,6 +8951,8 @@ shit_packet: /* common with the packet read */
                             client->server_id);
                     raft_update_term(term);
                     raft_change_to(RAFT_MODE_FOLLOWER);
+                    raft_stop_election();
+                    raft_update_leader_id(client->server_id);
                 }
 
                 bool is_upto_date = (last_log_term > log_term) ||
@@ -9253,56 +9192,19 @@ step_down:
                     raft_change_to(RAFT_MODE_FOLLOWER);
                     raft_stop_election();
                     raft_update_leader_id(leader_id);
-                }
-#if 0
-                if (term >= raft_state.current_term) {
-                    /* If RPC request or response contains term T > currentTerm,
-                     * set currentTerm to T, convert to follower.
-                     * BUT
-                     * If the leader’s term (included in its RPC) is at least as
-                     * large as the candidate’s current term, then the candidate
-                     * recognizes the leader as legitimate and returns to
-                     * follower state
-                     */
+                } 
 
-
-                    /* TODO does this apply only if i'm in RAFT_MODE_CANDIDATE */
-                    if (raft_state.mode == RAFT_MODE_CANDIDATE) {
-                        rdbg_printf("RAFT raft_recv: term(%u) == currentTerm(%u), accept new leader\n",
-                                term, raft_state.current_term);
-                        raft_stop_election();
-                        raft_update_leader_id(leader_id);
-                    }
-                    if (term > raft_state.current_term) {
-                        raft_update_term(term);
-                        rdbg_printf("RAFT raft_recv: term(%u) > currentTerm(%u), converting\n",
-                                term, raft_state.current_term);
-                        raft_change_to(RAFT_MODE_FOLLOWER);
-                    }
-                }
-#endif
                 /* This state may never happen, but just in case */
                 if (reply == RAFT_FALSE)
                     goto append_reply;
-#if 0
-                /* If AppendEntries RPC received from new leader:
-                 * convert to follower §3.4 */
-                if (raft_state.mode == RAFT_MODE_CANDIDATE) {
-                    rdbg_printf("RAFT raft_recv: RPC from a leader(id=%u), converting\n",
-                            client->server_id);
-                    raft_change_to(RAFT_MODE_FOLLOWER);
-                }
 
-                if (raft_state.leader_id != leader_id) {
-                    rdbg_printf(BRED "RAFT raft_recv: APPEND_ENTRIES: setting leader_id to %d" CRESET "\n",
-                            leader_id);
-                    raft_update_leader_id(leader_id);
-                }
-#endif
 append_reply:
-                if (reply != RAFT_TRUE)
+                if (reply == RAFT_TRUE) {
+                    raft_reset_election_timer();
+                } else {
                     rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: sending reply of %s idx=%u\n",
                             raft_status_str[reply], new_match_index);
+                }
                 raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, reply, new_match_index);
             }
             break;
@@ -9373,7 +9275,7 @@ append_reply:
                             client->server_id);
                     raft_update_term(term);
                     raft_change_to(RAFT_MODE_FOLLOWER);
-                    raft_stop_election();
+                    raft_stop_election(); /* triggers raft_reset_election_timer() */
                     raft_update_leader_id(NULL_ID);
                     break;
                 }
@@ -9511,6 +9413,7 @@ static int raft_init(void)
 #endif
 
     atexit(raft_clean);
+    raft_reset_election_timer();
 
     rdbg_printf("RAFT init: raft_num_peers=%u\n", raft_num_peers);
 
@@ -9866,7 +9769,7 @@ static RETURN_TYPE main_loop(void *start_args)
 
         if (has_clients == false) {
 #ifdef FEATURE_RAFT
-            tv.tv_usec = opt_raft ? 10000 : 1000000;
+            tv.tv_usec = opt_raft ? 25000 : 1000000;
 #else
             tv.tv_usec = 1000000;
 #endif
