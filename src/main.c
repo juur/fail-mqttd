@@ -385,7 +385,7 @@ static void show_usage(FILE *fp, const char *name)
             "  addrs=HOST[/HOST...]  forward-slash separated list of id:host:port peers\n"
             "  enable                enable Raft clustering\n"
             "  disable               disable Raft clustering\n"
-            "  id=ID                 set this server's id\n"
+            "  server_id=ID          set this server's id\n"
             "  port=PORT             bind to TCP port (default 1800 + id)\n"
             "  bind=ADDR             bind to IP address ADDR (default 127.0.0.1)\n"
             "\n"
@@ -8037,12 +8037,18 @@ static int raft_new_conn(int new_fd, [[maybe_unused]] const struct sockaddr_in *
     memcpy(&mqtt_port, ptr, sizeof(mqtt_port));
     ptr += sizeof(mqtt_port);
 
-    if (id == raft_state.self_id) {
-        if (packet.role == RAFT_PEER) {
-            errno = EINVAL;
-            warnx("raft_new_conn: attempt to read from self?");
-            goto fail;
-        }
+    if (packet.role != RAFT_CLIENT && packet.role != RAFT_PEER) {
+        warnx("raft_new_conn: attempt to connect as illegal role");
+        errno = EINVAL;
+        goto fail;
+    }
+
+    /* We connect to ourselves, but only as a RAFT_CLIENT */
+    if (id == raft_state.self_id && 
+            packet.role == RAFT_PEER) {
+        warnx("raft_new_conn: attempt to read from self?");
+        errno = EINVAL;
+        goto fail;
     }
 
     if (type >= RAFT_MAX_CONN) {
@@ -8439,12 +8445,28 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     } else {
         int *fd;
 
+        if (mode == RAFT_CLIENT) {
+            if (raft_state.leader == NULL) {
+                warnx("raft_send: can't find leader?");
+                goto fail;
+            }
+            fd = &raft_state.leader->peer_fd;
+            client = raft_state.leader;
+        } else /* RAFT_PEER || RAFT_SERVER */ {
+            if (client == NULL) {
+                errno = EINVAL;
+                goto fail;
+            }
+            fd = &client->peer_fd;
+        }
+
+        /*
         if (mode == RAFT_PEER) {
             fd = &client->peer_fd;
         } else if (raft_state.mode == RAFT_MODE_LEADER) {
             client = &raft_peers[0];
             fd = &raft_peers[0].peer_fd;
-        } else { /* mode == RAFT_CLIENT */
+        } else {
             if (raft_state.leader == NULL) {
                 warnx("raft_send: can't find leader?");
                 goto fail;
@@ -8452,6 +8474,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             fd = &raft_state.leader->peer_fd;
             client = raft_state.leader;
         }
+        */
 
         assert(fd != NULL);
 
@@ -8831,8 +8854,131 @@ static int raft_tick(void)
     return 0;
 }
 
-static raft_status_t process_append_entries()
+[[gnu::nonnull(1)]]
+static raft_status_t process_append_entries(struct raft_host_entry *client,
+        uint32_t term, uint32_t leader_id, uint32_t prev_log_index,
+        uint32_t prev_log_term, struct raft_log *log_entry_head,
+        uint32_t leader_commit, uint32_t new_match_index)
 {
+    raft_status_t reply = RAFT_TRUE;
+
+    /* 1. reply false if term < currentTerm */
+    if (term < raft_state.current_term) {
+        reply = RAFT_FALSE;
+        goto append_reply;
+    } else {
+        raft_update_leader_id(leader_id);
+        /* should we do this even if the rest fails? */
+        raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
+    }
+
+    /* 2. reply false if log doesn't contain an entry at
+     * prev_log_index whose term matches prev_log_term
+     * TODO: check this applies to "ping"s */
+
+    if (raft_state.log_head == NULL) {
+        if (prev_log_index > 0) {
+            reply = RAFT_FALSE; /* signal we have nothing so we're at index=0 */
+            goto append_reply;
+        }
+        goto got_prev_log;
+    }
+
+    for (const struct raft_log *tmp = raft_state.log_head; tmp; tmp = tmp->next)
+    {
+        if (prev_log_index == 0)
+            goto got_prev_log;
+        if (tmp->index == prev_log_index && tmp->term == prev_log_term)
+            goto got_prev_log;
+    }
+    rdbg_printf("RAFT no log matches\n");
+    reply = RAFT_FALSE;
+    goto append_reply;
+
+got_prev_log:
+    if (log_entry_head) {
+        /* we have a valid list, so append them all */
+        for (struct raft_log *next = NULL, *tmp = log_entry_head; tmp; tmp = next)
+        {
+            int rc;
+
+            next = tmp->next;
+            tmp->next = NULL;
+
+            if ((rc = raft_client_log_append_single(tmp, leader_commit)) == -1) {
+                warn("raft_recv: APPEND_ENTRIES: raft_client_log_append");
+                reply = RAFT_FALSE;
+                log_entry_head = tmp; /* don't free the stuff already added? */
+                goto append_reply;
+            } else if (rc == 0) {
+                /* entry was a dupe */
+                raft_free_log(tmp);
+                /* TODO what should reply be here? */
+            } else {
+                if (tmp->index > new_match_index)
+                    new_match_index = tmp->index;
+            }
+        }
+        /* we've added them all OK, don't free */
+        log_entry_head = NULL;
+    } else if (reply == RAFT_TRUE && leader_commit > raft_state.commit_index) {
+        /* Advance commit index on a heart beat (if acceptable) */
+        raft_state.commit_index = MIN(leader_commit,
+                raft_state.log_tail ? raft_state.log_tail->index : 0);
+    }
+
+    /*
+     * ALL SERVERS:
+     *
+     * If RPC request or response contains term T > currentTerm, set currentTerm to T, convert to follower. §3.3
+     *
+     * CANDIDATES: §3.4
+     *
+     * If AppendEntries RPC received from new leader: convert to follower.
+     *
+     * If the leader’s term (included in its RPC) is at least as large as the candidate’s current term,
+     * then the candidate recognizes the leader as legitimate and returns to follower state
+     */
+
+    /* exit events from Candidate status:
+     *
+     * receives majority of votes --> LEADER
+     * election times out, new election --> CANDIDATE
+     * discovers current leader OR new term --> FOLLOWER
+     */
+
+    if (term == raft_state.current_term && raft_state.mode == RAFT_MODE_CANDIDATE) {
+        rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: received term matched leader ping from %u, stepping down.\n",
+                client->server_id);
+        goto step_down;
+    } else if (term > raft_state.current_term) {
+        rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: received newer term from %u, stepping down.\n",
+                client->server_id);
+        raft_update_term(term);
+step_down:
+        raft_change_to(RAFT_MODE_FOLLOWER);
+        raft_stop_election();
+        raft_update_leader_id(leader_id);
+    }
+
+    /* This state may never happen, but just in case */
+    if (reply == RAFT_FALSE)
+        goto append_reply;
+
+append_reply:
+    if (reply == RAFT_TRUE) {
+        raft_reset_election_timer();
+    } else {
+        rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: sending reply of %s idx=%u\n",
+                raft_status_str[reply], new_match_index);
+    }
+
+    raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, reply, new_match_index);
+
+    return reply;
+
+[[maybe_unused]] fail:
+    return RAFT_ERR;
 }
 
 [[gnu::nonnull(1)]]
@@ -8944,8 +9090,8 @@ shit_packet: /* common with the packet read */
                 if (reply != RAFT_OK) {
                     warn("raft_recv: RAFT_CLIENT_REQUEST_REPLY: got an error: <%s>",
                             reply < RAFT_MAX_STATUS ? raft_status_str[reply] : "ILLEGAL_CODE");
+                    goto fail;
                 }
-                goto fail;
             }
             break;
 
@@ -9019,7 +9165,7 @@ send_client_request_reply:
                     raft_update_term(term);
                     raft_change_to(RAFT_MODE_FOLLOWER);
                     raft_stop_election();
-                    raft_update_leader_id(client->server_id);
+                    raft_update_leader_id(NULL_ID);
                 }
 
                 bool is_upto_date = (last_log_term > log_term) ||
@@ -9140,8 +9286,8 @@ send_client_request_reply:
                                 goto fail;
                             log_entry->register_topic.name = (void *)strndup((void *)ptr, entry_length);
                             log_entry->register_topic.length = strlen((void *)log_entry->register_topic.name);
-                            rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: REGISTER_TOPIC: str=<%s> len=%u\n",
-                                    log_entry->register_topic.name, log_entry->register_topic.length);
+                            //rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: REGISTER_TOPIC: str=<%s> len=%u\n",
+                            //        log_entry->register_topic.name, log_entry->register_topic.length);
                             ptr += entry_length;
                             bytes_remaining -= entry_length;
                             break;
@@ -9164,116 +9310,10 @@ send_client_request_reply:
                     log_entry = NULL;
                 }
 
-                raft_status_t reply = RAFT_TRUE;
-
-                /* 1. reply false if term < currentTerm */
-                if (term < raft_state.current_term) {
-                    reply = RAFT_FALSE;
-                    goto append_reply;
-                } else {
-                    raft_update_leader_id(leader_id);
-                    /* should we do this even if the rest fails? */
-                    raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
-                }
-
-                /* 2. reply false if log doesn't contain an entry at
-                 * prev_log_index whose term matches prev_log_term
-                 * TODO: check this applies to "ping"s */
-
-                if (raft_state.log_head == NULL) {
-                    if (prev_log_index > 0)
-                        reply = RAFT_FALSE; /* signal we have nothing so we're at index=0 */
-                    goto got_prev_log;
-                }
-
-                for (const struct raft_log *tmp = raft_state.log_head; tmp; tmp = tmp->next)
-                {
-                    if (prev_log_index == 0)
-                        goto got_prev_log;
-                    if (tmp->index == prev_log_index && tmp->term == prev_log_term)
-                        goto got_prev_log;
-                }
-                rdbg_printf("RAFT no log matches\n");
-                reply = RAFT_FALSE;
-                goto append_reply;
-
-got_prev_log:
-                if (log_entry_head) {
-                    /* we have a valid list, so append them all */
-                    for (struct raft_log *next = NULL, *tmp = log_entry_head; tmp; tmp = next)
-                    {
-                        int rc;
-
-                        next = tmp->next;
-                        tmp->next = NULL;
-
-                        if ((rc = raft_client_log_append_single(tmp, leader_commit)) == -1) {
-                            warn("raft_recv: APPEND_ENTRIES: raft_client_log_append");
-                            reply = RAFT_FALSE;
-                            log_entry_head = tmp; /* don't free the stuff already added? */
-                            goto append_reply;
-                        } else if (rc == 0) {
-                            /* entry was a dupe */
-                            raft_free_log(tmp);
-                            /* TODO what should reply be here? */
-                        } else {
-                            if (tmp->index > new_match_index)
-                                new_match_index = tmp->index;
-                        }
-                    }
-                    /* we've added them all OK, don't free */
-                    log_entry_head = NULL;
-                } else if (reply == RAFT_TRUE && leader_commit > raft_state.commit_index) {
-                    /* Advance commit index on a heart beat (if acceptable) */
-                    raft_state.commit_index = MIN(leader_commit, raft_state.log_tail ? raft_state.log_tail->index : 0);
-                }
-
-                /*
-                 * ALL SERVERS:
-                 *
-                 * If RPC request or response contains term T > currentTerm, set currentTerm to T, convert to follower. §3.3
-                 *
-                 * CANDIDATES: §3.4
-                 *
-                 * If AppendEntries RPC received from new leader: convert to follower.
-                 *
-                 * If the leader’s term (included in its RPC) is at least as large as the candidate’s current term,
-                 * then the candidate recognizes the leader as legitimate and returns to follower state
-                 */
-
-                /* exit events from Candidate status:
-                 *
-                 * receives majority of votes --> LEADER
-                 * election times out, new election --> CANDIDATE
-                 * discovers current leader OR new term --> FOLLOWER
-                 */
-
-                if (term == raft_state.current_term && raft_state.mode == RAFT_MODE_CANDIDATE) {
-                    rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: received term matched leader ping from %u, stepping down.\n",
-                            client->server_id);
-                    goto step_down;
-                } else if (term > raft_state.current_term) {
-                    rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: received newer term from %u, stepping down.\n",
-                            client->server_id);
-                    raft_update_term(term);
-step_down:
-                    raft_change_to(RAFT_MODE_FOLLOWER);
-                    raft_stop_election();
-                    raft_update_leader_id(leader_id);
-                }
-
-                /* This state may never happen, but just in case */
-                if (reply == RAFT_FALSE)
-                    goto append_reply;
-
-append_reply:
-                if (reply == RAFT_TRUE) {
-                    raft_reset_election_timer();
-                } else {
-                    rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: sending reply of %s idx=%u\n",
-                            raft_status_str[reply], new_match_index);
-                }
-                raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, reply, new_match_index);
+                if (process_append_entries(client, term, leader_id, prev_log_index,
+                        prev_log_term, log_entry_head, leader_commit,
+                        new_match_index) == RAFT_ERR)
+                    goto fail;
             }
             break;
 
@@ -9282,6 +9322,9 @@ append_reply:
                 uint8_t tmp;
                 uint32_t client_term, new_match_index;
                 [[maybe_unused]] raft_status_t status;
+
+                if (bytes_remaining < (1+4+4))
+                    goto fail;
 
                 memcpy(&tmp, ptr, 1); ptr++;
                 status = tmp;
@@ -9324,6 +9367,9 @@ append_reply:
 
         case RAFT_REQUEST_VOTE_REPLY:
             {
+                if (bytes_remaining < (1+4))
+                    goto fail;
+
                 if (raft_state.mode != RAFT_MODE_CANDIDATE)
                     break;
 

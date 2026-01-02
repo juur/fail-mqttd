@@ -576,6 +576,7 @@ typedef enum {
 } raft_rpc_t;
 
 typedef enum {
+    RAFT_ERR = -1,
     RAFT_OK = 0,
     RAFT_TRUE,
     RAFT_FALSE,
