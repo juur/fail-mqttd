@@ -8486,16 +8486,11 @@ static int raft_reset_next_ping(void)
 
 static int raft_change_to(raft_mode_t mode)
 {
-    uint32_t log_index, log_term;
-
     if (raft_state.mode == mode)
         return 0;
 
     rdbg_printf(BBLU "RAFT raft_change_to: %s (from %s)"CRESET"\n",
             raft_mode_str[mode], raft_mode_str[raft_state.mode]);
-
-    log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
-    log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
 
     switch (mode)
     {
@@ -8518,6 +8513,14 @@ static int raft_change_to(raft_mode_t mode)
                 raft_peers[idx].next_index = last + 1;
             }
 
+            raft_state.next_ping = timems();
+
+            /* handle this in the ping
+            uint32_t log_index, log_term;
+            log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
+            log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
+
+
             if (raft_send(RAFT_PEER, NULL, RAFT_APPEND_ENTRIES,
                         raft_state.current_term,
                         raft_state.self_id,
@@ -8528,7 +8531,7 @@ static int raft_change_to(raft_mode_t mode)
                         NULL
                         ) == -1) {
                 warn("raft_change_to: raft_send");
-            }
+            }*/
             break;
 
         default:
@@ -9005,6 +9008,8 @@ shit_packet: /* common with the packet read */
                 /* If RPC request or response contains term T > currentTerm:
                  * set currentTerm = T, convert to follower */
                 if (term > raft_state.current_term) {
+                    rdbg_printf("RAFT raft_recv: higher term received from id=%u\n",
+                            client->server_id);
                     raft_update_term(term);
                     raft_change_to(RAFT_MODE_FOLLOWER);
                 }
@@ -9224,13 +9229,20 @@ got_prev_log:
                      * follower state
                      */
 
+
                     /* TODO does this apply only if i'm in RAFT_MODE_CANDIDATE */
-                    if (raft_state.mode == RAFT_MODE_CANDIDATE)
+                    if (raft_state.mode == RAFT_MODE_CANDIDATE) {
+                        rdbg_printf("RAFT raft_recv: term(%u) == currentTerm(%u), accept new leader\n",
+                                term, raft_state.current_term);
                         raft_stop_election();
-                    if (term > raft_state.current_term)
+                        raft_update_leader_id(leader_id);
+                    }
+                    if (term > raft_state.current_term) {
                         raft_update_term(term);
-                    raft_change_to(RAFT_MODE_FOLLOWER);
-                    raft_update_leader_id(leader_id);
+                        rdbg_printf("RAFT raft_recv: term(%u) > currentTerm(%u), converting\n",
+                                term, raft_state.current_term);
+                        raft_change_to(RAFT_MODE_FOLLOWER);
+                    }
                 }
 
                 /* This state may never happen, but just in case */
@@ -9239,8 +9251,11 @@ got_prev_log:
 
                 /* If AppendEntries RPC received from new leader:
                  * convert to follower §3.4 */
-                if (raft_state.mode == RAFT_MODE_CANDIDATE)
+                if (raft_state.mode == RAFT_MODE_CANDIDATE) {
+                    rdbg_printf("RAFT raft_recv: RPC from a leader(id=%u), converting\n",
+                            client->server_id);
                     raft_change_to(RAFT_MODE_FOLLOWER);
+                }
 
                 if (raft_state.leader_id != leader_id) {
                     rdbg_printf(BRED "RAFT raft_recv: APPEND_ENTRIES: setting leader_id to %d" CRESET "\n",
@@ -9269,6 +9284,8 @@ append_reply:
                 new_match_index = ntohl(new_match_index);
 
                 if (client_term > raft_state.current_term) {
+                    dbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES_REPLY has higher term from id=%u, converting\n",
+                            client->server_id);
                     raft_update_term(client_term);
                     raft_change_to(RAFT_MODE_FOLLOWER);
                     raft_stop_election();
@@ -9315,6 +9332,8 @@ append_reply:
 
                 /* TODO if reply term > currentTerm: update term and step down */
                 if (term > raft_state.current_term) {
+                    rdbg_printf("RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY has higher term from id=%u, converting.\n",
+                            client->server_id);
                     raft_update_term(term);
                     raft_change_to(RAFT_MODE_FOLLOWER);
                     raft_stop_election();
