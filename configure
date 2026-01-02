@@ -105,6 +105,8 @@ while :; do
 		--disable-raft-debugging) FEATURE_RAFT_DEBUG=0 ;;
 		--enable-raft) FEATURE_RAFT=1 ;;
 		--disable-raft) FEATURE_RAFT=0 ;;
+		--enable-openmetrics) FEATURE_OM=1 ;;
+		--disable-openmetrics) FEATURE_OM=0 ;;
 		--enable-threads) FEATURE_THREADS=1 ;;
 		--disable-threads) FEATURE_THREADS=0 ;;
 		*) [[ -n "${1-}" ]] && { echo "Unknown argument ${1-}" >&2; exit 1; } ;;

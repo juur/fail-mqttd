@@ -153,9 +153,9 @@ static const unsigned  MAX_SESSIONS          = 0x100;
 static const unsigned  MAX_TOPIC_ALIAS       = 0x20;
 static const unsigned  MIN_KEEP_ALIVE        = 60;
 static const unsigned  MAX_CLIENTID_LEN      = 0x100;
+
 #ifdef FEATURE_RAFT
 static const unsigned  RAFT_MAX_PACKET_SIZE  = 0x1000000U;
-
 static const unsigned  RAFT_PING_DELAY       = 50;
 static const unsigned  RAFT_MIN_ELECTION     = 200;
 static const unsigned  RAFT_MAX_ELECTION     = 500;
@@ -325,7 +325,15 @@ static void show_version(FILE *fp)
 static void show_usage(FILE *fp, const char *name)
 {
     fprintf(fp, "fail-mqttd -- a terrible implementation of MQTT\n" "\n"
-            "Usage: %s [-hdVn] [-H ADDR] [-p PORT] [-l LOGOPTION,[LOGOPTION..]] [-o OMOPTION,[OMOPTION..]] [TOPIC..]\n"
+            "Usage: %s [-hdVn] [-H ADDR] [-p PORT] "
+            " [-l LOGOPTION,[LOGOPTION..]]"
+#ifdef FEATURE_OM
+            " [-o OMOPTION,[OMOPTION..]]"
+#endif
+#ifdef FEATURE_RAFT
+            " [-r RAFTOPTION,[RAFTOPTION..]]"
+#endif
+            " [TOPIC..]\n"
             "Provides a MQTT broker, "
             "pre-creating topics per additional command line arguments, "
             "if provided.\n"
@@ -333,17 +341,20 @@ static void show_usage(FILE *fp, const char *name)
             "Options:\n"
             "  -h             show help\n"
             "  -H ADDR        bind to IP address ADDR (default 127.0.0.1)\n"
-            "  -l LOGOPTION   comma separated suboptions, described below, for logging\n"
             "  -p PORT        bind to TCP port PORT (default 1883)\n"
+            "  -l LOGOPTION   comma separated suboptions, described below, for logging\n"
+
 #ifdef FEATURE_OM
             "  -o OMOPTION    comma separated suboptions, described below, for openmetrics\n"
 #endif
+
 #ifdef FEATURE_RAFT
             "  -r RAFTOPTION  comma separated suboptions, described below, for raft clustering\n"
 #endif
+
             "  -d             daemonize and create a PID file\n"
             "  -V             show version\n"
-            "  -n             disable saving/loading\n"
+            "  -n             disable persistent database (saving/loading)\n"
             "\n"
             "The PID file will be created at %s.\n"
             "\n"
@@ -357,6 +368,7 @@ static void show_usage(FILE *fp, const char *name)
             "\n"
             "The default is stdout, with priority filter set to INFO.\n"
             "\n"
+
 #ifdef FEATURE_OM
             "Each OMOPTION may be:\n"
             "  enable         enable openmetrics\n"
@@ -364,12 +376,20 @@ static void show_usage(FILE *fp, const char *name)
             "  port=PORT      bind to TCP port PORT (default 1337)\n"
             "  bind=ADDR      bind to IP address ADDR (default 127.0.0.1)\n"
             "\n"
-#endif
-            "The default is disabled.\n"
+            "The default is that openmetrics is disabled.\n"
             "\n"
+#endif
+
 #ifdef FEATURE_RAFT
             "Each RAFTOPTION may be:\n"
             "  addrs=HOST[/HOST...]  forward-slash separated list of id:host:port peers\n"
+            "  enable                enable Raft clustering\n"
+            "  disable               disable Raft clustering\n"
+            "  id=ID                 set this server's id\n"
+            "  port=PORT             bind to TCP port (default 1800 + id)\n"
+            "  bind=ADDR             bind to IP address ADDR (default 127.0.0.1)\n"
+            "\n"
+            "The default is that Raft clustering is disabled.\n"
             "\n"
 #endif
             ,
@@ -546,21 +566,19 @@ static void parse_cmdline(int argc, char *argv[])
     enum {
         RAFT_CLUSTER_ADDRS = 0,
         RAFT_ENABLE,
+        RAFT_DISABLE,
         RAFT_PORT,
         RAFT_BIND,
         RAFT_ID,
-        RAFT_CLIENT_BIND,
-        RAFT_CLIENT_PORT,
     };
 
     char *const raft_token[] = {
         [RAFT_CLUSTER_ADDRS] = "addrs",
         [RAFT_ENABLE] = "enable",
+        [RAFT_DISABLE] = "disable",
         [RAFT_PORT] = "port",
         [RAFT_BIND] = "bind",
         [RAFT_ID] = "server_id",
-        [RAFT_CLIENT_BIND] = "client_bind",
-        [RAFT_CLIENT_PORT] = "client_port",
         NULL
     };
 
@@ -596,6 +614,9 @@ static void parse_cmdline(int argc, char *argv[])
                             break;
                         case RAFT_ENABLE:
                             opt_raft = true;
+                            break;
+                        case RAFT_DISABLE:
+                            opt_raft = false;
                             break;
                         case RAFT_PORT:
                             if (value == NULL)
@@ -9192,7 +9213,7 @@ step_down:
                     raft_change_to(RAFT_MODE_FOLLOWER);
                     raft_stop_election();
                     raft_update_leader_id(leader_id);
-                } 
+                }
 
                 /* This state may never happen, but just in case */
                 if (reply == RAFT_FALSE)
