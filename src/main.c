@@ -313,7 +313,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 [[gnu::nonnull]]
 static void show_version(FILE *fp)
 {
-    fprintf(fp, "fail-mqttd " VERSION "\n" "\n" "Written by http://github.com/juur");
+    fprintf(fp, "fail-mqttd " VERSION "\n" "\n" "Written by http://github.com/juur" "\n");
 }
 
 /**
@@ -6210,7 +6210,6 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
 
         /* TODO do something with the RETAIN flag */
 
-//next:
         request->options[request->num_topics] = *ptr++;
         bytes_left--;
 
@@ -8181,6 +8180,11 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             arg_term = htonl(va_arg(ap, uint32_t));
             break;
 
+        case RAFT_CLIENT_REQUEST_REPLY:
+            packet.length++;
+            arg_status = (uint8_t)va_arg(ap, raft_status_t);
+            break;
+
         case RAFT_CLIENT_REQUEST:
             packet.length += 2 * sizeof(uint32_t);
             arg_client_id = htonl(va_arg(ap, uint32_t));
@@ -8300,6 +8304,10 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             memcpy(ptr, &opt_listen.s_addr, 4)   ; ptr += sizeof(uint32_t) ;
             uint16_t tmp_port = htons(opt_port);
             memcpy(ptr, &tmp_port, 2)            ; ptr += sizeof(uint16_t) ;
+            break;
+
+        case RAFT_CLIENT_REQUEST_REPLY:
+            *ptr++ = arg_status;
             break;
 
         case RAFT_CLIENT_REQUEST:
@@ -8621,6 +8629,8 @@ static int raft_start_election(void)
     raft_state.voted_for = raft_state.self_id;
     /* Reset election timer */
     raft_reset_election_timer();
+    /* leader unknown untill RAFT_APPEND_ENTRIES */
+    raft_update_leader_id(NULL_ID);
 
     for (unsigned idx = 1; idx < raft_num_peers; idx++)
         raft_peers[idx].voted_for = NULL_ID;
@@ -8789,7 +8799,7 @@ static int raft_tick(void)
                         log_cnt++;
 
                     if (raft_state.log_head &&
-                            raft_state.log_head->index >= raft_peers[idx].next_index) {
+                            raft_state.log_head->index <= raft_peers[idx].next_index) {
 
                         rdbg_printf("RAFT raft_tick: sending APPEND_ENTRIES to id=%u at index=%u\n",
                                 raft_peers[idx].server_id,
@@ -8803,6 +8813,8 @@ static int raft_tick(void)
                                     raft_state.commit_index, log_cnt,
                                     (const struct raft_log *)tmp) == -1)
                             warn("raft_tick: RAFT_LEADER: raft_send");
+                        /* we have sent all the remaining ones so exit this loop */
+                        break;
                     }
                 }
 
@@ -8817,6 +8829,10 @@ static int raft_tick(void)
 
     last_run = time(NULL);
     return 0;
+}
+
+static raft_status_t process_append_entries()
+{
 }
 
 [[gnu::nonnull(1)]]
@@ -8914,13 +8930,35 @@ shit_packet: /* common with the packet read */
             raft_send(RAFT_PEER, client, RAFT_REGISTER_CLIENT_REPLY, RAFT_OK, raft_state.last_applied, raft_state.leader_id);
             break;
 
+        case RAFT_CLIENT_REQUEST_REPLY:
+            {
+                raft_status_t reply;
+                uint8_t tmp;
+
+                if (bytes_remaining < 1)
+                    goto fail;
+
+                tmp = *ptr++;
+                reply = tmp;
+
+                if (reply != RAFT_OK) {
+                    warn("raft_recv: RAFT_CLIENT_REQUEST_REPLY: got an error: <%s>",
+                            reply < RAFT_MAX_STATUS ? raft_status_str[reply] : "ILLEGAL_CODE");
+                }
+                goto fail;
+            }
+            break;
+
         case RAFT_CLIENT_REQUEST:
             {
+                raft_status_t reply = RAFT_OK;
                 uint32_t client_id, sequence_num;
                 uint8_t type/*, flags*/;
                 uint16_t len;
+
                 if (bytes_remaining < RAFT_CLIENT_REQUEST_SIZE)
                     goto fail;
+
                 memcpy(&client_id, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); client_id = ntohl(client_id);
                 memcpy(&sequence_num, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t); sequence_num = ntohl(sequence_num);
                 type = *ptr++;
@@ -8929,6 +8967,12 @@ shit_packet: /* common with the packet read */
                 /* TODO read the actual request */
                 memcpy(&len, ptr, sizeof(len)); ptr += sizeof(len); len = ntohs(len);
                 bytes_remaining -= RAFT_CLIENT_REQUEST_SIZE;
+
+                if (raft_state.mode != RAFT_MODE_LEADER) {
+                    reply = RAFT_NOT_LEADER;
+                    goto send_client_request_reply;
+                }
+
                 switch (type)
                 {
                     case RAFT_LOG_REGISTER_TOPIC:
@@ -8948,6 +8992,8 @@ shit_packet: /* common with the packet read */
                         errno = EINVAL;
                         goto fail;
                 }
+send_client_request_reply:
+                raft_send(RAFT_SERVER, client, RAFT_CLIENT_REQUEST_REPLY, reply);
             }
             break;
 
@@ -9125,6 +9171,7 @@ shit_packet: /* common with the packet read */
                     reply = RAFT_FALSE;
                     goto append_reply;
                 } else {
+                    raft_update_leader_id(leader_id);
                     /* should we do this even if the rest fails? */
                     raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
                 }
@@ -9289,6 +9336,10 @@ append_reply:
 
                 memcpy(&term, ptr, 4); ptr += 4;
                 term = ntohl(term);
+
+                /* ignore votes from older terms */
+                if (term < raft_state.current_term)
+                    break;
 
                 /* TODO if reply term > currentTerm: update term and step down */
                 if (term > raft_state.current_term) {
@@ -9563,10 +9614,10 @@ static void tick(void)
     if (num_packets)
         packet_tick();
 #ifndef FEATURE_THREADS
-#ifdef FEATURE_RAFT
+# ifdef FEATURE_RAFT
     if (opt_raft)
         raft_tick();
-#endif
+# endif
 #endif
 }
 
@@ -9642,7 +9693,7 @@ static RETURN_TYPE openmetrics_loop(void *start_args)
     return 0;
 }
 
-#ifdef FEATURE_RAFT
+# ifdef FEATURE_RAFT
 static RETURN_TYPE raft_loop(void *start_args)
 {
     const int raft_fd = ((const struct start_args *)start_args)->raft_fd;
@@ -9696,7 +9747,7 @@ static RETURN_TYPE raft_loop(void *start_args)
     return 0;
 
 }
-#endif
+# endif
 #endif
 
 static RETURN_TYPE main_loop(void *start_args)
@@ -9709,7 +9760,6 @@ static RETURN_TYPE main_loop(void *start_args)
 #ifdef FEATURE_RAFT
     const int raft_fd = ((const struct start_args *)start_args)->raft_fd;
 #endif
-    //const int raft_client_fd = ((const struct start_args *)start_args)->raft_client_fd;
 #ifdef FEATURE_THREADS
     const pthread_t self = pthread_self();
 #endif
