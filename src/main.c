@@ -2665,7 +2665,7 @@ fail:
 
 /* [MQTT-3.1.3-2] */
 [[gnu::nonnull, gnu::warn_unused_result]]
-static struct session *find_session(struct client *client)
+static struct session *find_session(const struct client *client)
 {
     pthread_rwlock_rdlock(&global_sessions_lock);
     for (struct session *tmp = global_session_list; tmp; tmp = tmp->next)
@@ -7809,6 +7809,15 @@ static int raft_check_commit_index(uint32_t best)
 
     for (uint32_t current_best = best; current_best > raft_state.commit_index; current_best--)
     {
+        const uint32_t term = raft_term_at(current_best);
+
+        /* Only commit entries from currentTerm */
+
+        if (term == -1U)
+            continue;
+        if (term != raft_state.current_term)
+            continue;
+
         unsigned cnt = 1;
 
         for (unsigned idx = 1; idx < raft_num_peers; idx++)
@@ -8694,6 +8703,10 @@ static int raft_request_votes(void)
 {
     int rc;
 
+    const uint32_t log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
+    const uint32_t log_term = log_index ? raft_term_at(log_index) : 0;
+
+
     for (unsigned idx = 1; idx < raft_num_peers; idx++)
     {
         if (raft_peers[idx].peer_fd == -1)
@@ -8701,22 +8714,13 @@ static int raft_request_votes(void)
         if (raft_peers[idx].vote_responded)
             continue;
 
-        const uint32_t log_index = raft_peers[idx].next_index - 1;
-        const uint32_t log_term = raft_term_at(log_index);
-
-        if (log_term == -1U) {
-            warnx("raft_tick: can't find term for index %u",
-                    log_index);
-            continue;
-        }
-
         if ((rc = raft_send(RAFT_PEER, &raft_peers[idx],
                         RAFT_REQUEST_VOTE,
                         raft_state.current_term,
                         raft_state.self_id,
                         log_index, log_term
                         )) == -1) {
-            warn("raft_change_to: raft_send");
+            warn("raft_request_votes: raft_send");
         }
     }
 
@@ -9011,7 +9015,9 @@ got_prev_log:
         }
         /* we've added them all OK, don't free */
         log_entry_head = NULL;
-    } else if (reply == RAFT_TRUE && leader_commit > raft_state.commit_index) {
+    }
+
+    if (reply == RAFT_TRUE && leader_commit > raft_state.commit_index) {
         /* Advance commit index on a heart beat (if acceptable) */
         raft_state.commit_index = MIN(leader_commit,
                 raft_state.log_tail ? raft_state.log_tail->index : 0);
@@ -9288,7 +9294,6 @@ send_client_request_reply:
         case RAFT_APPEND_ENTRIES:
             {
                 uint32_t term, leader_id, prev_log_index, prev_log_term, leader_commit, num_entries;
-                uint32_t new_match_index = 0;
 
                 if (bytes_remaining < (ssize_t)RAFT_APPEND_ENTRIES_FIXED_SIZE)
                     goto fail;
@@ -9318,6 +9323,8 @@ send_client_request_reply:
                 num_entries = ntohl(num_entries);
 
                 bytes_remaining -= RAFT_APPEND_ENTRIES_FIXED_SIZE;
+
+                uint32_t new_match_index = prev_log_index;
 
                 if (num_entries) {
                     rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: term=%u leader_id=%u prev_log_index=%u prev_log_term=%u leader_commit=%u num_entries=%u\n",
@@ -9503,11 +9510,11 @@ send_client_request_reply:
                 rdbg_printf("RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: %u voted %s\n",
                         client->server_id, raft_status_str[status]);
 
+                client->vote_responded = true;
+
                 if (status == RAFT_TRUE) {
-                    client->vote_responded = true;
-                    client->vote_granted = raft_state.self_id; /* OR voted_for? */
+                    client->vote_granted = raft_state.self_id;
                 } else if (voted_for != NULL_ID) {
-                    /* leave the votes as is? */
                     client->vote_granted = voted_for;
                 }
 
