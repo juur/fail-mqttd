@@ -279,11 +279,11 @@ const char *const raft_rpc_str[RAFT_MAX_RPC] = {
     [RAFT_CLIENT_QUERY_REPLY]    = "CLIENT_QUERY_REPLY",
 };
 
-const char *const raft_mode_str[RAFT_MAX_MODE] = {
-    [RAFT_MODE_NONE] = "NONE",
-    [RAFT_MODE_FOLLOWER] = "FOLLOWER",
-    [RAFT_MODE_CANDIDATE] = "CANDIDATE",
-    [RAFT_MODE_LEADER] = "LEADER",
+const char *const raft_mode_str[RAFT_MAX_STATES] = {
+    [RAFT_STATE_NONE] = "NONE",
+    [RAFT_STATE_FOLLOWER] = "FOLLOWER",
+    [RAFT_STATE_CANDIDATE] = "CANDIDATE",
+    [RAFT_STATE_LEADER] = "LEADER",
 };
 
 const char *const raft_conn_str[RAFT_MAX_CONN] = {

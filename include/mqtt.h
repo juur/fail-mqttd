@@ -587,12 +587,12 @@ typedef enum {
 } raft_status_t;
 
 typedef enum {
-    RAFT_MODE_NONE = 0,
-    RAFT_MODE_FOLLOWER,
-    RAFT_MODE_CANDIDATE,
-    RAFT_MODE_LEADER,
-    RAFT_MAX_MODE,
-} raft_mode_t;
+    RAFT_STATE_NONE = 0,
+    RAFT_STATE_FOLLOWER,
+    RAFT_STATE_CANDIDATE,
+    RAFT_STATE_LEADER,
+    RAFT_MAX_STATES,
+} raft_state_t;
 
 typedef enum {
     RAFT_PEER = 0,
@@ -619,8 +619,6 @@ enum {
     BROADCAST_ID = -1,
 };
 
-struct raft_host_entry;
-
 struct raft_log {
     struct raft_log *next;
     raft_log_t event;
@@ -635,28 +633,50 @@ struct raft_log {
     };
 };
 
+struct raft_host_entry {
+    /* candidateVar = */
+    bool vote_responded;   /* VARIABLE votesResponded (candidate) */
+    uint32_t vote_granted; /* VARIABLE votesGranted (candidate)   */
+    /* voterLog - used in proof only */
+    
+    /* leaderVars = */
+    uint32_t next_index;        /* VARIABLE nextIndex (leader)  */
+    uint32_t match_index;       /* VARIABLE matchIndex (leader) */
+    /* elections - used in proof only */
+
+    int peer_fd;
+    uint32_t server_id;
+    timems_t next_conn_attempt;
+    
+    struct in_addr address;
+    in_port_t port;
+    struct in_addr mqtt_addr;
+    in_port_t mqtt_port;
+};
+
 struct raft_state {
+    /* logVars = */
     struct raft_log *log_head;
     struct raft_log *log_tail;
+    uint32_t commit_index;      /* VARIABLE commitIndex */
 
+    /* serverVars = */
+    uint32_t current_term;      /* VARIABLE currentTerm */
+    raft_state_t state;         /* VARIABLE state       */
+    uint32_t voted_for;         /* VARIABLE votedFor    */
+
+    uint32_t self_id;
+    uint32_t last_applied;
+    uint32_t log_index;
+    timems_t election_timer;
+    bool     election;
+    timems_t next_ping;
+    timems_t next_request_vote;
+    
     /* for client */
     uint32_t leader_id;
     struct raft_host_entry *leader;
     uint32_t sequence_num;
-
-    raft_mode_t mode;
-    uint32_t current_term;
-    uint32_t voted_for;
-    uint32_t self_id;
-
-    uint32_t commit_index;
-    uint32_t last_applied;
-    uint32_t log_index;
-    
-    timems_t election_timer;
-    bool     election;
-
-    timems_t next_ping;
 };
 
 struct raft_packet {
@@ -668,20 +688,6 @@ struct raft_packet {
 };
 
 #define RAFT_HDR_SIZE   (1+1+1+1+4)
-
-struct raft_host_entry {
-    struct in_addr address;
-    in_port_t port;
-    int peer_fd;
-    uint32_t server_id;
-    uint32_t voted_for;
-    timems_t next_conn_attempt;
-    struct in_addr mqtt_addr;
-    in_port_t mqtt_port;
-    /* for server to store */
-    uint32_t match_index;
-    uint32_t next_index;
-};
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
 extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
@@ -701,7 +707,7 @@ extern const char *const subscription_type_str[SUB_TYPE_MAX];
 extern const char *const packet_dir_str[PACKET_DIR_MAX];
 extern const char *const raft_rpc_str[RAFT_MAX_RPC];
 extern const char *const raft_status_str[RAFT_MAX_STATUS];
-extern const char *const raft_mode_str[RAFT_MAX_MODE];
+extern const char *const raft_mode_str[RAFT_MAX_STATES];
 extern const char *const raft_conn_str[RAFT_MAX_CONN];
 extern const char *const raft_log_str[RAFT_MAX_LOG];
 
@@ -717,7 +723,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u16 mqtt-port in_port_t
  */
 
-#define RAFT_HELLO_SIZE (RAFT_HDR_SIZE + 4 + 1 + 4 + 2)
+#define RAFT_HELLO_SIZE (4 + 1 + 4 + 2)
 
 /**
  * RAFT_CLIENT_REQUEST
@@ -756,7 +762,47 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   current_term
  * u32   new_match_index
  */
-#define RAFT_APPEND_ENTRIES_REPLY_FIXED_SIZE (1+4+4)
+#define RAFT_APPEND_ENTRIES_REPLY_SIZE (1+4+4)
+
+/**
+ * RAFT_REQUEST_VOTE_REPLY
+ *
+ * Header
+ * u8    status
+ * u32   term
+ * u32   voted_for
+ */
+#define RAFT_REQUEST_VOTE_REPLY_SIZE (1+4+4)
+
+/**
+ * RAFT_CLIENT_REQUEST_REPLY
+ *
+ * Header
+ * u8    status
+ */
+
+#define RAFT_CLIENT_REQUEST_REPLY_SIZE (1)
+
+/** RAFT_REQUEST_VOTE
+ *
+ * Header
+ * u32   term
+ * u32   candidate_id
+ * u32   last_log_index
+ * u32   last_log_term
+ */
+#define RAFT_REQUEST_VOTE_SIZE (4+4+4+4)
+
+/** RAFT_REGISTER_CLIENT_REPLY
+ *
+ * Header
+ * u8    status
+ * u32   client_id
+ * u32   leader_hint
+ */
+#define RAFT_REGISTER_CLIENT_REPLY_SIZE (1+4+4)
+
+
 
 /**
  * RAFT_LOG_*
