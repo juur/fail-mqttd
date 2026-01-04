@@ -212,24 +212,25 @@ typedef enum {
 
 typedef enum {
     CS_NEW = 0,
-    CS_ACTIVE = 1,
-    CS_CLOSING = 2,
-    CS_CLOSED = 3,
-    CS_DISCONNECTED = 4,
+    CS_ACTIVE,
+    CS_CLOSING,
+    CS_CLOSED,
+    CS_DISCONNECTED,
     CLIENT_STATE_MAX
 } client_state_t;
 
 typedef enum {
     TOPIC_NEW = 0,
-    TOPIC_ACTIVE = 1,
-    TOPIC_DEAD = 2,
+    TOPIC_PREACTIVE,
+    TOPIC_ACTIVE,
+    TOPIC_DEAD,
     TOPIC_STATE_MAX
 } topic_state_t;
 
 typedef enum {
     MSG_NEW = 0,
-    MSG_ACTIVE = 1,
-    MSG_DEAD = 2,
+    MSG_ACTIVE,
+    MSG_DEAD,
     MSG_STATE_MAX
 } message_state_t;
 
@@ -241,8 +242,8 @@ typedef enum {
 
 typedef enum {
     SESSION_NEW = 0,
-    SESSION_ACTIVE = 1,
-    SESSION_DELETE = 2,
+    SESSION_ACTIVE,
+    SESSION_DELETE,
     SESSION_STATE_MAX
 } session_state_t;
 
@@ -625,6 +626,7 @@ struct raft_log {
     uint8_t flags;
     uint32_t index;
     uint32_t term;
+    uint32_t sequence_num;
     union {
         struct {
             uint16_t length;
@@ -677,6 +679,7 @@ struct raft_state {
     uint32_t leader_id;
     struct raft_host_entry *leader;
     uint32_t sequence_num;
+    struct raft_log *log_pending;
 };
 
 struct raft_packet {
@@ -779,9 +782,10 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  *
  * Header
  * u8    status
+ * u8    log_type?
  */
 
-#define RAFT_CLIENT_REQUEST_REPLY_SIZE (1)
+#define RAFT_CLIENT_REQUEST_REPLY_SIZE (1+1)
 
 /** RAFT_REQUEST_VOTE
  *
@@ -801,6 +805,13 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   leader_hint
  */
 #define RAFT_REGISTER_CLIENT_REPLY_SIZE (1+4+4)
+
+/** RAFT_REGISTER_CLIENT_SIZE
+ *
+ * Header
+ * TBC
+ */
+#define RAFT_REGISTER_CLIENT_SIZE (0)
 
 
 
