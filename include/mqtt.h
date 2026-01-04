@@ -641,7 +641,7 @@ struct raft_host_entry {
     bool vote_responded;   /* VARIABLE votesResponded (candidate) */
     uint32_t vote_granted; /* VARIABLE votesGranted (candidate)   */
     /* voterLog - used in proof only */
-    
+
     /* leaderVars = */
     uint32_t next_index;        /* VARIABLE nextIndex (leader)  */
     uint32_t match_index;       /* VARIABLE matchIndex (leader) */
@@ -650,7 +650,7 @@ struct raft_host_entry {
     int peer_fd;
     uint32_t server_id;
     timems_t next_conn_attempt;
-    
+
     struct in_addr address;
     in_port_t port;
     struct in_addr mqtt_addr;
@@ -675,7 +675,7 @@ struct raft_state {
     bool     election;
     timems_t next_ping;
     timems_t next_request_vote;
-    
+
     /* for client */
     uint32_t leader_id;
     struct raft_host_entry *leader;
@@ -721,7 +721,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * RAFT_HELLO
  *
  * Header
- * u32 id   
+ * u32 id
  * u8  type (raft_conn_t)
  * u32 mqtt-addr in_addr_t
  * u16 mqtt-port in_port_t
@@ -784,9 +784,11 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * Header
  * u8    status
  * u8    log_type?
+ * u32   client_id
+ * u32   sequence_num
  */
 
-#define RAFT_CLIENT_REQUEST_REPLY_SIZE (1+1)
+#define RAFT_CLIENT_REQUEST_REPLY_SIZE (1+1+4+4)
 
 /** RAFT_REQUEST_VOTE
  *
