@@ -2,7 +2,7 @@
 
 ## About
 
-[fail-mqttd](https://github.com/juur/fail-mqttd) is a terrible implementation of [MQTT Version 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html). Plus, for extra fail, [The Raft Algorithm]() is also half-done.
+[fail-mqttd](https://github.com/juur/fail-mqttd) is a terrible implementation of [MQTT Version 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html). Plus, for extra fail, [The Raft Algorithm](https://raft.github.io/) is also half-done.
 
 ## Done, or, half-jobbed
 
