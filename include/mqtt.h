@@ -631,6 +631,7 @@ struct raft_log {
         struct {
             uint16_t length;
             uint8_t *name;
+            uint8_t uuid[UUID_SIZE];
         } register_topic;
     };
 };
@@ -827,7 +828,9 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  *
  * RAFT_LOG_REGISTER_TOPIC
  *
- * 1..n  u8[n] (0 terminated uint8_t string)
+ * u8[16] uuid
+ * u16    string_length
+ * 1..n   u8[n] (0 terminated uint8_t string)
  *
  */
 

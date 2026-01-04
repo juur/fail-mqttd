@@ -3797,7 +3797,7 @@ static struct topic *register_topic(const uint8_t *name,
     dbg_printf(BYEL "     register_topic: name=%s" CRESET "\n", (char *)name);
 
 #ifdef FEATURE_RAFT
-    if (raft_client_log_send(RAFT_LOG_REGISTER_TOPIC, ret->name) == -1)
+    if (raft_client_log_send(RAFT_LOG_REGISTER_TOPIC, ret->name, &ret->uuid) == -1)
         goto fail;
     ret->state = TOPIC_PREACTIVE;
 #else
@@ -7920,6 +7920,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
             if (new_log->register_topic.name == NULL)
                 goto fail;
             new_log->register_topic.length = strlen((void *)new_log->register_topic.name);
+            memcpy(&new_log->register_topic.uuid, va_arg(ap, uint8_t *), UUID_SIZE);
             break;
 
         default:
@@ -7975,53 +7976,6 @@ static int raft_leader_log_append(raft_log_t event, ...)
     return rc;
 }
 
-/*
-static int raft_client_log_recv(raft_status_t status, raft_log_t event,
-        uint32_t client_id, uint32_t sequence_num)
-{
-    struct raft_log *pending = NULL;
-
-    if (event >= RAFT_MAX_LOG) {
-        errno = EINVAL;
-        goto fail;
-    }
-
-    for (pending = raft_state.log_pending; pending; pending = pending->next)
-        if (sequence_num == pending->sequence_num)
-            break;
-
-    if (pending == NULL) {
-        errno = ENOENT;
-        goto fail;
-    }
-
-    switch (event)
-    {
-        case RAFT_LOG_REGISTER_TOPIC:
-            struct topic * topic = find_topic(pending->register_topic.name);
-            if (topic == NULL) {
-                errno = ENOENT;
-                goto fail;
-            }
-            topic->state = TOPIC_ACTIVE;
-            break;
-
-        default:
-            break;
-    }
-
-    raft_remove_log(pending, &raft_state.log_pending, NULL);
-    raft_free_log(pending);
-
-    return 0;
-
-fail:
-    if (pending) {
-    }
-    return -1;
-}
-*/
-
 /* sends a log event (as a client) to the leader to process */
 static int raft_client_log_sendv(raft_log_t event, va_list ap)
 {
@@ -8047,6 +8001,7 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
     {
         case RAFT_LOG_REGISTER_TOPIC:
             str = va_arg(ap, uint8_t *);
+            uint8_t *uuid = va_arg(ap, void *);
 
             if ((new_client_event->register_topic.name = (void *)strdup((void *)str)) == NULL) {
                 warn("raft_client_log_sendv: strdup");
@@ -8061,7 +8016,7 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
                             raft_state.self_id,
                             raft_state.sequence_num++,
                             event,
-                            str
+                            str, uuid
                             )) == -1) {
                 warn("raft_client_log_sendv: raft_send");
                 break;
@@ -8326,7 +8281,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     uint32_t arg_num_entries = 0, arg_new_match_index = 0, arg_leader_commit = 0;
     uint32_t arg_sequence_num = 0, arg_voted_for = NULL_ID;
     uint32_t arg_term = 0, arg_candidate_id, arg_last_log_index, arg_last_log_term;
-    uint8_t *str = NULL;
+    uint8_t *str = NULL, *arg_uuid = NULL;
     uint8_t arg_status, arg_conn_type, arg_req_type = 0, arg_req_flags;
 
     const struct raft_log *arg_entries = NULL;
@@ -8407,6 +8362,8 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     {
                         str = va_arg(ap, uint8_t *);
                         arg_req_len += strlen((void *)str) + 1;
+                        arg_req_len += UUID_SIZE;
+                        arg_uuid = va_arg(ap, uint8_t *);
                     }
                     break;
 
@@ -8450,8 +8407,10 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
                             str = tmp->register_topic.name;
+                            arg_req_len += 2; /* u16 strlen */
                             arg_req_len += tmp->register_topic.length;
                             arg_req_len++; /* 0 terminator */
+                            arg_req_len += UUID_SIZE;
                             /* TODO */
                             break;
 
@@ -8536,9 +8495,12 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             {
                 case RAFT_LOG_REGISTER_TOPIC:
                     size_t tmp_len = strlen((void *)str);
-                    memcpy(ptr, str, tmp_len);
-                    ptr += tmp_len;
+                    uint16_t len;
+                    len = htons(tmp_len);
+                    memcpy(ptr, &len, 2); ptr += 2;
+                    memcpy(ptr, str, tmp_len); ptr += tmp_len;
                     *ptr++ = '\0';
+                    memcpy(ptr, arg_uuid, UUID_SIZE); ptr += UUID_SIZE;
                     rdbg_printf("RAFT raft_send: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n",
                             str);
                     break;
@@ -8598,19 +8560,16 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     switch(tmp->event)
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
-                            /*
-                            rdbg_printf(
-                                    "RAFT raft_send: APPEND_ENTRIES: REGISTER_TOPIC: str=<%s> len=%u\n",
-                                    tmp->register_topic.name,
-                                    tmp->register_topic.length);
-                                    */
-                            memcpy(ptr, tmp->register_topic.name,
-                                    tmp->register_topic.length);
-                            ptr += tmp->register_topic.length;
+                            uint16_t tmp_len = htons(tmp->register_topic.length);
+                            memcpy(ptr, &tmp_len, 2); ptr += 2;
+                            memcpy(ptr, tmp->register_topic.name, tmp->register_topic.length); ptr += tmp->register_topic.length;
                             *ptr++ = 0;
+                            memcpy(ptr, &tmp->register_topic.uuid, UUID_SIZE); ptr += UUID_SIZE;
 
+                            entry_length += 2;
                             entry_length += tmp->register_topic.length;
                             entry_length++;
+                            entry_length += UUID_SIZE;
                             break;
 
                         default:
@@ -9241,7 +9200,7 @@ static int raft_recv(int *fd, struct raft_host_entry *client)
 {
     uint8_t header[RAFT_HDR_SIZE];
     uint8_t *packet_buffer = NULL;
-    uint8_t *ptr;
+    uint8_t *ptr, *temp_string = NULL;
     uint32_t term = 0;
     uint32_t log_index = 0, log_term = 0;
 
@@ -9405,20 +9364,37 @@ shit_packet: /* common with the packet read */
                 switch (type)
                 {
                     case RAFT_LOG_REGISTER_TOPIC:
-                        if (bytes_remaining < len)
+                        if (bytes_remaining < 2)
                             goto fail;
 
-                        uint8_t *str = (void *)strndup((void *)ptr, len);
-                        if (str == NULL) {
+                        uint16_t tmp_len;
+                        memcpy(&tmp_len, ptr, 2); ptr += 2;
+                        tmp_len = ntohs(tmp_len);
+
+                        if (bytes_remaining < tmp_len)
+                            goto fail;
+                        if ((temp_string = (void *)strndup((void *)ptr, tmp_len)) == NULL) {
                             warnx("raft_recv: strndup");
                             goto fail;
                         }
 
-                        ptr += len;
-                        bytes_remaining -= len;
-                        rdbg_printf("RAFT raft_recv: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n", str);
-                        raft_leader_log_append(type, str);
-                        free(str);
+                        ptr += tmp_len + 1;
+                        bytes_remaining -= (tmp_len + 1);
+
+                        if (bytes_remaining < UUID_SIZE)
+                            goto fail;
+
+                        uint8_t uuid[UUID_SIZE];
+                        memcpy(&uuid, ptr, UUID_SIZE); ptr += UUID_SIZE;
+                        bytes_remaining -= UUID_SIZE;
+                        
+                        if (bytes_remaining != 0)
+                            goto fail;
+
+                        rdbg_printf("RAFT raft_recv: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n", temp_string);
+                        raft_leader_log_append(type, temp_string, &uuid);
+                        free(temp_string);
+                        temp_string = NULL;
                         break;
 
                     default:
@@ -9571,15 +9547,26 @@ send_client_request_reply:
                                 warnx("raft_recv: APPEND_ENTRIES: REGISTER_TOPIC: bytes_remaining < entry_length");
                                 goto fail;
                             }
-                            if ((log_entry->register_topic.name = (void *)strndup((void *)ptr, entry_length)) == NULL) {
+
+                            uint16_t str_len = 0;
+                            memcpy(&str_len, ptr, 2); ptr += 2;
+                            str_len = ntohs(str_len);
+
+                            if ((log_entry->register_topic.name = (void *)strndup((void *)ptr, str_len)) == NULL) {
                                 warn("raft_recv: strndup");
                                 goto fail;
                             }
-                            log_entry->register_topic.length = strlen((void *)log_entry->register_topic.name);
-                            //rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: REGISTER_TOPIC: str=<%s> len=%u\n",
-                            //        log_entry->register_topic.name, log_entry->register_topic.length);
-                            ptr += entry_length;
-                            bytes_remaining -= entry_length;
+                            log_entry->register_topic.length = str_len;
+                            
+                            ptr += log_entry->register_topic.length + 1;
+                            bytes_remaining -= (log_entry->register_topic.length + 1);
+
+                            if (bytes_remaining < UUID_SIZE)
+                                goto fail;
+                            
+                            memcpy(&log_entry->register_topic.uuid, ptr, UUID_SIZE);
+                            ptr += UUID_SIZE;
+
                             break;
 
                         default:
