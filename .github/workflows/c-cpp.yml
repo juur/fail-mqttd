@@ -12,7 +12,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: prep
-      run: apt-get install -y libgdbm-dev
+      run: sudo apt-get install -y libgdbm-dev
     - name: configure
       run: ./configure --enable-raft --enable-openmetrics
     - name: make
