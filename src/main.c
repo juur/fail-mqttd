@@ -2958,16 +2958,16 @@ static void *read_binary(const uint8_t **const ptr, size_t *bytes_left,
 
     errno = 0;
 
-    if (*bytes_left < 2) {
+    if (*bytes_left < sizeof(uint16_t)) {
         errno = ENOSPC;
         return NULL;
     }
 
-    memcpy(&tmp, *ptr, 2);
+    memcpy(&tmp, *ptr, sizeof(uint16_t));
 
     *length = ntohs(tmp);
-    *ptr += 2;
-    *bytes_left -= 2;
+    *ptr += sizeof(uint16_t);
+    *bytes_left -= sizeof(uint16_t);
 
     if (*bytes_left < *length) {
         errno = ENOSPC;
@@ -3060,16 +3060,16 @@ static uint8_t *read_utf8(const uint8_t **const ptr, size_t *bytes_left)
 
     errno = 0;
 
-    if (*bytes_left < 2) {
+    if (*bytes_left < sizeof(uint16_t)) {
         errno = ENOSPC;
         return NULL;
     }
 
-    memcpy(&str_len, *ptr, 2);
+    memcpy(&str_len, *ptr, sizeof(uint16_t));
     str_len = ntohs(str_len);
 
-    *ptr += 2;
-    *bytes_left -= 2;
+    *ptr += sizeof(uint16_t);
+    *bytes_left -= sizeof(uint16_t);
 
     if (*bytes_left < str_len) {
         errno = ENOSPC;
@@ -3157,18 +3157,18 @@ static ssize_t get_properties_size(const struct property (*props)[],
                 ret++;
                 break;
             case MQTT_TYPE_2BYTE:
-                ret += 2;
+                ret += sizeof(uint16_t);
                 break;
             case MQTT_TYPE_4BYTE:
-                ret += 4;
+                ret += sizeof(uint32_t);
                 break;
             case MQTT_TYPE_BINARY:
                 ret += prop->binary.len;
-                ret += 2;
+                ret += sizeof(uint16_t);
                 break;
             case MQTT_TYPE_UTF8_STRING:
                 ret += strlen((const char *)prop->utf8_string);
-                ret += 2;
+                ret += sizeof(uint16_t);
                 break;
             case MQTT_TYPE_VARBYTE:
                 ret += encode_var_byte(prop->varbyte, tmp_out);
@@ -3176,7 +3176,7 @@ static ssize_t get_properties_size(const struct property (*props)[],
             case MQTT_TYPE_UTF8_STRING_PAIR:
                 ret += strlen((const char *)prop->utf8_pair[0]);
                 ret += strlen((const char *)prop->utf8_pair[1]);
-                ret += 4; /* 2x2 */
+                ret += (2 * sizeof(uint16_t)); /* 2x2 */
                 break;
             case MQTT_TYPE_UNDEFINED:
             case MQTT_TYPE_MAX:
@@ -3202,8 +3202,8 @@ static void do_one_string(const uint8_t *str, uint8_t **ptr)
         len = 0;
         enclen = 0;
     }
-    memcpy(*ptr, &enclen, 2);
-    *ptr += 2;
+    memcpy(*ptr, &enclen, sizeof(uint16_t));
+    *ptr += sizeof(uint16_t);
     if (len != 0) {
         memcpy(*ptr, str, len);
         *ptr += len;
@@ -3247,14 +3247,14 @@ static int build_properties(const struct property (*props)[],
 
             case MQTT_TYPE_2BYTE:
                 tmp2byte = htons(prop->byte2);
-                memcpy(ptr, &tmp2byte, 2);
-                ptr += 2;
+                memcpy(ptr, &tmp2byte, sizeof(uint16_t));
+                ptr += sizeof(uint16_t);
                 break;
 
             case MQTT_TYPE_4BYTE:
                 tmp4byte = htonl(prop->byte4);
-                memcpy(ptr, &tmp4byte, 4);
-                ptr += 4;
+                memcpy(ptr, &tmp4byte, sizeof(uint32_t));
+                ptr += sizeof(uint32_t);
                 break;
 
             case MQTT_TYPE_VARBYTE:
@@ -3265,8 +3265,8 @@ static int build_properties(const struct property (*props)[],
 
             case MQTT_TYPE_BINARY:
                 tmp2byte = htons(prop->binary.len);
-                memcpy(ptr, &tmp2byte, 2);
-                ptr += 2;
+                memcpy(ptr, &tmp2byte, sizeof(uint16_t));
+                ptr += sizeof(uint16_t);
                 if (prop->binary.len) {
                     memcpy(ptr, prop->binary.data, prop->binary.len);
                     ptr += prop->binary.len;
@@ -3385,19 +3385,19 @@ static int parse_properties(
                 break;
 
             case MQTT_TYPE_2BYTE:
-                if (*bytes_left < 2)
+                if (*bytes_left < sizeof(uint16_t))
                     goto fail;
-                memcpy(&prop->byte2, *ptr, 2);
+                memcpy(&prop->byte2, *ptr, sizeof(uint16_t));
                 prop->byte2 = ntohs(prop->byte2);
-                skip = 2;
+                skip = sizeof(uint16_t);
                 break;
 
             case MQTT_TYPE_4BYTE:
-                if (*bytes_left < 4)
+                if (*bytes_left < sizeof(uint32_t))
                     goto fail;
-                memcpy(&prop->byte4, *ptr, 4);
+                memcpy(&prop->byte4, *ptr, sizeof(uint32_t));
                 prop->byte4 = ntohl(prop->byte4);
-                skip = 4;
+                skip = sizeof(uint32_t);
                 break;
 
             case MQTT_TYPE_VARBYTE:
@@ -3413,12 +3413,12 @@ static int parse_properties(
                 break;
 
             case MQTT_TYPE_BINARY:
-                if (*bytes_left < 2)
+                if (*bytes_left < sizeof(uint16_t))
                     goto fail;
 
-                memcpy(&prop->binary.len, *ptr, 2);
-                *ptr += 2;
-                *bytes_left -= 2;
+                memcpy(&prop->binary.len, *ptr, sizeof(uint16_t));
+                *ptr += sizeof(uint16_t);
+                *bytes_left -= sizeof(uint16_t);
                 prop->binary.len = ntohs(prop->binary.len);
 
                 if (prop->binary.len) {
@@ -4836,16 +4836,16 @@ static int send_cp_publish(struct packet *pkt)
     ptr += remlen_len;
 
     tmp = htons(topic_len);
-    memcpy(ptr, &tmp, 2);
-    ptr += 2;
+    memcpy(ptr, &tmp, sizeof(uint16_t));
+    ptr += sizeof(uint16_t);
 
     memcpy(ptr, msg->topic->name, topic_len);
     ptr += topic_len;
 
     if (pkt->flags & MQTT_FLAG_PUBLISH_QOS_MASK) {
         tmp = htons(pkt->packet_identifier); /* TODO proper packet identifier */
-        memcpy(ptr, &tmp, 2);
-        ptr += 2;
+        memcpy(ptr, &tmp, sizeof(uint16_t));
+        ptr += sizeof(uint16_t);
     }
 
     memcpy(ptr, proplen, proplen_len);
@@ -5055,7 +5055,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
         return -1;
 
     length = 0;
-    length += 2;           /* connack var header (1byte for flags, 1byte for code) */
+    length += 1+1;           /* connack var header (1byte for flags, 1byte for code) */
     length += proplen_len; /* properties length (0) */
     length += prop_len;    /* property[] */
 
@@ -5155,8 +5155,8 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
     ptr += remlen_len;
 
     tmp = htons(packet_id);
-    memcpy(ptr, &tmp, 2);
-    ptr += 2;
+    memcpy(ptr, &tmp, sizeof(uint16_t));
+    ptr += sizeof(uint16_t);
 
     *ptr = reason_code;
     ptr++;
@@ -5212,8 +5212,8 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
     ptr += remlen_len;
 
     tmp = htons(packet_id);
-    memcpy(ptr, &tmp, 2);
-    ptr += 2;
+    memcpy(ptr, &tmp, sizeof(uint16_t));
+    ptr += sizeof(uint16_t);
 
     if (reason_code > 0) {
     *ptr = reason_code;
@@ -5274,7 +5274,7 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     errno = 0;
 
     length = 0;
-    length += 2; /* Packet Identifier */
+    length += sizeof(uint16_t); /* Packet Identifier */
 
     if (reason_code > 0) {
         length += 1; /* Reason Code */
@@ -5296,8 +5296,8 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     ptr += remlen_len;
 
     tmp = htons(packet_id);
-    memcpy(ptr, &tmp, 2);
-    ptr += 2;
+    memcpy(ptr, &tmp, sizeof(uint16_t));
+    ptr += sizeof(uint16_t);
 
     if (reason_code > 0) {
         *ptr = reason_code;
@@ -5352,8 +5352,8 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
     ptr += remlen_len;
 
     tmp = htons(packet_id);
-    memcpy(ptr, &tmp, 2);
-    ptr += 2;
+    memcpy(ptr, &tmp, sizeof(uint16_t));
+    ptr += sizeof(uint16_t);
 
     *ptr = reason_code;
     ptr++;
@@ -5419,8 +5419,8 @@ static int send_cp_unsuback(struct client *client, uint16_t packet_id,
     ptr += remlen_len;
 
     tmp = htons(packet_id);
-    memcpy(ptr, &tmp, 2);
-    ptr += 2;
+    memcpy(ptr, &tmp, sizeof(uint16_t));
+    ptr += sizeof(uint16_t);
 
     *ptr = 0;
     ptr++;
@@ -5507,8 +5507,8 @@ static int send_cp_suback(struct client *client, uint16_t packet_id,
     ptr += remlen_len;
 
     tmp = htons(packet_id);
-    memcpy(ptr, &tmp, 2);
-    ptr += 2;
+    memcpy(ptr, &tmp, sizeof(uint16_t));
+    ptr += sizeof(uint16_t);
 
     *ptr = 0; /* properties length */
     ptr++;
@@ -5566,13 +5566,13 @@ static int handle_cp_pubrel(struct client *client, struct packet *packet,
     if (packet->flags != MQTT_FLAG_PUBREL)
         goto fail;
 
-    if (bytes_left < 2)
+    if (bytes_left < sizeof(uint16_t))
         goto fail;
 
-    memcpy(&tmp, ptr, 2);
+    memcpy(&tmp, ptr, sizeof(uint16_t));
     packet->packet_identifier = ntohs(tmp);
-    ptr += 2;
-    bytes_left -= 2;
+    ptr += sizeof(uint16_t);
+    bytes_left -= sizeof(uint16_t);
 
     if (packet->packet_identifier == 0) {
         reason_code = MQTT_PROTOCOL_ERROR;
@@ -5634,12 +5634,12 @@ static int handle_cp_puback(struct client *client, struct packet *packet,
 
     errno = 0;
 
-    if (bytes_left < 2)
+    if (bytes_left < sizeof(uint16_t))
         goto fail;
 
-    memcpy(&packet->packet_identifier, ptr, 2);
-    bytes_left -= 2;
-    ptr += 2;
+    memcpy(&packet->packet_identifier, ptr, sizeof(uint16_t));
+    bytes_left -= sizeof(uint16_t);
+    ptr += sizeof(uint16_t);
     packet->packet_identifier = ntohs(packet->packet_identifier);
 
     if (packet->packet_identifier == 0) {
@@ -5701,12 +5701,12 @@ static int handle_cp_pubcomp(struct client *client, struct packet *packet,
 
     errno = 0;
 
-    if (bytes_left < 2)
+    if (bytes_left < sizeof(uint16_t))
         goto fail;
 
-    memcpy(&packet->packet_identifier, ptr, 2);
-    bytes_left -= 2;
-    ptr += 2;
+    memcpy(&packet->packet_identifier, ptr, sizeof(uint16_t));
+    bytes_left -= sizeof(uint16_t);
+    ptr += sizeof(uint16_t);
     packet->packet_identifier = ntohs(packet->packet_identifier);
 
     if (packet->packet_identifier == 0) {
@@ -5765,12 +5765,12 @@ static int handle_cp_pubrec(struct client *client, struct packet *packet,
 
     errno = 0;
 
-    if (bytes_left < 2)
+    if (bytes_left < sizeof(uint16_t))
         goto fail;
 
-    memcpy(&packet_identifier, ptr, 2);
-    bytes_left -= 2;
-    ptr += 2;
+    memcpy(&packet_identifier, ptr, sizeof(uint16_t));
+    bytes_left -= sizeof(uint16_t);
+    ptr += sizeof(uint16_t);
     packet_identifier = ntohs(packet_identifier);
 
     if (packet_identifier == 0) {
@@ -5882,10 +5882,16 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     }
 
     if (qos) {
-        memcpy(&packet_identifier, ptr, 2);
+        if (bytes_left < sizeof(uint16_t)) {
+            reason_code = MQTT_MALFORMED_PACKET;
+            goto fail;
+        }
+        
+        memcpy(&packet_identifier, ptr, sizeof(uint16_t));
         packet_identifier = ntohs(packet_identifier);
-        ptr += 2;
-        bytes_left -= 2;
+        ptr += sizeof(uint16_t);
+        bytes_left -= sizeof(uint16_t);
+        
         if (packet_identifier == 0) {
             reason_code = MQTT_PROTOCOL_ERROR;
             goto fail;
@@ -6054,15 +6060,15 @@ static int handle_cp_unsubscribe(struct client *client, struct packet *packet,
     if (packet->flags != MQTT_FLAG_UNSUBSCRIBE)
         goto fail;
 
-    if (bytes_left < 3) {
+    if (bytes_left < (1 + sizeof(uint16_t))) {
         errno = ENOSPC;
         goto fail;
     }
 
-    memcpy(&packet->packet_identifier, ptr, 2);
+    memcpy(&packet->packet_identifier, ptr, sizeof(uint16_t));
     packet->packet_identifier = ntohs(packet->packet_identifier);
-    ptr += 2;
-    bytes_left -= 2;
+    ptr += sizeof(uint16_t);
+    bytes_left -= sizeof(uint16_t);
 
     if (packet->packet_identifier == 0) {
         reason_code = MQTT_PROTOCOL_ERROR;
@@ -6153,10 +6159,10 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
         goto fail;
     }
 
-    memcpy(&packet->packet_identifier, ptr, 2);
+    memcpy(&packet->packet_identifier, ptr, sizeof(uint16_t));
     packet->packet_identifier = ntohs(packet->packet_identifier);
-    ptr += 2;
-    bytes_left -= 2;
+    ptr += sizeof(uint16_t);
+    bytes_left -= sizeof(uint16_t);
 
     if (packet->packet_identifier == 0) {
         reason_code = MQTT_PROTOCOL_ERROR;
@@ -6460,10 +6466,10 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     if (bytes_left < 2+4+1+1+2) /* Connect Header, Protocol Name, Protocol Version, Connect Flags, Keep Alive */
         goto fail;
 
-    memcpy(&connect_header_length, ptr, 2);
+    memcpy(&connect_header_length, ptr, sizeof(uint16_t));
     connect_header_length = ntohs(connect_header_length);
-    ptr += 2;
-    bytes_left -= 2;
+    ptr += sizeof(uint16_t);
+    bytes_left -= sizeof(uint16_t);
 
     if (connect_header_length != 4) {
         if (connect_header_length == 6) {
@@ -6483,10 +6489,10 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
     connect_flags = *ptr++;
     bytes_left--;
 
-    memcpy(&keep_alive, ptr, 2);
+    memcpy(&keep_alive, ptr, sizeof(uint16_t));
     keep_alive = ntohs(keep_alive);
-    ptr += 2;
-    bytes_left -= 2;
+    ptr += sizeof(uint16_t);
+    bytes_left -= sizeof(uint16_t);
 
     if (keep_alive > 0 && keep_alive < MIN_KEEP_ALIVE) {
         keep_alive = MIN_KEEP_ALIVE;
@@ -8446,7 +8452,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
                             arg_str = tmp->register_topic.name;
-                            arg_req_len += 2; /* u16 strlen */
+                            arg_req_len += sizeof(uint16_t); /* u16 strlen */
                             arg_req_len += tmp->register_topic.length;
                             arg_req_len++; /* 0 terminator */
                             arg_req_len += UUID_SIZE;
@@ -8540,7 +8546,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     uint16_t len = 0;
                     len = htons(tmp_len);
 
-                    memcpy(ptr, &len, 2); ptr += 2;
+                    memcpy(ptr, &len, sizeof(uint16_t)); ptr += sizeof(uint16_t);
                     memcpy(ptr, arg_str, tmp_len); ptr += tmp_len;
                     *ptr++ = '\0';
                     memcpy(ptr, arg_uuid, UUID_SIZE); ptr += UUID_SIZE;
@@ -8583,7 +8589,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             memcpy(ptr, &tmp32, sizeof(uint32_t))              ; ptr += sizeof(uint32_t) ;
 
             if (arg_num_entries) {
-                rdbg_printf("RAFT raft_send: APPEND_ENTRIES: sending %d entries\n", arg_num_entries);
+                //rdbg_printf("RAFT raft_send: APPEND_ENTRIES: sending %d entries\n", arg_num_entries);
                 const struct raft_log *tmp = arg_entries;
                 uint32_t index, term;
                 uint16_t entry_length;
@@ -8605,12 +8611,12 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
                             uint16_t tmp_len = htons(tmp->register_topic.length);
-                            memcpy(ptr, &tmp_len, 2); ptr += 2;
+                            memcpy(ptr, &tmp_len, sizeof(uint16_t)); ptr += sizeof(uint16_t);
                             memcpy(ptr, tmp->register_topic.name, tmp->register_topic.length); ptr += tmp->register_topic.length;
                             *ptr++ = 0;
                             memcpy(ptr, &tmp->register_topic.uuid, UUID_SIZE); ptr += UUID_SIZE;
 
-                            entry_length += 2;
+                            entry_length += sizeof(uint16_t);
                             entry_length += tmp->register_topic.length;
                             entry_length++;
                             entry_length += UUID_SIZE;
@@ -9061,8 +9067,7 @@ static int raft_tick(void)
                     if (raft_state.log_head &&
                             raft_state.log_head->index <= raft_peers[idx].next_index) {
 
-                        rdbg_printf(
-                                "RAFT raft_tick: sending APPEND_ENTRIES to id=%u at idx=%u/%u\n",
+                        rdbg_printf("RAFT raft_tick: sending APPEND_ENTRIES to id=%u at idx=%u/%u\n",
                                 raft_peers[idx].server_id,
                                 tmp->index, tmp->term);
 
@@ -9242,15 +9247,13 @@ append_reply:
 [[gnu::nonnull(1)]]
 static int raft_recv(int *fd, struct raft_host_entry *client)
 {
-    uint8_t header[RAFT_HDR_SIZE];
-    uint8_t *packet_buffer = NULL;
-    uint8_t *ptr, *temp_string = NULL;
-    uint32_t term = 0;
-    uint32_t log_index = 0, log_term = 0;
-
-    struct raft_packet packet;
-    ssize_t rc, bytes_remaining;
+    size_t bytes_remaining;
+    ssize_t rc;
     struct raft_log *log_entry = NULL, *log_entry_head = NULL, *prev_log_entry = NULL;
+    struct raft_packet packet;
+    uint32_t term = 0, log_index = 0, log_term = 0;
+    uint8_t *packet_buffer = NULL, *ptr, *temp_string = NULL;
+    uint8_t header[RAFT_HDR_SIZE];
 
     if (*fd == -1) {
         errno = EBADF;
@@ -9408,14 +9411,14 @@ shit_packet: /* common with the packet read */
                 switch (type)
                 {
                     case RAFT_LOG_REGISTER_TOPIC:
-                        if (bytes_remaining < 2)
+                        if (bytes_remaining < sizeof(uint16_t))
                             goto fail;
 
                         uint16_t tmp_len;
 
-                        memcpy(&tmp_len, ptr, 2);
-                        ptr += 2;
-                        bytes_remaining -= 2;
+                        memcpy(&tmp_len, ptr, sizeof(uint16_t));
+                        ptr += sizeof(uint16_t);
+                        bytes_remaining -= sizeof(uint16_t);
 
                         tmp_len = ntohs(tmp_len);
 
@@ -9600,7 +9603,7 @@ send_client_request_reply:
                             }
 
                             uint16_t str_len = 0;
-                            memcpy(&str_len, ptr, 2); ptr += 2;
+                            memcpy(&str_len, ptr, sizeof(uint16_t)); ptr += sizeof(uint16_t);
                             str_len = ntohs(str_len);
 
                             if ((log_entry->register_topic.name = (void *)strndup((void *)ptr, str_len)) == NULL) {
