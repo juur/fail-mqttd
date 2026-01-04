@@ -9151,6 +9151,8 @@ got_prev_log:
                 if (tmp->index > new_match_index)
                     new_match_index = tmp->index;
 
+                if (log_entry_head == tmp)
+                    log_entry_head = next;
                 raft_free_log(tmp);
                 /* TODO what should reply be here? */
             } else {
@@ -9164,8 +9166,11 @@ got_prev_log:
 
     if (reply == RAFT_TRUE && leader_commit > raft_state.commit_index) {
         /* Advance commit index on a heart beat (if acceptable) */
-        raft_state.commit_index = MIN(leader_commit,
+        const uint32_t desired_commit_index = MIN(leader_commit,
                 raft_state.log_tail ? raft_state.log_tail->index : 0);
+        while (raft_state.commit_index < desired_commit_index)
+            if (raft_commit_and_advance() == -1)
+                break;
     }
 
     /*
@@ -9217,6 +9222,13 @@ append_reply:
     }
 
     raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, reply, new_match_index);
+
+    /* if we have any left (dupes) free them */
+    while (log_entry_head) {
+        struct raft_log *next = log_entry_head->next;
+        raft_free_log(log_entry_head);
+        log_entry_head = next;
+    }
 
     return reply;
 
@@ -9544,20 +9556,21 @@ send_client_request_reply:
 
                     bytes_remaining -= RAFT_LOG_FIXED_SIZE;
 
-                    if ((log_entry = malloc(sizeof(struct raft_log))) == NULL)
+                    if ((log_entry = calloc(1, sizeof(struct raft_log))) == NULL)
                         goto fail;
 
                     log_entry->event = type;
                     log_entry->flags = flags;
                     log_entry->index = index;
                     log_entry->term = term;
-                    log_entry->next = NULL;
 
                     switch((raft_log_t)type)
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
-                            if (bytes_remaining < entry_length)
+                            if (bytes_remaining < entry_length) {
+                                warnx("raft_recv: APPEND_ENTRIES: REGISTER_TOPIC: bytes_remaining < entry_length");
                                 goto fail;
+                            }
                             if ((log_entry->register_topic.name = (void *)strndup((void *)ptr, entry_length)) == NULL) {
                                 warn("raft_recv: strndup");
                                 goto fail;
