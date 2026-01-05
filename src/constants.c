@@ -160,6 +160,7 @@ const char *const client_state_str[CLIENT_STATE_MAX] = {
 
 const char *const message_state_str[MSG_STATE_MAX] = {
     [MSG_NEW] = "NEW",
+    [MSG_PREACTIVE] = "PREACTIVE",
     [MSG_ACTIVE] = "ACTIVE",
     [MSG_DEAD] = "DEAD",
 };
@@ -168,6 +169,13 @@ const char *const session_state_str[SESSION_STATE_MAX] = {
     [SESSION_NEW] = "NEW",
     [SESSION_ACTIVE] = "ACTIVE",
     [SESSION_DELETE] = "DELETE",
+};
+
+const char *const topic_state_str[TOPIC_STATE_MAX] = {
+    [TOPIC_NEW]       = "NEW",
+    [TOPIC_PREACTIVE] = "PREACTIVE",
+    [TOPIC_ACTIVE]    = "ACTIVE",
+    [TOPIC_DEAD]      = "DEAD",
 };
 
 const char *const message_type_str[MSG_TYPE_MAX] = {

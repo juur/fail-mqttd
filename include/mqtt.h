@@ -229,6 +229,7 @@ typedef enum {
 
 typedef enum {
     MSG_NEW = 0,
+    MSG_PREACTIVE,
     MSG_ACTIVE,
     MSG_DEAD,
     MSG_STATE_MAX
@@ -632,6 +633,8 @@ struct raft_log {
             uint16_t length;
             uint8_t *name;
             uint8_t uuid[UUID_SIZE];
+            bool retained;
+            uint8_t msg_uuid[UUID_SIZE];
         } register_topic;
     };
 };
@@ -700,6 +703,7 @@ extern const type_t property_per_control[MQTT_PROPERTY_IDENT_MAX][MQTT_CP_MAX];
 
 extern const char *const client_state_str[CLIENT_STATE_MAX];
 extern const char *const message_state_str[MSG_STATE_MAX];
+extern const char *const topic_state_str[TOPIC_STATE_MAX];
 extern const char *const session_state_str[SESSION_STATE_MAX];
 extern const char *const property_str[MQTT_PROPERTY_IDENT_MAX];
 extern const char *const control_packet_str[MQTT_CP_MAX];
@@ -830,10 +834,14 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  *
  * RAFT_LOG_REGISTER_TOPIC
  *
- * u8[16] uuid
+ * u32    flags (1 = retained)
  * u16    string_length
  * 1..n   u8[n] (0 terminated uint8_t string)
+ * u8[16] uuid
+ * u8[16] uuid retained message (OPTIONAL)
  *
  */
+
+#define RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED    (1<<0)
 
 #define RAFT_LOG_FIXED_SIZE (1+1+4+4+2)

@@ -2558,8 +2558,10 @@ static int save_message(const struct message *msg)
 
     pthread_rwlock_rdlock(&global_messages_lock);
 
-    if (msg->state != MSG_ACTIVE)
+    if (msg->state != MSG_ACTIVE) {
+        warnx("save_message: attempt to save message in invalid state");
         goto fail;
+    }
 
     dbg_printf("     save_message: saving message id=%d uuid=%s\n",
             msg->id, uuid_to_string(msg->uuid));
@@ -2619,8 +2621,11 @@ static int save_topic(const struct topic *topic)
 
     pthread_rwlock_rdlock(&global_topics_lock);
 
-    if (topic->state != TOPIC_ACTIVE)
+    if (topic->state != TOPIC_ACTIVE) {
+        warn("save_topic: attempt to save topic <%s> in illegal state",
+                topic->name);
         goto fail;
+    }
 
     dbg_printf("     save_topic: saving topic id=%d name=<%s> %s%s\n",
             topic->id, topic->name,
@@ -5886,12 +5891,12 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
             reason_code = MQTT_MALFORMED_PACKET;
             goto fail;
         }
-        
+
         memcpy(&packet_identifier, ptr, sizeof(uint16_t));
         packet_identifier = ntohs(packet_identifier);
         ptr += sizeof(uint16_t);
         bytes_left -= sizeof(uint16_t);
-        
+
         if (packet_identifier == 0) {
             reason_code = MQTT_PROTOCOL_ERROR;
             goto fail;
@@ -7583,6 +7588,9 @@ static void topic_tick(void)
     pthread_rwlock_wrlock(&global_topics_lock);
     for (struct topic *topic = global_topic_list; topic; topic = topic->next)
     {
+        if (topic->state != TOPIC_ACTIVE)
+            continue;
+
         if (max_messages == 0 || topic->pending_queue == NULL)
             continue;
 
@@ -7861,7 +7869,15 @@ static int raft_commit_and_advance(void)
     {
         case RAFT_LOG_REGISTER_TOPIC:
             {
-                struct topic *topic;
+                struct topic *topic = NULL;
+                struct message *message = NULL;
+
+                if (log_entry->register_topic.retained)
+                    if ((message = find_message_by_uuid(log_entry->register_topic.msg_uuid)) == NULL) {
+                        errno = EINVAL;
+                        warn("raft_commit_and_advance: can't find retained message for UUID");
+                    }
+
                 if ((topic = find_topic(log_entry->register_topic.name, false)) != NULL) {
                     if (topic->state != TOPIC_PREACTIVE)
                         goto fail;
@@ -7873,6 +7889,18 @@ static int raft_commit_and_advance(void)
                 } else {
                     rdbg_printf("RAFT raft_commit_and_advance: registered new topic <%s>\n", log_entry->register_topic.name);
                 }
+
+                if (message && topic->retained_message == message) {
+                    warn("raft_commit_and_advance: somehow the topic already has the message");
+                    goto fail;
+                }
+
+                topic->retained_message = message;
+
+                /* TODO what about message->topic? */
+
+                if (opt_database)
+                    save_topic(topic);
             }
             break;
 
@@ -8315,12 +8343,12 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 
     uint16_t arg_req_len = 0;
     uint32_t arg_client_id = 0, arg_leader_hint = 0;
-    uint32_t arg_id;
+    uint32_t arg_id, arg_flags = 0;
     uint32_t arg_leader_id = 0, arg_prev_log_index = 0, arg_prev_log_term = 0;
     uint32_t arg_num_entries = 0, arg_new_match_index = 0, arg_leader_commit = 0;
     uint32_t arg_sequence_num = 0, arg_voted_for = NULL_ID;
     uint32_t arg_term = 0, arg_candidate_id, arg_last_log_index, arg_last_log_term;
-    const uint8_t *arg_str = NULL, *arg_uuid = NULL;
+    const uint8_t *arg_str = NULL, *arg_uuid = NULL, *arg_msg_uuid = NULL;
     uint8_t arg_status, arg_conn_type, arg_req_type = 0, arg_req_flags;
     uint8_t arg_log_type;
 
@@ -8402,13 +8430,21 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             {
                 case RAFT_LOG_REGISTER_TOPIC:
                     {
-                        arg_req_len += sizeof(uint16_t);
+                        arg_req_len += sizeof(uint32_t); /* flags */
+                        arg_flags = va_arg(ap, uint32_t);
+
+                        arg_req_len += sizeof(uint16_t); /* strlen */
 
                         arg_str = va_arg(ap, const uint8_t *);
                         arg_req_len += strlen((const void *)arg_str) + 1;
 
                         arg_uuid = va_arg(ap, const uint8_t *);
                         arg_req_len += UUID_SIZE;
+
+                        if (arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
+                            arg_msg_uuid = va_arg(ap, const uint8_t *);
+                            arg_req_len += UUID_SIZE;
+                        }
                     }
                     break;
 
@@ -8452,10 +8488,13 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
                             arg_str = tmp->register_topic.name;
+                            arg_req_len += sizeof(uint32_t); /* u32 flags */
                             arg_req_len += sizeof(uint16_t); /* u16 strlen */
                             arg_req_len += tmp->register_topic.length;
                             arg_req_len++; /* 0 terminator */
                             arg_req_len += UUID_SIZE;
+                            if (tmp->register_topic.retained)
+                                arg_req_len += UUID_SIZE;
                             /* TODO */
                             break;
 
@@ -8545,11 +8584,17 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     const size_t tmp_len = strlen((void *)arg_str);
                     uint16_t len = 0;
                     len = htons(tmp_len);
+                    const bool retained_uuid = arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED;
+                    arg_flags = htonl(arg_flags);
 
-                    memcpy(ptr, &len, sizeof(uint16_t)); ptr += sizeof(uint16_t);
-                    memcpy(ptr, arg_str, tmp_len); ptr += tmp_len;
+                    memcpy(ptr, &arg_flags, sizeof(uint32_t)) ; ptr += sizeof(uint32_t) ; 
+                    memcpy(ptr, &len, sizeof(uint16_t))       ; ptr += sizeof(uint16_t) ; 
+                    memcpy(ptr, arg_str, tmp_len)             ; ptr += tmp_len          ; 
                     *ptr++ = '\0';
-                    memcpy(ptr, arg_uuid, UUID_SIZE); ptr += UUID_SIZE;
+                    memcpy(ptr, arg_uuid, UUID_SIZE)          ; ptr += UUID_SIZE        ; 
+                    if (retained_uuid) {
+                        memcpy(ptr, arg_msg_uuid, UUID_SIZE)  ; ptr += UUID_SIZE        ; 
+                    }
 
                     rdbg_printf(BGRN "RAFT raft_send: CLIENT_REQUEST: REGISTER_TOPIC <%s, %ld, %s>" CRESET "\n",
                             arg_str, tmp_len, uuid_to_string(arg_uuid));
@@ -8611,15 +8656,30 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
                             uint16_t tmp_len = htons(tmp->register_topic.length);
+                            uint32_t flags = 0;
+
+                            if (tmp->register_topic.retained)
+                                flags |= RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED;
+
+                            flags = htonl(flags);
+
+                            memcpy(ptr, &flags, sizeof(uint32_t)); ptr += sizeof(uint32_t);
                             memcpy(ptr, &tmp_len, sizeof(uint16_t)); ptr += sizeof(uint16_t);
                             memcpy(ptr, tmp->register_topic.name, tmp->register_topic.length); ptr += tmp->register_topic.length;
                             *ptr++ = 0;
                             memcpy(ptr, &tmp->register_topic.uuid, UUID_SIZE); ptr += UUID_SIZE;
+                            if (tmp->register_topic.retained) {
+                                memcpy(ptr, &tmp->register_topic.msg_uuid, UUID_SIZE); ptr += UUID_SIZE;
+                            }
 
+                            entry_length += sizeof(uint32_t);
                             entry_length += sizeof(uint16_t);
                             entry_length += tmp->register_topic.length;
                             entry_length++;
                             entry_length += UUID_SIZE;
+                            if (tmp->register_topic.retained)
+                                entry_length += UUID_SIZE;
+
                             break;
 
                         default:
@@ -9411,6 +9471,17 @@ shit_packet: /* common with the packet read */
                 switch (type)
                 {
                     case RAFT_LOG_REGISTER_TOPIC:
+                        if (bytes_remaining < sizeof(uint32_t))
+                            goto fail;
+
+                        uint32_t flags;
+
+                        memcpy(&flags, ptr, sizeof(uint32_t));
+                        ptr += sizeof(uint32_t);
+                        bytes_remaining -= sizeof(uint32_t);
+
+                        flags = ntohl(flags);
+
                         if (bytes_remaining < sizeof(uint16_t))
                             goto fail;
 
@@ -9435,17 +9506,26 @@ shit_packet: /* common with the packet read */
                         if (bytes_remaining < UUID_SIZE)
                             goto fail;
 
-                        uint8_t uuid[UUID_SIZE];
+                        uint8_t uuid[UUID_SIZE], msg_uuid[UUID_SIZE];
 
                         memcpy(&uuid, ptr, UUID_SIZE);
                         ptr += UUID_SIZE;
                         bytes_remaining -= UUID_SIZE;
 
+                        if (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
+                            if (bytes_remaining < UUID_SIZE)
+                                goto fail;
+                            memcpy(&msg_uuid, ptr, UUID_SIZE);
+                            ptr += UUID_SIZE;
+                            bytes_remaining -= UUID_SIZE;
+                        }
+
                         if (bytes_remaining != 0)
                             goto fail;
 
                         rdbg_printf("RAFT raft_recv: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n", temp_string);
-                        raft_leader_log_append(type, temp_string, &uuid);
+                        raft_leader_log_append(type, temp_string, &uuid,
+                                (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) ? &msg_uuid : NULL);
                         free(temp_string);
                         temp_string = NULL;
                         break;
@@ -9602,6 +9682,12 @@ send_client_request_reply:
                                 goto fail;
                             }
 
+                            uint32_t flags = 0;
+                            memcpy(&flags, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                            flags = ntohl(flags);
+
+                            log_entry->register_topic.retained = (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
+
                             uint16_t str_len = 0;
                             memcpy(&str_len, ptr, sizeof(uint16_t)); ptr += sizeof(uint16_t);
                             str_len = ntohs(str_len);
@@ -9615,11 +9701,13 @@ send_client_request_reply:
                             ptr += log_entry->register_topic.length + 1;
                             bytes_remaining -= (log_entry->register_topic.length + 1);
 
-                            if (bytes_remaining < UUID_SIZE)
-                                goto fail;
-
                             memcpy(&log_entry->register_topic.uuid, ptr, UUID_SIZE);
                             ptr += UUID_SIZE;
+
+                            if (log_entry->register_topic.retained) {
+                                memcpy(&log_entry->register_topic.msg_uuid, ptr, UUID_SIZE);
+                                ptr += UUID_SIZE;
+                            }
 
                             break;
 
@@ -10509,8 +10597,10 @@ static int load_topic(datum /* key */, datum content)
 
 #ifdef FEATURE_RAFT
     if ((topic = register_topic((void *)save->name, save->uuid, false)) == NULL)
-        return -1;
+#else
+    if ((topic = register_topic((void *)save->name, save->uuid)) == NULL)
 #endif
+        return -1;
 
     if (!is_null_uuid(save->retained_message_uuid)) {
         dbg_printf("     open_databases: retained_message_uuid=%s\n",
