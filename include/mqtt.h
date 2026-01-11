@@ -604,12 +604,13 @@ typedef enum {
 } raft_conn_t;
 
 typedef enum {
-    RAFT_PCK_NEW,
+    RAFT_PCK_NEW = 0,
     RAFT_PCK_HELLO,
     RAFT_PCK_HEADER,
     RAFT_PCK_PACKET,
     RAFT_PCK_PROCESS,
     RAFT_PCK_EMPTY,
+    RAFT_MAX_PCK,
 } raft_rd_state_t;
 
 /* wire-format used for client to send & log[] for server
@@ -698,8 +699,9 @@ struct raft_host_entry {
     off_t rd_offset;
     ssize_t rd_packet_length;
     uint8_t rd_packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+    raft_rpc_t rd_rpc;
     struct raft_host_entry *unknown_next;
-    uint8_t *packet_buffer;
+    uint8_t *rd_packet_buffer;
 };
 
 struct raft_state {

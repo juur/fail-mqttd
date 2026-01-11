@@ -6959,6 +6959,9 @@ free_and_return:
     }
 
     if (rc == -1) {
+        if (errno == EINTR)
+            return;
+
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             client->write_ok = false;
             return;
@@ -7033,7 +7036,7 @@ more:
             rd_len = read(client->fd,
                     &client->header_buffer[client->read_offset],
                     client->read_need);
-            if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) ) {
+            if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ) {
                 return 0;
             } else if (rd_len == -1) {
                 log_io_error(NULL, rd_len, client->read_need, false, NULL);
@@ -7148,7 +7151,7 @@ readbody:
                     &client->packet_buf[client->packet_offset],
                     client->read_need);
 
-            if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (rd_len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
                 return 0;
             } else if (rd_len == -1) {
                 log_io_error(NULL, rd_len, client->read_need, false, NULL);
@@ -7688,6 +7691,18 @@ static void close_session(struct session *session)
  * Raft
  */
 
+static void raft_reset_read_state(struct raft_host_entry *client)
+{
+    client->rd_state = RAFT_PCK_NEW;
+    client->rd_offset = 0;
+    client->rd_need = 0;
+    if (client->rd_packet_buffer) {
+        free(client->rd_packet_buffer);
+        client->rd_packet_buffer = NULL;
+    }
+    client->rd_packet_length = 0;
+}
+
 static int raft_update_leader_id(uint32_t leader_id)
 {
     if (leader_id == NULL_ID) {
@@ -7774,6 +7789,8 @@ static int raft_close(struct raft_host_entry *client)
         client->match_index = 0;
         client->next_index = last + 1;
     }
+
+    raft_reset_read_state(client);
 
     return 0;
 }
@@ -8075,7 +8092,7 @@ static int raft_await_client_response(struct raft_log *pending_event)
             continue;
 
         if (rc == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 continue;
             return -1;
         }
@@ -8247,7 +8264,28 @@ static int raft_client_log_append_single(struct raft_log *raft_log, uint32_t lea
 
     return 1;
 }
- 
+
+[[gnu::nonnull]]
+static void raft_remove_and_free_unknown_host(struct raft_host_entry *entry)
+{
+    if (entry->peer_fd != -1)
+        close_socket(&entry->peer_fd);
+
+    struct raft_host_entry **ptr = &raft_state.unknown_clients;
+
+    while (*ptr && *ptr != entry)
+        ptr = &(*ptr)->unknown_next;
+
+    if (*ptr != entry)
+        return;
+
+    *ptr = entry->unknown_next;
+
+    entry->unknown_next = NULL;
+    raft_reset_read_state(entry);
+    free(entry);
+}
+
 static int raft_new_conn(int new_fd, struct raft_host_entry *unknown_host,
         const struct sockaddr_in *sin, socklen_t /*sin_len*/)
 {
@@ -8259,7 +8297,10 @@ static int raft_new_conn(int new_fd, struct raft_host_entry *unknown_host,
     uint16_t mqtt_port;
     uint32_t id, mqtt_addr;
     unsigned idx;
-    
+
+    rdbg_printf("RAFT raft_new_conn called with new_fd=%d and unknown_host=%p\n",
+            new_fd, unknown_host);
+
     errno = 0;
     assert( (unknown_host == NULL && new_fd != -1) || (unknown_host != NULL && new_fd == -1) );
 
@@ -8269,7 +8310,7 @@ static int raft_new_conn(int new_fd, struct raft_host_entry *unknown_host,
         goto has_host_entry;
     }
 
-    rdbg_printf("RAFT raft_new_peer on fd %u\n", new_fd);
+    rdbg_printf("RAFT raft_new_conn: new on fd %u\n", new_fd);
 
     sock_nonblock(new_fd);
     sock_linger(new_fd);
@@ -8280,9 +8321,9 @@ static int raft_new_conn(int new_fd, struct raft_host_entry *unknown_host,
         goto fail;
 
     tmp_host->peer_fd = new_fd;
+    raft_reset_read_state(tmp_host);
     tmp_host->rd_state = RAFT_PCK_HELLO;
     tmp_host->rd_need = RAFT_HELLO_SIZE + RAFT_HDR_SIZE;
-    tmp_host->rd_offset = 0;
 
     tmp_host->unknown_next = raft_state.unknown_clients;
     raft_state.unknown_clients = tmp_host;
@@ -8291,20 +8332,19 @@ has_host_entry:
     if ((rc = read(new_fd, tmp_host->rd_packet + tmp_host->rd_offset,
                     tmp_host->rd_need)) != tmp_host->rd_need) {
         if (rc == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                return -1;
             warn("raft_new_conn: read");
             goto fail;
+        } else if (rc == 0) {
+            goto fail;
         }
-//        errno = ERANGE;
-//        warnx("raft_new_conn: short read (%ld != %lu)", rc, tmp_host->rd_need);
-
         errno = EAGAIN;
 
         tmp_host->rd_offset += rc;
         tmp_host->rd_need -= rc;
 
         return -1;
-        
-        goto fail;
     }
 
     /* we have read enough */
@@ -8395,10 +8435,11 @@ found_one:
                     raft_peers[idx].peer_fd);
             close_socket(&new_fd);
         }
-        return idx;
+        goto finish;
     }
 
     raft_peers[idx].peer_fd = new_fd;
+    raft_reset_read_state(&raft_peers[idx]);
     raft_peers[idx].mqtt_addr.s_addr = mqtt_addr;
     raft_peers[idx].mqtt_port = mqtt_port;
 
@@ -8410,26 +8451,16 @@ found_one:
     }
 
 finish:
-    if (tmp_host) {
-        if (raft_state.unknown_clients == tmp_host) {
-            raft_state.unknown_clients = tmp_host->unknown_next;
-        } else
-            for (struct raft_host_entry *tmp = raft_state.unknown_clients, *next = NULL; tmp; tmp = next)
-            {
-                next = tmp->unknown_next;
+    if (tmp_host)
+        raft_remove_and_free_unknown_host(tmp_host);
 
-                if (next == tmp_host) {
-                    tmp->unknown_next = tmp_host->unknown_next;
-                    break;
-                }
-            }
-        tmp_host->unknown_next = NULL;
-        free(tmp_host);
-    }
-
+    rdbg_printf("RAFT raft_new_conn: returning %d\n", idx);
     return idx;
 
 fail:
+    if (tmp_host)
+        close_socket(&tmp_host->peer_fd);
+
     idx = -1;
     goto finish;
 }
@@ -8709,13 +8740,13 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     const bool retained_uuid = arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED;
                     arg_flags = htonl(arg_flags);
 
-                    memcpy(ptr, &arg_flags, sizeof(uint32_t)) ; ptr += sizeof(uint32_t) ; 
-                    memcpy(ptr, &len, sizeof(uint16_t))       ; ptr += sizeof(uint16_t) ; 
-                    memcpy(ptr, arg_str, tmp_len)             ; ptr += tmp_len          ; 
+                    memcpy(ptr, &arg_flags, sizeof(uint32_t)) ; ptr += sizeof(uint32_t) ;
+                    memcpy(ptr, &len, sizeof(uint16_t))       ; ptr += sizeof(uint16_t) ;
+                    memcpy(ptr, arg_str, tmp_len)             ; ptr += tmp_len          ;
                     *ptr++ = '\0';
-                    memcpy(ptr, arg_uuid, UUID_SIZE)          ; ptr += UUID_SIZE        ; 
+                    memcpy(ptr, arg_uuid, UUID_SIZE)          ; ptr += UUID_SIZE        ;
                     if (retained_uuid) {
-                        memcpy(ptr, arg_msg_uuid, UUID_SIZE)  ; ptr += UUID_SIZE        ; 
+                        memcpy(ptr, arg_msg_uuid, UUID_SIZE)  ; ptr += UUID_SIZE        ;
                     }
 
                     rdbg_printf(BGRN "RAFT raft_send: CLIENT_REQUEST: REGISTER_TOPIC <%s, %ld, %s>" CRESET "\n",
@@ -9000,6 +9031,7 @@ static int raft_tick_connection_check(void)
         sock_nonblock(new_fd);
 
         raft_peers[idx].peer_fd = new_fd;
+        raft_reset_read_state(&raft_peers[idx]);
         raft_active_peers++;
 
         rdbg_printf("RAFT raft_tick: connected to %08x:%u (idx=%u, fd=%d, id=%u)\n",
@@ -9165,6 +9197,7 @@ static int raft_tick(void)
     switch(raft_state.state)
     {
         case RAFT_STATE_NONE:
+            warnx("raft_tick: RAFT_STATE_NONE");
             abort();
             break;
 
@@ -9426,154 +9459,18 @@ append_reply:
     return RAFT_ERR;
 }
 
-[[gnu::nonnull(1)]]
-static int raft_recv(struct raft_host_entry *client)
+[[gnu::nonnull]]
+static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
 {
-    size_t bytes_remaining = 0;
-    ssize_t rc;
+    uint8_t *temp_string = NULL;
+    const uint8_t *ptr = client->rd_packet_buffer;
+    size_t bytes_remaining = client->rd_packet_length;
+    uint32_t term = 0;
     struct raft_log *log_entry = NULL, *log_entry_head = NULL, *prev_log_entry = NULL;
-    struct raft_packet packet;
-    uint32_t term = 0, log_index = 0, log_term = 0;
-    uint8_t /* *packet_buffer = NULL, */ *ptr = NULL, *temp_string = NULL;
-    //uint8_t header[RAFT_HDR_SIZE];
-    int *fd = &client->peer_fd;
+    const uint32_t log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
+    const uint32_t log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
 
-    if (*fd == -1) {
-        errno = EBADF;
-        //if (client)
-            raft_close(client);
-        return -1;
-    }
-
-    switch (client->rd_state)
-    {
-    case RAFT_PCK_EMPTY:
-
-        /* Start a new state machine */
-        client->rd_state = RAFT_PCK_HEADER;
-        client->rd_offset = 0;
-        client->rd_need = RAFT_HDR_SIZE;
-
-        /* fall-through */
-
-    case RAFT_PCK_HEADER:
-        ptr = client->rd_packet;
-
-        if ((rc = read(*fd, ptr + client->rd_offset, client->rd_need)) != client->rd_need) {
-            if (rc == -1) {
-                if (errno == EWOULDBLOCK || errno == EAGAIN)
-                    return 0;
-                warn("raft_recv: read(RAFT_PCK_HEADER)");
-                goto shit_packet;
-            } else if (rc == 0) {
-eof_recv:
-                //if (client)
-                raft_close(client);
-                return 0;
-            }
-
-            client->rd_need -= rc;
-            client->rd_offset += rc;
-
-            return 0;
-
-shit_packet: /* common with the packet read */
-            rdbg_printf("RAFT raft_recv: closing\n");
-            //if (client)
-            raft_close(client);
-            goto fail;
-        }
-
-        packet.rpc = *ptr++;
-        packet.flags = *ptr++;
-        packet.role = *ptr++;
-        packet.res0 = *ptr++;
-        memcpy(&packet.length, ptr, 4); ptr += 4;
-
-        packet.length = ntohl(packet.length);
-
-        if (packet.length < RAFT_HDR_SIZE) {
-            errno = EINVAL;
-            goto fail;
-        }
-
-        if (packet.length > RAFT_MAX_PACKET_SIZE) {
-            errno = EOVERFLOW;
-            goto fail;
-        }
-
-        if (packet.rpc > RAFT_MAX_RPC) {
-            errno = EINVAL;
-            goto fail;
-        }
-
-        packet.length -= RAFT_HDR_SIZE;
-        client->rd_packet_length = packet.length;
-
-        //rdbg_printf("RAFT raft_recv: type=%u length=%u\n", packet.rpc, packet.length);
-
-        if (raft_rpc_settings[packet.rpc].min_size) {
-            if (packet.length < raft_rpc_settings[packet.rpc].min_size) {
-                errno = EBADMSG;
-                goto fail;
-            }
-        }
-        if (raft_rpc_settings[packet.rpc].max_size) {
-            if (packet.length > raft_rpc_settings[packet.rpc].max_size) {
-                errno = EMSGSIZE;
-                goto fail;
-            }
-        }
-
-        if (packet.length) {
-            if ((ptr = client->packet_buffer = malloc(packet.length)) == NULL)
-                goto fail;
-
-            client->rd_state = RAFT_PCK_PACKET;
-            client->rd_need = packet.length;
-            client->rd_offset = 0;
-
-            goto do_raft_pck_packet;
-        }
-
-        break;
-
-    case RAFT_PCK_PACKET:
-do_raft_pck_packet:
-        if ((rc = read(*fd, client->packet_buffer + client->rd_offset, client->rd_need))
-                != client->rd_need) {
-            if (rc == -1) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    return 0;
-                warn("raft_recv: read(RAFT_PCK_PACKET)");
-                goto shit_packet;
-            } else if (rc == 0) {
-                goto eof_recv;
-            }
-            client->rd_offset += rc;
-            client->rd_need -= rc;
-            return 0;
-        }
-        client->rd_state = RAFT_PCK_PROCESS;
-
-    /* fall-through */
-
-    case RAFT_PCK_PROCESS:
-        bytes_remaining = client->rd_packet_length;
-        break;
-
-    default:
-        abort();
-    }
-
-    assert(client->rd_state == RAFT_PCK_PROCESS);
-
-    //bytes_remaining = packet.length;
-
-    log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
-    log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
-
-    switch(packet.rpc)
+    switch(rpc)
     {
         case RAFT_REGISTER_CLIENT:
             if (raft_state.state != RAFT_STATE_LEADER) {
@@ -9607,12 +9504,12 @@ do_raft_pck_packet:
                 memcpy(&sequence_num, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
                 sequence_num = ntohl(sequence_num);
 
-                if (reply > RAFT_MAX_STATUS) {
+                if (reply >= RAFT_MAX_STATUS) {
                     errno = EINVAL;
                     goto fail;
                 }
 
-                if (log_type > RAFT_MAX_LOG) {
+                if (log_type >= RAFT_MAX_LOG) {
                     errno = EINVAL;
                     goto fail;
                 }
@@ -9842,8 +9739,8 @@ send_client_request_reply:
                     }
 
                     /*
-                    rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: idx=%u type=%s flags=%u len=%u\n",
-                            idx, raft_log_str[type], flags, entry_length);*/
+                       rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: idx=%u type=%s flags=%u len=%u\n",
+                       idx, raft_log_str[type], flags, entry_length);*/
 
                     bytes_remaining -= RAFT_LOG_FIXED_SIZE;
 
@@ -9864,13 +9761,15 @@ send_client_request_reply:
                             }
 
                             uint32_t flags = 0;
-                            memcpy(&flags, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                            memcpy(&flags, ptr, sizeof(uint32_t));
+                            ptr += sizeof(uint32_t);
                             flags = ntohl(flags);
 
                             log_entry->register_topic.retained = (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
 
                             uint16_t str_len = 0;
-                            memcpy(&str_len, ptr, sizeof(uint16_t)); ptr += sizeof(uint16_t);
+                            memcpy(&str_len, ptr, sizeof(uint16_t));
+                            ptr += sizeof(uint16_t);
                             str_len = ntohs(str_len);
 
                             if ((log_entry->register_topic.name = (void *)strndup((void *)ptr, str_len)) == NULL) {
@@ -9880,7 +9779,6 @@ send_client_request_reply:
                             log_entry->register_topic.length = str_len;
 
                             ptr += log_entry->register_topic.length + 1;
-                            bytes_remaining -= (log_entry->register_topic.length + 1);
 
                             memcpy(&log_entry->register_topic.uuid, ptr, UUID_SIZE);
                             ptr += UUID_SIZE;
@@ -9889,6 +9787,8 @@ send_client_request_reply:
                                 memcpy(&log_entry->register_topic.msg_uuid, ptr, UUID_SIZE);
                                 ptr += UUID_SIZE;
                             }
+
+                            bytes_remaining -= entry_length;
 
                             break;
 
@@ -9900,7 +9800,7 @@ send_client_request_reply:
                     /* if we're the first one, set the head */
                     if (log_entry_head == NULL) {
                         log_entry_head = log_entry;
-                    /* if we're not the first, link us in */
+                        /* if we're not the first, link us in */
                     } else if (prev_log_entry) {
                         prev_log_entry->next = log_entry;
                     }
@@ -9911,8 +9811,8 @@ send_client_request_reply:
                 }
 
                 if (process_append_entries(client, term, leader_id, prev_log_index,
-                        prev_log_term, log_entry_head, leader_commit,
-                        new_match_index) == RAFT_ERR)
+                            prev_log_term, log_entry_head, leader_commit,
+                            new_match_index) == RAFT_ERR)
                     goto fail;
 
                 log_entry_head = NULL;
@@ -10040,7 +9940,7 @@ send_client_request_reply:
             break;
 
         default:
-            warnx("raft_recv: unknown type: %d", packet.rpc);
+            warnx("raft_recv: unknown type: %d", rpc);
             goto fail;
     }
 
@@ -10055,14 +9955,6 @@ done:
         log_entry_head = next;
     }
 
-    if (client->packet_buffer) {
-        client->rd_need = 0; client->rd_offset = 0;
-        free(client->packet_buffer);
-        client->packet_buffer = NULL;
-    }
-    
-    client->rd_state = RAFT_PCK_EMPTY;
-    
     return 0;
 
 fail:
@@ -10076,22 +9968,180 @@ fail:
         log_entry_head = next;
     }
 
-    if (client->packet_buffer) {
-        client->rd_need = 0; client->rd_offset = 0;
-        client->packet_buffer = NULL;
-        free(client->packet_buffer);
-    }
-
-    client->rd_state = RAFT_PCK_EMPTY;
-
     return -1;
 }
 
-//[[gnu::nonnull]]
-//static int raft_packet_in(struct raft_host_entry *client)
-//{
-//   return raft_recv(&client->peer_fd, client);
-//}
+/**
+ * handles the (primary) raft state machine for reads.
+ * TODO: consider merging this with the raft_new_conn() state machine
+ */
+[[gnu::nonnull]]
+static int raft_recv(struct raft_host_entry *client)
+{
+    ssize_t rc;
+    uint8_t *ptr = NULL;
+    const int *fd = &client->peer_fd;
+
+    if (*fd == -1) {
+        errno = EBADF;
+        raft_close(client);
+        return -1;
+    }
+
+    /* raft_recv state machine */
+    switch (client->rd_state)
+    {
+        /* Start a new state machine */
+        case RAFT_PCK_NEW:
+        case RAFT_PCK_EMPTY:
+            client->rd_state = RAFT_PCK_HEADER;
+            client->rd_offset = 0;
+            client->rd_need = RAFT_HDR_SIZE;
+            if (client->rd_packet_buffer) {
+                free(client->rd_packet_buffer);
+                client->rd_packet_buffer = NULL;
+            }
+            client->rd_packet_length = 0;
+
+            /* fall-through */
+
+        /* Read the fixed header */
+        case RAFT_PCK_HEADER:
+            ptr = client->rd_packet;
+
+            if ((rc = read(*fd, ptr + client->rd_offset,
+                            client->rd_need)) != client->rd_need) {
+                if (rc == -1) {
+                    if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)
+                        return 0;
+                    warn("raft_recv: read(RAFT_PCK_HEADER)");
+                    goto shit_packet;
+                } else if (rc == 0) {
+eof_recv:
+                    raft_close(client);
+                    rc = 0;
+                    goto clean_up;
+                }
+
+                client->rd_need -= rc;
+                client->rd_offset += rc;
+
+                return 0;
+
+shit_packet: /* common with the packet read */
+                rdbg_printf("RAFT raft_recv: closing\n");
+                raft_close(client);
+                goto fail;
+            }
+
+            struct raft_packet packet;
+
+            packet.rpc = *ptr++;
+            packet.flags = *ptr++;
+            packet.role = *ptr++;
+            packet.res0 = *ptr++;
+            memcpy(&packet.length, ptr, 4); ptr += 4;
+
+            packet.length = ntohl(packet.length);
+
+            if (packet.length < RAFT_HDR_SIZE) {
+                errno = EINVAL;
+                goto fail;
+            }
+
+            if (packet.length > RAFT_MAX_PACKET_SIZE) {
+                errno = EOVERFLOW;
+                goto fail;
+            }
+
+            if (packet.rpc >= RAFT_MAX_RPC) {
+                errno = EINVAL;
+                goto fail;
+            }
+
+            packet.length -= RAFT_HDR_SIZE;
+            client->rd_packet_length = packet.length;
+
+            //rdbg_printf("RAFT raft_recv: type=%u length=%u\n", packet.rpc, packet.length);
+
+            if (raft_rpc_settings[packet.rpc].min_size) {
+                if (packet.length < raft_rpc_settings[packet.rpc].min_size) {
+                    errno = EBADMSG;
+                    goto fail;
+                }
+            }
+            if (raft_rpc_settings[packet.rpc].max_size) {
+                if (packet.length > raft_rpc_settings[packet.rpc].max_size) {
+                    errno = EMSGSIZE;
+                    goto fail;
+                }
+            }
+
+            client->rd_rpc = packet.rpc;
+
+            if (packet.length) {
+                if ((ptr = client->rd_packet_buffer = malloc(packet.length)) == NULL)
+                    goto fail;
+
+                client->rd_state = RAFT_PCK_PACKET;
+                client->rd_need = packet.length;
+                client->rd_offset = 0;
+
+                goto do_raft_pck_packet;
+            }
+
+            client->rd_state = RAFT_PCK_PROCESS;
+            break;
+
+        /* Read the variable length payload */
+        case RAFT_PCK_PACKET:
+do_raft_pck_packet:
+            if ((rc = read(*fd, client->rd_packet_buffer + client->rd_offset,
+                            client->rd_need)) != client->rd_need) {
+                if (rc == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                        return 0;
+                    warn("raft_recv: read(RAFT_PCK_PACKET)");
+                    goto shit_packet;
+                } else if (rc == 0) {
+                    goto eof_recv;
+                }
+                client->rd_offset += rc;
+                client->rd_need -= rc;
+                return 0;
+            }
+            client->rd_state = RAFT_PCK_PROCESS;
+
+            /* fall-through */
+
+        /* Now skip to processing it */
+        case RAFT_PCK_PROCESS:
+            break;
+
+        /* We should never be in another state */
+        default:
+            warnx("raft_recv: state is %u", client->rd_state);
+            errno = EINVAL;
+            goto fail;
+    }
+    assert(client->rd_state == RAFT_PCK_PROCESS);
+
+    /* Now we've read everything, process it */
+    if ((rc = raft_process_packet(client, client->rd_rpc)) == -1)
+        goto fail;
+
+    rc = 0;
+
+clean_up:
+    raft_reset_read_state(client);
+    client->rd_state = RAFT_PCK_EMPTY;
+    return rc;
+
+fail:
+    raft_close(client);
+    rc = -1;
+    goto clean_up;
+}
 
 static void raft_clean(void)
 {
@@ -10102,7 +10152,8 @@ static void raft_clean(void)
         free(raft_peers);
     }
 
-    for (struct raft_log *next = NULL, *tmp = raft_state.log_head; tmp; tmp = next)
+    struct raft_log *next, *tmp;
+    for (next = NULL, tmp = raft_state.log_head; tmp; tmp = next)
     {
         next = tmp->next;
         raft_remove_log(tmp, &raft_state.log_head, &raft_state.log_tail);
@@ -10370,7 +10421,7 @@ static RETURN_TYPE openmetrics_loop(void *start_args)
             continue;
 
         if ((fd = accept(om_fd, NULL, NULL)) == -1) {
-            if (errno != EWOULDBLOCK && errno != EAGAIN)
+            if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR)
                 logger(LOG_WARNING, NULL, "openmetrics_loop: accept: %s", strerror(errno));
             sleep(1);
             continue;
@@ -10424,7 +10475,7 @@ static RETURN_TYPE raft_loop(void *start_args)
 
         /* update for raft_fd/raft_client_fd */
         if ((fd = accept(raft_fd, NULL, NULL)) == -1) {
-            if (errno != EWOULDBLOCK && errno != EAGAIN)
+            if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR)
                 logger(LOG_WARNING, NULL, "raft_loop: accept: %s", strerror(errno));
             sleep(1);
             continue;
@@ -10530,8 +10581,8 @@ static RETURN_TYPE main_loop(void *start_args)
             {
                 if (tmp->peer_fd != -1) {
                     max_fd = MAX(max_fd, tmp->peer_fd);
-                    FD_SET(max_fd, &fds_in);
-                    FD_SET(max_fd, &fds_exc);
+                    FD_SET(tmp->peer_fd, &fds_in);
+                    FD_SET(tmp->peer_fd, &fds_exc);
                 }
             }
         }
@@ -10619,13 +10670,16 @@ static RETURN_TYPE main_loop(void *start_args)
 
                 if (tmp_host->peer_fd != -1) {
                     if (FD_ISSET(tmp_host->peer_fd, &fds_exc)) {
-                        abort(); /* TODO */
-                    } else if (FD_ISSET(tmp_host->peer_fd, &fds_in))
+                        warnx("main_loop: tmp_host is in fds_exc");
+                        raft_remove_and_free_unknown_host(tmp_host);
+                    } else if (FD_ISSET(tmp_host->peer_fd, &fds_in)) {
                         if (raft_new_conn(-1, tmp_host, NULL, -1) == -1) {
-                            if (errno == EAGAIN)
+                            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                                 continue;
-                            abort(); /* TODO */
+                            warn("main_loop: tmp_host: raft_new_conn");
+                            /* tmp_host might have been trashed by raft_new_conn() */
                         }
+                    }
                 }
             }
 
@@ -10638,12 +10692,15 @@ static RETURN_TYPE main_loop(void *start_args)
                 if ((tmp_fd = accept(raft_fd, (struct sockaddr *)&sin, &sin_len)) != -1) {
                     dbg_printf("RAFT main_loop: accept fd %u\n", tmp_fd);
                     if (raft_new_conn(tmp_fd, NULL, &sin, sin_len) == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                            goto raft_new_out;
                         dbg_printf("RAFT main_loop: raft_new_conn: failed: %s\n", strerror(errno));
                         close_socket(&tmp_fd);
                     }
                 } else
                     warn("main_loop: raft accept failed");
             }
+raft_new_out:
         }
 #endif
 
@@ -10660,7 +10717,7 @@ static RETURN_TYPE main_loop(void *start_args)
                 if ((child_fd = accept(mother_fd,
                                 (struct sockaddr *)&sin_client,
                                 &sin_client_len)) == -1) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                         warn("main_loop: accept failed");
                         continue;
                     }
