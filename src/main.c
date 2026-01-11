@@ -7703,6 +7703,17 @@ static void raft_reset_read_state(struct raft_host_entry *client)
     client->rd_packet_length = 0;
 }
 
+static int raft_reset_write_state(struct raft_host_entry *client)
+{
+    client->wr_need = 0;
+    client->wr_offset = 0;
+    client->wr_packet_length = 0;
+    if (client->wr_packet_buffer) {
+        free((void *)client->wr_packet_buffer);
+        client->wr_packet_buffer = NULL;
+    }
+}
+
 static int raft_update_leader_id(uint32_t leader_id)
 {
     if (leader_id == NULL_ID) {
@@ -7791,6 +7802,7 @@ static int raft_close(struct raft_host_entry *client)
     }
 
     raft_reset_read_state(client);
+    raft_reset_write_state(client);
 
     return 0;
 }
@@ -8283,6 +8295,7 @@ static void raft_remove_and_free_unknown_host(struct raft_host_entry *entry)
 
     entry->unknown_next = NULL;
     raft_reset_read_state(entry);
+    raft_reset_write_state(entry);
     free(entry);
 }
 
@@ -8322,6 +8335,7 @@ static int raft_new_conn(int new_fd, struct raft_host_entry *unknown_host,
 
     tmp_host->peer_fd = new_fd;
     raft_reset_read_state(tmp_host);
+    raft_reset_write_state(tmp_host);
     tmp_host->rd_state = RAFT_PCK_HELLO;
     tmp_host->rd_need = RAFT_HELLO_SIZE + RAFT_HDR_SIZE;
 
@@ -8440,8 +8454,11 @@ found_one:
 
     raft_peers[idx].peer_fd = new_fd;
     raft_reset_read_state(&raft_peers[idx]);
+    raft_reset_write_state(&raft_peers[idx]);
     raft_peers[idx].mqtt_addr.s_addr = mqtt_addr;
     raft_peers[idx].mqtt_port = mqtt_port;
+    if (tmp_host)
+        tmp_host->peer_fd = -1;
 
     if (idx != 0) {
         const uint32_t last_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
@@ -8480,10 +8497,56 @@ static const struct {
     [RAFT_REGISTER_CLIENT_REPLY] = { RAFT_REGISTER_CLIENT_REPLY_SIZE , RAFT_REGISTER_CLIENT_REPLY_SIZE } ,
 };
 
+
+static int raft_add_write(struct raft_host_entry *client, const uint8_t *buffer, ssize_t size)
+{
+    if (client->wr_packet_buffer) {
+        errno = ENOSPC;
+        return -1;
+    }
+
+    client->wr_packet_buffer = buffer;
+    client->wr_packet_length = size;
+    client->wr_offset = 0;
+    client->wr_need = size;
+
+    return 0;
+}
+
+static int raft_try_write(struct raft_host_entry *client)
+{
+    ssize_t rc;
+
+    errno = 0;
+
+    assert(client->wr_packet_buffer);
+    assert(client->peer_fd != -1);
+
+    if ((rc = write(client->peer_fd, client->wr_packet_buffer + client->wr_offset, client->wr_need)) != client->wr_need) {
+        if (rc == -1) {
+            if (errno != EWOULDBLOCK && errno != EINTR && errno != EAGAIN)
+                raft_close(client);
+            return -1;
+        } else if (rc == 0) {
+            errno = EPIPE;
+            raft_close(client);
+            return -1;
+        }
+        client->wr_offset += rc;
+        client->wr_need -= rc;
+
+        return 0;
+    }
+
+    raft_reset_write_state(client);
+    return 0;
+}
+
+
 /* -1 = all */
 static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...)
 {
-    ssize_t rc, sendsz;
+    ssize_t sendsz;
     uint8_t *packet_buffer = NULL, *ptr;
     struct raft_packet packet;
 
@@ -8863,22 +8926,38 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     }
 
     unsigned sent = 0;
+    void *tmp_packet_buffer;
 
     if (client == NULL && mode != RAFT_CLIENT) {
         for (unsigned idx = 1; idx < raft_num_peers; idx++) {
             if (raft_peers[idx].peer_fd == -1)
                 continue;
-            if ((rc = write(raft_peers[idx].peer_fd, packet_buffer, sendsz)) != sendsz) {
-                if (rc == -1) {
-                    warn("raft_send: bcast write(%u on fd %u)", idx, raft_peers[idx].peer_fd);
-                    raft_close(&raft_peers[idx]);
-                } else {
-                    rdbg_printf("RAFT raft_send: short-write on fd %u\n",
-                            raft_peers[idx].peer_fd);
-                }
+            if ((tmp_packet_buffer = malloc(sendsz)) == NULL)
+                goto fail;
+            memcpy(tmp_packet_buffer, packet_buffer, sendsz);
+            if (raft_add_write(&raft_peers[idx], tmp_packet_buffer, sendsz) == -1) {
+                warn("raft_send: bcast raft_add_write(%u)", idx);
+                free(tmp_packet_buffer);
+                raft_close(&raft_peers[idx]);
+            } else if (raft_try_write(&raft_peers[idx]) == -1) {
+                if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR)
+                    warn("raft_send: bcast raft_try_write(%u)", idx);
             } else {
                 sent++;
             }
+            /*
+               if ((rc = write(raft_peers[idx].peer_fd, packet_buffer, sendsz)) != sendsz) {
+               if (rc == -1) {
+               warn("raft_send: bcast write(%u on fd %u)", idx, raft_peers[idx].peer_fd);
+               raft_close(&raft_peers[idx]);
+               } else {
+               rdbg_printf("RAFT raft_send: short-write on fd %u\n",
+               raft_peers[idx].peer_fd);
+               }
+               } else {
+               sent++;
+               }
+               */
         }
     } else {
         int *fd;
@@ -8906,6 +8985,22 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             goto fail;
         }
 
+        if (raft_add_write(client, packet_buffer, sendsz) == -1) {
+            warn("raft_send: raft_add_write(%u)", client->server_id);
+            raft_close(client);
+            goto fail;
+        } else if (raft_try_write(client) == -1) {
+            if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) {
+                warn("raft_send: raft_try_write(%u)", client->server_id);
+                goto fail;
+            }
+            packet_buffer = NULL;
+        } else {
+            packet_buffer = NULL;
+            sent = 1;
+        }
+
+        /*
         if ((rc = write(*fd, packet_buffer, sendsz)) != sendsz) {
             if (rc == -1) {
                 warn("raft_send: single write(%u on fd %u)",
@@ -8920,9 +9015,11 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
         } else {
             sent = 1;
         }
+        */
     }
 
-    free(packet_buffer);
+    if (packet_buffer)
+        free(packet_buffer);
     va_end(ap);
     return sent;
 
@@ -9032,6 +9129,7 @@ static int raft_tick_connection_check(void)
 
         raft_peers[idx].peer_fd = new_fd;
         raft_reset_read_state(&raft_peers[idx]);
+        raft_reset_write_state(&raft_peers[idx]);
         raft_active_peers++;
 
         rdbg_printf("RAFT raft_tick: connected to %08x:%u (idx=%u, fd=%d, id=%u)\n",
@@ -10575,6 +10673,9 @@ static RETURN_TYPE main_loop(void *start_args)
                     max_fd = MAX(max_fd, raft_peers[idx].peer_fd);
                     FD_SET(raft_peers[idx].peer_fd, &fds_in);
                     FD_SET(raft_peers[idx].peer_fd, &fds_exc);
+                    if (raft_peers[idx].wr_packet_buffer)
+                        FD_SET(raft_peers[idx].peer_fd, &fds_out);
+
                 }
             }
             for (struct raft_host_entry *tmp = raft_state.unknown_clients; tmp; tmp = tmp->unknown_next)
@@ -10583,6 +10684,9 @@ static RETURN_TYPE main_loop(void *start_args)
                     max_fd = MAX(max_fd, tmp->peer_fd);
                     FD_SET(tmp->peer_fd, &fds_in);
                     FD_SET(tmp->peer_fd, &fds_exc);
+                    if (tmp->wr_packet_buffer)
+                        FD_SET(tmp->peer_fd, &fds_out);
+
                 }
             }
         }
@@ -10617,9 +10721,15 @@ static RETURN_TYPE main_loop(void *start_args)
         if (rc == 0) {
             /* a timeout occured, but no fds */
 #ifndef FEATURE_THREADS
-            goto tick_me;
+            /* we still need to check outbound data ... */
+            //goto tick_me;
 #endif
         } else if (rc == -1 && (errno == EAGAIN || errno == EINTR || errno == EBADF)) {
+            if (errno == EBADF) {
+                /* TODO check all fd's and close any connections that are
+                 * EBADF to avoid constant looping */
+                warn("main_loop");
+            }
             /* TODO calculate the remaining time to sleep? */
             continue;
         } else if (rc == -1) {
@@ -10654,7 +10764,18 @@ static RETURN_TYPE main_loop(void *start_args)
                     if (FD_ISSET(raft_peers[idx].peer_fd, &fds_exc)) {
                         dbg_printf("RAFT main_loop: fds_exc, closing peer\n");
                         raft_close(&raft_peers[idx]);
-                    } else if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
+                        continue;
+                    } 
+
+                    if (raft_peers[idx].wr_packet_buffer) {
+                        if (raft_try_write(&raft_peers[idx]) == -1)
+                            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                                dbg_printf("RAFT main_loop: raft_try_write\n");
+                                continue;
+                            }
+                    } 
+
+                    if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
                         raft_recv(&raft_peers[idx]);
                 }
             }
@@ -10672,7 +10793,18 @@ static RETURN_TYPE main_loop(void *start_args)
                     if (FD_ISSET(tmp_host->peer_fd, &fds_exc)) {
                         warnx("main_loop: tmp_host is in fds_exc");
                         raft_remove_and_free_unknown_host(tmp_host);
-                    } else if (FD_ISSET(tmp_host->peer_fd, &fds_in)) {
+                        continue;
+                        /* TODO is this needed & OK ?
+                    } else if (tmp_host->wr_packet_buffer) {
+                        if (raft_try_write(tmp_host) == -1)
+                            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                                dbg_printf("RAFT main_loop: raft_try_write\n"); 
+                                continue;
+                                }
+                                */
+                    } 
+
+                    if (FD_ISSET(tmp_host->peer_fd, &fds_in)) {
                         if (raft_new_conn(-1, tmp_host, NULL, -1) == -1) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                                 continue;

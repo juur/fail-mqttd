@@ -695,13 +695,21 @@ struct raft_host_entry {
 
     /* for connection handling */
     raft_rd_state_t rd_state;
-    ssize_t rd_need;
+
+    /* read buffering */
     off_t rd_offset;
-    ssize_t rd_packet_length;
-    uint8_t rd_packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
     raft_rpc_t rd_rpc;
+    ssize_t rd_need;
+    ssize_t rd_packet_length;
     struct raft_host_entry *unknown_next;
     uint8_t *rd_packet_buffer;
+    uint8_t rd_packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+
+    /* write buffering */
+    const uint8_t *wr_packet_buffer;
+    off_t wr_offset;
+    ssize_t wr_need;
+    ssize_t wr_packet_length;
 };
 
 struct raft_state {
