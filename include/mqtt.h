@@ -603,6 +603,15 @@ typedef enum {
     RAFT_MAX_CONN,
 } raft_conn_t;
 
+typedef enum {
+    RAFT_PCK_NEW,
+    RAFT_PCK_HELLO,
+    RAFT_PCK_HEADER,
+    RAFT_PCK_PACKET,
+    RAFT_PCK_PROCESS,
+    RAFT_PCK_EMPTY,
+} raft_rd_state_t;
+
 /* wire-format used for client to send & log[] for server
  *
  * u8   type   (raft_log_t)
@@ -639,6 +648,30 @@ struct raft_log {
     };
 };
 
+struct raft_packet {
+    raft_rpc_t rpc; /* uint8_t */
+    uint8_t flags;
+    raft_conn_t role; /* uint8_t */
+    uint8_t res0;
+    uint32_t length;
+};
+
+#define RAFT_HDR_SIZE   (1+1+1+1+4)
+
+/**
+ * RAFT_HELLO
+ *
+ * Header
+ * u32 id
+ * u8  type (raft_conn_t)
+ * u32 mqtt-addr in_addr_t
+ * u16 mqtt-port in_port_t
+ */
+
+#define RAFT_HELLO_SIZE (4 + 1 + 4 + 2)
+
+
+
 struct raft_host_entry {
     /* candidateVar = */
     bool vote_responded;   /* VARIABLE votesResponded (candidate) */
@@ -658,6 +691,15 @@ struct raft_host_entry {
     in_port_t port;
     struct in_addr mqtt_addr;
     in_port_t mqtt_port;
+
+    /* for connection handling */
+    raft_rd_state_t rd_state;
+    ssize_t rd_need;
+    off_t rd_offset;
+    ssize_t rd_packet_length;
+    uint8_t rd_packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+    struct raft_host_entry *unknown_next;
+    uint8_t *packet_buffer;
 };
 
 struct raft_state {
@@ -684,17 +726,8 @@ struct raft_state {
     struct raft_host_entry *leader;
     uint32_t sequence_num;
     struct raft_log *log_pending;
+    struct raft_host_entry *unknown_clients;
 };
-
-struct raft_packet {
-    raft_rpc_t rpc; /* uint8_t */
-    uint8_t flags;
-    raft_conn_t role; /* uint8_t */
-    uint8_t res0;
-    uint32_t length;
-};
-
-#define RAFT_HDR_SIZE   (1+1+1+1+4)
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
 extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
@@ -720,18 +753,6 @@ extern const char *const raft_conn_str[RAFT_MAX_CONN];
 extern const char *const raft_log_str[RAFT_MAX_LOG];
 
 #endif
-
-/**
- * RAFT_HELLO
- *
- * Header
- * u32 id
- * u8  type (raft_conn_t)
- * u32 mqtt-addr in_addr_t
- * u16 mqtt-port in_port_t
- */
-
-#define RAFT_HELLO_SIZE (4 + 1 + 4 + 2)
 
 /**
  * RAFT_CLIENT_REQUEST
