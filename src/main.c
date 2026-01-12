@@ -269,9 +269,9 @@ static int load_topic(datum /* key */, datum content);
 
 static const struct {
     DBM **global;
-    char *filename;
+    char *const filename;
     int (*const func)(datum key, datum content);
-    size_t size;
+    const size_t size;
 } database_init[] = {
     { &message_dbm, "messages", load_message, sizeof(struct message_save) },
     { &topic_dbm, "topics", load_topic, sizeof(struct topic_save) },
@@ -8435,8 +8435,8 @@ fail:
 }
 
 static const struct {
-    size_t min_size;
-    size_t max_size;
+    const size_t min_size;
+    const size_t max_size;
 } raft_rpc_settings[RAFT_MAX_RPC] = {
     [RAFT_HELLO]                 = { RAFT_HELLO_SIZE                 , RAFT_HELLO_SIZE                 } ,
     [RAFT_CLIENT_REQUEST]        = { RAFT_CLIENT_REQUEST_SIZE        , RAFT_MAX_PACKET_SIZE            } ,
@@ -8450,6 +8450,7 @@ static const struct {
 };
 
 
+[[gnu::nonnull]]
 static int raft_add_write(struct raft_host_entry *client, const uint8_t *buffer, ssize_t size)
 {
     if (client->wr_packet_buffer) {
@@ -8465,6 +8466,7 @@ static int raft_add_write(struct raft_host_entry *client, const uint8_t *buffer,
     return 0;
 }
 
+[[gnu::nonnull]]
 static int raft_try_write(struct raft_host_entry *client)
 {
     ssize_t rc;
