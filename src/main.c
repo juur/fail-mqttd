@@ -317,7 +317,6 @@ static struct raft_state raft_state;
 static int raft_client_log_send(raft_log_t event, ...);
 static int raft_leader_log_append(raft_log_t event, ...);
 static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...);
-//static int raft_packet_in(struct raft_host_entry *client);
 static int raft_recv(struct raft_host_entry *client);
 #endif
 
@@ -3547,14 +3546,6 @@ static void close_all_sockets(void)
     }
 #endif
 
-#ifdef FEATURE_RAFT
-    if (opt_raft) {
-        dbg_printf("     close_socket: closing raft_fd %d\n",
-                global_raft_fd/*, global_raft_client_fd*/);
-        if (global_raft_fd != -1)
-            close_socket(&global_raft_fd);
-    }
-#endif
 }
 
 static void save_all_topics(void)
@@ -7712,6 +7703,8 @@ static int raft_reset_write_state(struct raft_host_entry *client)
         free((void *)client->wr_packet_buffer);
         client->wr_packet_buffer = NULL;
     }
+
+    return 0;
 }
 
 static int raft_update_leader_id(uint32_t leader_id)
@@ -7770,19 +7763,6 @@ static uint32_t raft_term_at(uint32_t index)
     return -1U;
 }
 
-#if 0
-static int check_and_update_term(uint32_t term)
-{
-    if (term > raft_state.current_term) {
-        raft_state.state = RAFT_STATE_FOLLOWER;
-        raft_state.voted_for = NULL_ID;
-        raft_state.current_term = term;
-    }
-
-    return 0;
-}
-#endif
-
 [[gnu::nonnull]]
 static int raft_close(struct raft_host_entry *client)
 {
@@ -7822,6 +7802,9 @@ static int raft_free_log(struct raft_log *entry)
             free(entry);
             return -1;
     }
+
+    if (entry->role == RAFT_CLIENT)
+        pthread_mutex_destroy(&entry->mutex);
 
     free(entry);
     return 0;
@@ -7990,7 +7973,6 @@ static int raft_check_commit_index(uint32_t best)
 static int raft_leader_log_appendv(raft_log_t event, va_list ap)
 {
     struct raft_log *new_log = NULL;
-    //struct raft_log *prev_log;
 
     if (event >= RAFT_MAX_LOG) {
         errno = EINVAL;
@@ -8003,8 +7985,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
     if ((new_log = malloc(sizeof(struct raft_log))) == NULL)
         goto fail;
 
-    //prev_log = raft_state.log_tail;
-
+    new_log->role = RAFT_PEER;
     new_log->event = event;
     new_log->term = raft_state.current_term;
     new_log->index = ++raft_state.log_index;
@@ -8019,6 +8000,8 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
                 goto fail;
             new_log->register_topic.length = strlen((void *)new_log->register_topic.name);
             memcpy(&new_log->register_topic.uuid, va_arg(ap, uint8_t *), UUID_SIZE);
+            new_log->register_topic.retained = false;
+            memset(&new_log->register_topic.msg_uuid, 0, UUID_SIZE);
             break;
 
         default:
@@ -8031,11 +8014,6 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
     {
         if (raft_peers[idx].peer_fd == -1)
             continue;
-
-#if 0
-        if (raft_peers[idx].next_index != new_log->index)
-            continue; /* follower is 'behind' so needs to catch-up */
-#endif
 
         const uint32_t prev_index = raft_peers[idx].next_index - 1;
         const uint32_t prev_term = raft_term_at(prev_index);
@@ -8076,53 +8054,15 @@ static int raft_leader_log_append(raft_log_t event, ...)
 
 static int raft_await_client_response(struct raft_log *pending_event)
 {
-    const int leader_fd = raft_state.leader ? raft_state.leader->peer_fd : -1;
-    fd_set fds_in, fds_exc;
-    struct timeval tv;
     int rc;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 5;
 
-    if (leader_fd == -1) {
-        errno = EBADF;
-        return -1;
-    }
+    if ((rc = pthread_mutex_timedlock(&pending_event->mutex, &ts)) == 0)
+        return 0;
 
-    while (1)
-    {
-        FD_ZERO(&fds_in);
-        FD_ZERO(&fds_exc);
-
-        tv.tv_usec = 25000;
-        tv.tv_sec = 0;
-
-        rc = select(leader_fd, &fds_in, NULL, NULL, &tv);
-
-        tv.tv_sec = 0;
-        tv.tv_usec = 500;
-        select(leader_fd, NULL, NULL, &fds_exc, &tv);
-
-        if (rc == 0)
-            continue;
-
-        if (rc == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                continue;
-            return -1;
-        }
-
-        if (FD_ISSET(leader_fd, &fds_exc)) {
-            dbg_printf("RAFT raft_await_client_response: fds_exc, closing peer\n");
-            raft_close(raft_state.leader);
-            return -1;
-        }
-
-        assert(FD_ISSET(leader_fd, &fds_in));
-
-        raft_recv(raft_state.leader);
-    }
-
-    return 0;
-
-fail:
+    errno = rc;
     return -1;
 }
 
@@ -8144,8 +8084,20 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
     if ((new_client_event = calloc(1, sizeof(struct raft_log))) == NULL)
         goto fail;
 
+    new_client_event->role = RAFT_CLIENT;
     new_client_event->event = event;
     new_client_event->sequence_num = ++raft_state.sequence_num;
+    if ((rc = pthread_mutex_init(&new_client_event->mutex, NULL)) != 0) {
+        warnx("raft_client_log_sendv: pthread_mutex_init: %s", strerror(rc));
+        errno = rc;
+        goto fail;
+    }
+
+    if ((rc = pthread_mutex_trylock(&new_client_event->mutex)) != 0) {
+        warnx("raft_client_log_sendv: pthread_mutex_trylock: %s", strerror(rc));
+        errno = rc;
+        goto fail;
+    }
 
     switch (event)
     {
@@ -8945,19 +8897,6 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             } else {
                 sent++;
             }
-            /*
-               if ((rc = write(raft_peers[idx].peer_fd, packet_buffer, sendsz)) != sendsz) {
-               if (rc == -1) {
-               warn("raft_send: bcast write(%u on fd %u)", idx, raft_peers[idx].peer_fd);
-               raft_close(&raft_peers[idx]);
-               } else {
-               rdbg_printf("RAFT raft_send: short-write on fd %u\n",
-               raft_peers[idx].peer_fd);
-               }
-               } else {
-               sent++;
-               }
-               */
         }
     } else {
         int *fd;
@@ -8999,23 +8938,6 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             packet_buffer = NULL;
             sent = 1;
         }
-
-        /*
-        if ((rc = write(*fd, packet_buffer, sendsz)) != sendsz) {
-            if (rc == -1) {
-                warn("raft_send: single write(%u on fd %u)",
-                        client->server_id, *fd);
-                raft_close(client);
-                goto fail;
-            } else {
-                errno = ENOSPC;
-                rdbg_printf("RAFT raft_send: short-write on fd %u\n", *fd);
-                goto fail;
-            }
-        } else {
-            sent = 1;
-        }
-        */
     }
 
     if (packet_buffer)
@@ -9613,8 +9535,16 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                 }
 
                 if (reply == RAFT_OK) {
-                    /* TODO */
-                    goto done;
+                    for (struct raft_log *tmp = raft_state.log_pending; tmp; tmp = tmp->next)
+                    {
+                        if (tmp->sequence_num != sequence_num || raft_state.self_id != client_id)
+                            continue;
+
+                        pthread_mutex_unlock(&tmp->mutex);
+                        goto done;
+                    }
+                    errno = ENOENT;
+                    goto fail;
                 }
 
                 warn("raft_recv: RAFT_CLIENT_REQUEST_REPLY: got an error: <%s>",
@@ -9845,6 +9775,7 @@ send_client_request_reply:
                     if ((log_entry = calloc(1, sizeof(struct raft_log))) == NULL)
                         goto fail;
 
+                    log_entry->role = RAFT_PEER;
                     log_entry->event = type;
                     log_entry->flags = flags;
                     log_entry->index = index;
@@ -10243,6 +10174,7 @@ fail:
 
 static void raft_clean(void)
 {
+    rdbg_printf("RAFT raft_clean\n");
     if (raft_peers) {
         for (unsigned idx = 0; idx < raft_num_peers; idx++)
             if (raft_peers[idx].peer_fd != -1)
@@ -10256,6 +10188,12 @@ static void raft_clean(void)
         next = tmp->next;
         raft_remove_log(tmp, &raft_state.log_head, &raft_state.log_tail);
         raft_free_log(tmp);
+    }
+
+    if (opt_raft) {
+        dbg_printf("     close_socket: closing raft_fd %d\n", global_raft_fd);
+        if (global_raft_fd != -1)
+            close_socket(&global_raft_fd);
     }
 }
 
@@ -10326,7 +10264,7 @@ static int raft_init(void)
                 ntohl(raft_peers[idx].address.s_addr), ntohs(raft_peers[idx].port));
 #endif
 
-    atexit(raft_clean);
+    //atexit(raft_clean);
     raft_reset_election_timer();
 
     rdbg_printf("RAFT init: raft_num_peers=%u\n", raft_num_peers);
@@ -10456,19 +10394,12 @@ static void tick(void)
         message_tick();
     if (num_packets)
         packet_tick();
-#ifndef FEATURE_THREADS
-# ifdef FEATURE_RAFT
-    if (opt_raft)
-        raft_tick();
-# endif
-#endif
 }
 
 struct start_args {
     int fd;
     int om_fd;
     int raft_fd;
-    //int raft_client_fd;
 };
 
 #ifdef FEATURE_THREADS
@@ -10535,62 +10466,159 @@ static RETURN_TYPE openmetrics_loop(void *start_args)
 
     return 0;
 }
+#endif
 
-# ifdef FEATURE_RAFT
-static RETURN_TYPE raft_loop(void *start_args)
+#ifdef FEATURE_RAFT
+static void *raft_loop(void *start_args)
 {
     const int raft_fd = ((const struct start_args *)start_args)->raft_fd;
-    //const int raft_client_fd = ((const struct start_args *)start_args)->raft_client_fd;
 
     raft_init();
 
     while (running)
     {
-        int fd, rc;
-        fd_set fds_in;
+        int rc;
+        fd_set fds_in, fds_out, fds_exc;
         int max_fd = 0;
 
-        FD_ZERO(&fds_in);
         FD_SET(raft_fd, &fds_in);
-        //FD_SER(raft_client_fd, &fds_in);
 
-        max_fd = raft_fd; //MAX(raft_fd, raft_client_fd);
+        max_fd = raft_fd;
+
+        FD_ZERO(&fds_in);
+        FD_ZERO(&fds_out);
+        FD_ZERO(&fds_exc);
+
+        FD_SET(raft_fd, &fds_in);
+
+            for (unsigned idx = 0; idx < raft_num_peers; idx++)
+            {
+                if (raft_peers[idx].peer_fd != -1) {
+                    max_fd = MAX(max_fd, raft_peers[idx].peer_fd);
+                    FD_SET(raft_peers[idx].peer_fd, &fds_in);
+                    FD_SET(raft_peers[idx].peer_fd, &fds_exc);
+                    if (raft_peers[idx].wr_packet_buffer)
+                        FD_SET(raft_peers[idx].peer_fd, &fds_out);
+
+                }
+            }
+            for (struct raft_host_entry *tmp = raft_state.unknown_clients; tmp; tmp = tmp->unknown_next)
+            {
+                if (tmp->peer_fd != -1) {
+                    max_fd = MAX(max_fd, tmp->peer_fd);
+                    FD_SET(tmp->peer_fd, &fds_in);
+                    FD_SET(tmp->peer_fd, &fds_exc);
+                    if (tmp->wr_packet_buffer)
+                        FD_SET(tmp->peer_fd, &fds_out);
+
+                }
+            }
 
         struct timeval timeout = {
-            .tv_sec = 1,
-            .tv_usec = 0,
+            .tv_usec = 25000,
+            .tv_sec = 0,
         };
 
-        if ((rc = select(max_fd + 1, &fds_in, NULL, NULL, &timeout)) == -1) {
-            if (errno == EINTR)
+        if ((rc = select(max_fd + 1, &fds_in, NULL, &fds_exc, &timeout)) == -1) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 continue;
             logger(LOG_WARNING, NULL, "raft_loop: select: %s", strerror(errno));
             sleep(1);
         }
 
-        if (rc == 0)
-            continue;
+        raft_tick();
 
-        /* update for raft_fd/raft_client_fd */
-        if ((fd = accept(raft_fd, NULL, NULL)) == -1) {
-            if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR)
-                logger(LOG_WARNING, NULL, "raft_loop: accept: %s", strerror(errno));
-            sleep(1);
-            continue;
+        /* TODO:
+         * rc == 0 needs to be checked, but needs more consideration
+         * on if we want to check for write will/won't block */
+
+        /* First, handle properly connected peers/clients */
+        for (unsigned idx = 0; idx < raft_num_peers; idx++)
+        {
+            if (raft_peers[idx].peer_fd != -1) {
+                if (FD_ISSET(raft_peers[idx].peer_fd, &fds_exc)) {
+                    dbg_printf("RAFT main_loop: fds_exc, closing peer\n");
+                    raft_close(&raft_peers[idx]);
+                    continue;
+                }
+
+                if (raft_peers[idx].wr_packet_buffer) {
+                    if (raft_try_write(&raft_peers[idx]) == -1)
+                        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                            dbg_printf("RAFT main_loop: raft_try_write\n");
+                            continue;
+                        }
+                }
+
+                if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
+                    raft_recv(&raft_peers[idx]);
+            }
         }
 
-        if (raft_export(fd) == -1)
-            close_socket(&fd);
-        else
-            close_socket(&fd);
+        /* Next, handle new connections we've not yet finished
+         * RAFT_HELLO with */
+        struct raft_host_entry *tmp_host, *next_host;
+        next_host = NULL;
+
+        for (tmp_host = raft_state.unknown_clients; tmp_host; tmp_host = next_host)
+        {
+            next_host = tmp_host->unknown_next;
+
+            if (tmp_host->peer_fd != -1) {
+                if (FD_ISSET(tmp_host->peer_fd, &fds_exc)) {
+                    warnx("main_loop: tmp_host is in fds_exc");
+                    raft_remove_and_free_unknown_host(tmp_host);
+                    continue;
+                    /* TODO
+                     * currently there is no 'write' within this distinct state machine,
+                     * so the below isn't needed. Probably better to merge the state machines
+                     * than fix this?
+
+                       } else if (tmp_host->wr_packet_buffer) {
+                       if (raft_try_write(tmp_host) == -1)
+                       if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                       dbg_printf("RAFT main_loop: raft_try_write\n");
+                       continue;
+                       }
+                       */
+                }
+
+                if (FD_ISSET(tmp_host->peer_fd, &fds_in)) {
+                    if (raft_new_conn(-1, tmp_host, NULL, -1) == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                            continue;
+                        warn("main_loop: tmp_host: raft_new_conn");
+                        /* tmp_host might have been trashed by raft_new_conn() */
+                    }
+                }
+            }
+        }
+
+        /* Finnally, handle new connections */
+        if (FD_ISSET(raft_fd, &fds_in)) {
+            int tmp_fd;
+            struct sockaddr_in sin;
+            socklen_t sin_len = sizeof(sin);
+
+            if ((tmp_fd = accept(raft_fd, (struct sockaddr *)&sin, &sin_len)) != -1) {
+                dbg_printf("RAFT main_loop: accept fd %u\n", tmp_fd);
+                if (raft_new_conn(tmp_fd, NULL, &sin, sin_len) == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                        goto raft_new_out;
+                    dbg_printf("RAFT main_loop: raft_new_conn: failed: %s\n", strerror(errno));
+                    close_socket(&tmp_fd);
+                }
+            } else
+                warn("main_loop: raft accept failed");
+        }
+raft_new_out:
     }
 
     logger(LOG_INFO, NULL, "raft_loop: terminated normally");
 
-    return 0;
-
+    raft_clean();
+    return 0; /* this does pthread_exit() */
 }
-# endif
 #endif
 
 static RETURN_TYPE main_loop(void *start_args)
@@ -10599,9 +10627,6 @@ static RETURN_TYPE main_loop(void *start_args)
     const int mother_fd = ((const struct start_args *)start_args)->fd;
 #ifdef FEATURE_OM
     const int om_fd = ((const struct start_args *)start_args)->om_fd;
-#endif
-#ifdef FEATURE_RAFT
-    const int raft_fd = ((const struct start_args *)start_args)->raft_fd;
 #endif
 #ifdef FEATURE_THREADS
     const pthread_t self = pthread_self();
@@ -10612,13 +10637,10 @@ static RETURN_TYPE main_loop(void *start_args)
         int rc = 0;
         struct timeval tv;
         int max_fd = mother_fd;
+
 #ifdef FEATURE_OM
         max_fd = MAX(mother_fd, om_fd);
 #endif
-#ifdef FEATURE_RAFT
-        max_fd = MAX(max_fd, raft_fd);
-#endif
-        //max_fd = MAX(max_fd, raft_client_fd);
 
         FD_ZERO(&fds_in);
         FD_ZERO(&fds_out);
@@ -10630,11 +10652,6 @@ static RETURN_TYPE main_loop(void *start_args)
         if (om_fd != -1)
             FD_SET(om_fd, &fds_in);
 #endif
-#ifdef FEATURE_RAFT
-        if (raft_fd != -1)
-            FD_SET(raft_fd, &fds_in);
-#endif
-
         has_clients = false;
 
         if (num_clients) {
@@ -10665,42 +10682,10 @@ static RETURN_TYPE main_loop(void *start_args)
             pthread_rwlock_unlock(&global_clients_lock);
         }
 
-#ifdef FEATURE_RAFT
-        if (raft_fd != -1) {
-            for (unsigned idx = 0; idx < raft_num_peers; idx++)
-            {
-                if (raft_peers[idx].peer_fd != -1) {
-                    max_fd = MAX(max_fd, raft_peers[idx].peer_fd);
-                    FD_SET(raft_peers[idx].peer_fd, &fds_in);
-                    FD_SET(raft_peers[idx].peer_fd, &fds_exc);
-                    if (raft_peers[idx].wr_packet_buffer)
-                        FD_SET(raft_peers[idx].peer_fd, &fds_out);
-
-                }
-            }
-            for (struct raft_host_entry *tmp = raft_state.unknown_clients; tmp; tmp = tmp->unknown_next)
-            {
-                if (tmp->peer_fd != -1) {
-                    max_fd = MAX(max_fd, tmp->peer_fd);
-                    FD_SET(tmp->peer_fd, &fds_in);
-                    FD_SET(tmp->peer_fd, &fds_exc);
-                    if (tmp->wr_packet_buffer)
-                        FD_SET(tmp->peer_fd, &fds_out);
-
-                }
-            }
-        }
-
-#endif
-
         tv.tv_sec = 0;
 
         if (has_clients == false) {
-#ifdef FEATURE_RAFT
-            tv.tv_usec = opt_raft ? 25000 : 1000000;
-#else
             tv.tv_usec = 1000000;
-#endif
             rc = select(max_fd + 1, &fds_in, NULL, NULL, &tv);
             tv.tv_sec = 0;
             tv.tv_usec = 1000;
@@ -10721,8 +10706,9 @@ static RETURN_TYPE main_loop(void *start_args)
         if (rc == 0) {
             /* a timeout occured, but no fds */
 #ifndef FEATURE_THREADS
-            /* we still need to check outbound data ... */
-            //goto tick_me;
+            /* TODO we still need to check outbound data ... need a better solution
+             * here. */
+            /* goto tick_me; */
 #endif
         } else if (rc == -1 && (errno == EAGAIN || errno == EINTR || errno == EBADF)) {
             if (errno == EBADF) {
@@ -10752,87 +10738,6 @@ static RETURN_TYPE main_loop(void *start_args)
                 else
                     close_socket(&tmp_fd);
             }
-        }
-#endif
-
-#ifdef FEATURE_RAFT
-        if (raft_fd != -1) {
-            /* First, handle properly connected peers/clients */
-            for (unsigned idx = 0; idx < raft_num_peers; idx++)
-            {
-                if (raft_peers[idx].peer_fd != -1) {
-                    if (FD_ISSET(raft_peers[idx].peer_fd, &fds_exc)) {
-                        dbg_printf("RAFT main_loop: fds_exc, closing peer\n");
-                        raft_close(&raft_peers[idx]);
-                        continue;
-                    } 
-
-                    if (raft_peers[idx].wr_packet_buffer) {
-                        if (raft_try_write(&raft_peers[idx]) == -1)
-                            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                                dbg_printf("RAFT main_loop: raft_try_write\n");
-                                continue;
-                            }
-                    } 
-
-                    if (FD_ISSET(raft_peers[idx].peer_fd, &fds_in))
-                        raft_recv(&raft_peers[idx]);
-                }
-            }
-
-            /* Next, handle new connections we've not yet finished
-             * RAFT_HELLO with */
-            struct raft_host_entry *tmp_host, *next_host;
-            next_host = NULL;
-
-            for (tmp_host = raft_state.unknown_clients; tmp_host; tmp_host = next_host)
-            {
-                next_host = tmp_host->unknown_next;
-
-                if (tmp_host->peer_fd != -1) {
-                    if (FD_ISSET(tmp_host->peer_fd, &fds_exc)) {
-                        warnx("main_loop: tmp_host is in fds_exc");
-                        raft_remove_and_free_unknown_host(tmp_host);
-                        continue;
-                        /* TODO is this needed & OK ?
-                    } else if (tmp_host->wr_packet_buffer) {
-                        if (raft_try_write(tmp_host) == -1)
-                            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                                dbg_printf("RAFT main_loop: raft_try_write\n"); 
-                                continue;
-                                }
-                                */
-                    } 
-
-                    if (FD_ISSET(tmp_host->peer_fd, &fds_in)) {
-                        if (raft_new_conn(-1, tmp_host, NULL, -1) == -1) {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                                continue;
-                            warn("main_loop: tmp_host: raft_new_conn");
-                            /* tmp_host might have been trashed by raft_new_conn() */
-                        }
-                    }
-                }
-            }
-
-            /* Finnally, handle new connections */
-            if (FD_ISSET(raft_fd, &fds_in)) {
-                int tmp_fd;
-                struct sockaddr_in sin;
-                socklen_t sin_len = sizeof(sin);
-
-                if ((tmp_fd = accept(raft_fd, (struct sockaddr *)&sin, &sin_len)) != -1) {
-                    dbg_printf("RAFT main_loop: accept fd %u\n", tmp_fd);
-                    if (raft_new_conn(tmp_fd, NULL, &sin, sin_len) == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                            goto raft_new_out;
-                        dbg_printf("RAFT main_loop: raft_new_conn: failed: %s\n", strerror(errno));
-                        close_socket(&tmp_fd);
-                    }
-                } else
-                    warn("main_loop: raft accept failed");
-            }
-raft_new_out:
         }
 #endif
 
@@ -10939,7 +10844,6 @@ shit_fd:
         }
 
 #ifndef FEATURE_THREADS
-tick_me:
             tick();
 #endif
     }
@@ -11328,6 +11232,8 @@ int main(int argc, char *argv[])
 #endif
 
 #ifdef FEATURE_RAFT
+    /* TODO: should this move to raft_init() so it runs in the correct
+     * thread? */
     if (opt_raft) {
         if ((global_raft_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)
             logger(LOG_EMERG, NULL, "socket(raft): %s", strerror(errno));
@@ -11392,60 +11298,50 @@ int main(int argc, char *argv[])
 #ifdef FEATURE_THREADS
     struct start_args start_args0 = {
         .fd = global_mother_fd,
-        .om_fd = -1,
-        .raft_fd = -1,
+        .om_fd = -1, .raft_fd = -1,
     };
 
     struct start_args start_argsn = {
-        .fd = -1,
-        .om_fd = -1,
-        .raft_fd = -1,
+        .fd = -1, .om_fd = -1, .raft_fd = -1,
     };
 
     struct start_args start_args_om = {
         .fd = -1,
-#ifdef FEATURE_OM
+# ifdef FEATURE_OM
         .om_fd = opt_openmetrics ? global_om_fd : 0,
-#else
+# else
         .om_fd = -1,
-#endif
+# endif
         .raft_fd = -1,
     };
-    struct start_args start_args_raft = {
-        .fd = -1,
-#ifdef FEATURE_OM
-        .om_fd = opt_openmetrics ? global_om_fd : 0,
-#else
-        .om_fd = -1,
-#endif
-        .raft_fd = opt_raft ? global_raft_fd : 0,
-    };
-#else
+#else /* #ifdef FEATURE_THREADS */
     struct start_args start_args = {
         .fd = global_mother_fd,
-#ifdef FEATURE_OM
+# ifdef FEATURE_OM
         .om_fd = opt_openmetrics ? global_om_fd : 0,
-#else
+# else
         .om_fd = -1,
-#endif
-#ifdef FEATURE_RAFT
-        .raft_fd = opt_raft ? global_raft_fd : 0,
-#else
+# endif
         .raft_fd = -1,
-#endif
     };
-#endif
+#endif /* #ifdef FEATURE_THREADS */
     running = true;
 
-#ifdef FEATURE_THREADS
-# define NUM_THREADS 16
-    pthread_t main_thread[NUM_THREADS], tick_thread[NUM_THREADS], om_thread, raft_thread;
+#ifdef FEATURE_RAFT
+    struct start_args start_args_raft = {
+        .fd = -1, .om_fd = -1,
+        .raft_fd = opt_raft ? global_raft_fd : 0,
+    };
 
-# ifdef FEATURE_RAFT
+    pthread_t raft_thread;
     if (opt_raft &&
             pthread_create(&raft_thread, NULL, raft_loop, &start_args_raft) == -1)
         err(EXIT_FAILURE, "pthread_create: raft_loop");
-# endif
+#endif
+
+#ifdef FEATURE_THREADS
+# define NUM_THREADS 16
+    pthread_t main_thread[NUM_THREADS], tick_thread[NUM_THREADS], om_thread; //, raft_thread;
 
     if (opt_openmetrics &&
             pthread_create(&om_thread, NULL, openmetrics_loop, &start_args_om) == -1)
@@ -11463,6 +11359,10 @@ int main(int argc, char *argv[])
     if (opt_openmetrics)
         pthread_join(om_thread, NULL);
 # endif
+# ifdef FEATURE_RAFT
+    if (opt_raft)
+        pthread_join(raft_thread, NULL);
+# endif
 
     for (unsigned idx = 0; idx < NUM_THREADS; idx++)
         if (pthread_join(tick_thread[idx], NULL) == -1)
@@ -11476,14 +11376,15 @@ int main(int argc, char *argv[])
         else
             logger(LOG_INFO, NULL, "main: pthread_join(main_thread[%u]): OK", idx);
 #else /* FEATURE_THREADS */
+
+    if (main_loop(&start_args) == -1)
+        logger(LOG_EMERG, NULL, "main_loop returned an error: %s", strerror(errno));
 # ifdef FEATURE_RAFT
     if (opt_raft)
-        raft_init();
+        pthread_join(raft_thread, NULL);
 # endif
-    if (main_loop(&start_args) == -1)
-        logger(LOG_EMERG, NULL, "main_loop returned an error: %s",
-                strerror(errno));
-#endif
+#endif /* FEATURE_THREADS */
+
     logger(LOG_INFO, NULL, "main: done");
     exit(EXIT_SUCCESS);
 

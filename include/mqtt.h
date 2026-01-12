@@ -633,11 +633,14 @@ enum {
 
 struct raft_log {
     struct raft_log *next;
+    raft_conn_t role;
     raft_log_t event;
     uint8_t flags;
     uint32_t index;
     uint32_t term;
     uint32_t sequence_num;
+    pthread_mutex_t mutex;
+
     union {
         struct {
             uint16_t length;
