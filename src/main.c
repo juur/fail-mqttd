@@ -7986,7 +7986,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
     rdbg_printf("RAFT raft_leader_log_appendv: %s\n",
             raft_log_str[event]);
 
-    if ((new_log = malloc(sizeof(struct raft_log))) == NULL)
+    if ((new_log = calloc(1, sizeof(struct raft_log))) == NULL)
         goto fail;
 
     new_log->role = RAFT_PEER;
@@ -8007,9 +8007,9 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
 
             memcpy(&new_log->register_topic.uuid, va_arg(ap, uint8_t *), UUID_SIZE);
 
-            const uint32_t flags = va_arg(ap, uint32_t);
-
-            new_log->register_topic.retained = (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
+            new_log->register_topic.flags = va_arg(ap, uint32_t);
+            new_log->register_topic.retained = (new_log->register_topic.flags &
+                    RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
 
             if (new_log->register_topic.retained)
                 memcpy(&new_log->register_topic.msg_uuid, va_arg(ap, uint8_t *), UUID_SIZE);
@@ -8050,7 +8050,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
 
 fail:
     if (new_log)
-        free(new_log);
+        raft_free_log(new_log);
 
     return -1;
 }
@@ -8116,6 +8116,16 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
         goto fail;
     }
 
+    pthread_rwlock_wrlock(&raft_state.log_pending_lock);
+    for (prev = raft_state.log_pending; prev && prev->next; prev = prev->next) {}
+
+    if (prev == NULL)
+        raft_state.log_pending = new_client_event;
+    else
+        prev->next = new_client_event;
+    pthread_rwlock_unlock(&raft_state.log_pending_lock);
+
+
     switch (event)
     {
         /* name, *uuid, flags, [msg_uuid] */
@@ -8157,25 +8167,26 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
             break;
     }
 
-    if (rc != -1 && new_client_event) {
+    if (rc == -1) {
         pthread_rwlock_wrlock(&raft_state.log_pending_lock);
-        for (prev = raft_state.log_pending; prev && prev->next; prev = prev->next) {}
-
-        if (prev == NULL)
-            raft_state.log_pending = new_client_event;
-        else
-            prev->next = new_client_event;
+        raft_remove_log(new_client_event, &raft_state.log_pending, NULL);
         pthread_rwlock_unlock(&raft_state.log_pending_lock);
+        goto fail;
+    }
 
+    if (new_client_event) {
         if ((rc = raft_await_client_response(new_client_event)) == -1) {
             warn("raft_client_log_sendv: raft_await_client_response");
-            pthread_mutex_unlock(&new_client_event->mutex);
+            pthread_rwlock_wrlock(&raft_state.log_pending_lock);
+            raft_remove_log(new_client_event, &raft_state.log_pending, NULL);
+            pthread_rwlock_unlock(&raft_state.log_pending_lock);
             goto fail;
         }
 
         pthread_rwlock_wrlock(&raft_state.log_pending_lock);
         raft_remove_log(new_client_event, &raft_state.log_pending, NULL);
         pthread_rwlock_unlock(&raft_state.log_pending_lock);
+
         pthread_mutex_unlock(&new_client_event->mutex);
         raft_free_log(new_client_event);
 
@@ -9378,8 +9389,7 @@ static raft_status_t process_append_entries(struct raft_host_entry *client,
         goto append_reply;
     } else {
         raft_update_leader_id(leader_id);
-        /* should we do this even if the rest fails? */
-        raft_state.election_timer = timems() + rnd(RAFT_MIN_ELECTION, RAFT_MAX_ELECTION);
+        raft_reset_election_timer();
     }
 
     /* 2. reply false if log doesn't contain an entry at
@@ -9569,13 +9579,13 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                 if (reply == RAFT_OK) {
                     struct raft_log *match = NULL;
 
-                    pthread_rwlock_wrlock(&raft_state.log_pending_lock);
+                    pthread_rwlock_rdlock(&raft_state.log_pending_lock);
                     for (match = raft_state.log_pending; match; match = match->next)
                         /* this is for the CLIENT to get a RAFT_OK from the SERVER
                          * as we are the CLIENT, then we use our self_id */
-                        if (match->sequence_num != sequence_num ||
-                                raft_state.self_id != client_id)
-                            continue;
+                        if (match->sequence_num == sequence_num &&
+                                raft_state.self_id == client_id)
+                            break;
                     pthread_rwlock_unlock(&raft_state.log_pending_lock);
 
                     if (match == NULL) {
@@ -9648,7 +9658,10 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
 
                         tmp_len = ntohs(tmp_len);
 
-                        if (bytes_remaining < tmp_len)
+                        if (bytes_remaining < (size_t)tmp_len + 1)
+                            goto fail;
+
+                        if (ptr[tmp_len] != '\0')
                             goto fail;
 
                         if ((temp_string = (void *)strndup((void *)ptr, tmp_len)) == NULL) {
@@ -9679,8 +9692,9 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                             goto fail;
 
                         rdbg_printf("RAFT raft_recv: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n", temp_string);
-                        raft_leader_log_append(type, temp_string, &uuid,
-                                (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) ? &msg_uuid : NULL);
+                        raft_leader_log_append(type,
+                                temp_string, uuid, flags,
+                                (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) ? msg_uuid : NULL);
                         free(temp_string);
                         temp_string = NULL;
                         break;
