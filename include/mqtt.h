@@ -640,6 +640,8 @@ struct raft_log {
     uint32_t term;
     uint32_t sequence_num;
     pthread_mutex_t mutex;
+    pthread_cond_t cv;
+    bool done;
 
     union {
         struct {
@@ -648,6 +650,7 @@ struct raft_log {
             uint8_t uuid[UUID_SIZE];
             bool retained;
             uint8_t msg_uuid[UUID_SIZE];
+            uint32_t flags;
         } register_topic;
     };
 };
@@ -740,6 +743,7 @@ struct raft_state {
     uint32_t sequence_num;
     struct raft_log *log_pending;
     struct raft_host_entry *unknown_clients;
+    pthread_rwlock_t log_pending_lock;
 };
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
