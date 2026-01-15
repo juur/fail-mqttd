@@ -283,6 +283,7 @@ static const struct {
  */
 
 #ifdef FEATURE_RAFT
+pthread_rwlock_t raft_state_lock = PTHREAD_RWLOCK_INITIALIZER;
 static struct raft_state raft_state;
 #endif
 
@@ -438,7 +439,7 @@ static void show_usage(FILE *fp, const char *name)
 
 #ifdef FEATURE_RAFT
 [[gnu::nonnull]]
-static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **list, int extra)
+static int raft_parse_cmdline_host_list(const char *tmp, struct raft_host_entry **list, int extra)
 {
     char *ptr, *ptr2;
     char *save = NULL, *save2 = NULL;
@@ -472,31 +473,23 @@ static int parse_cmdline_host_list(const char *tmp, struct raft_host_entry **lis
         save2 = NULL;
 
         /* id: */
-
-        if ((ptr2 = strtok_r(single, ":", &save2)) == NULL) {
+        if ((ptr2 = strtok_r(single, ":", &save2)) == NULL)
             goto fail;
-        }
 
         id = atoi(ptr2);
-        if (id <= 0 || id >= 0xff) {
+        if (id <= 0 || id >= 0xff)
             goto fail;
-        }
 
         /* host: */
-
-        if ((ptr2 = strtok_r(NULL, ":", &save2)) == NULL) {
+        if ((ptr2 = strtok_r(NULL, ":", &save2)) == NULL)
             goto fail;
-        }
 
-        if (inet_pton(AF_INET, ptr2, &addr) != 1) {
+        if (inet_pton(AF_INET, ptr2, &addr) != 1)
             goto fail;
-        }
 
         /* port */
-
-        if ((ptr2 = strtok_r(NULL, ":", &save2)) == NULL) {
+        if ((ptr2 = strtok_r(NULL, ":", &save2)) == NULL)
             goto fail;
-        }
 
         port = atoi(ptr2);
         if (port <= 0 || port >= USHRT_MAX)
@@ -669,7 +662,7 @@ static void parse_cmdline(int argc, char *argv[])
                                 goto shit_usage;
                             break;
                         case RAFT_CLUSTER_ADDRS:
-                            if ((raft_num_peers = parse_cmdline_host_list(value, &raft_peers, 1)) <= 0)
+                            if ((raft_num_peers = raft_parse_cmdline_host_list(value, &raft_peers, 1)) <= 0)
                                 goto shit_usage;
                             break;
                         default:
@@ -7730,7 +7723,8 @@ static int raft_update_leader_id(uint32_t leader_id)
 
 static int raft_update_term(uint32_t new_term)
 {
-    assert(new_term > raft_state.current_term);
+    if (new_term <= raft_state.current_term)
+        return 0;
 
     raft_state.current_term = new_term;
     raft_state.voted_for = NULL_ID;
@@ -7816,9 +7810,12 @@ static int raft_free_log(struct raft_log *entry)
 
 [[gnu::nonnull(1,2)]]
 static int raft_remove_log(struct raft_log *entry, struct raft_log **head,
-        struct raft_log **tail)
+        struct raft_log **tail, pthread_rwlock_t *lock)
 {
     struct raft_log *prev = NULL;
+
+    if (lock)
+        pthread_rwlock_wrlock(lock);
 
     if (*head == entry) {
         *head = entry->next;
@@ -7829,6 +7826,8 @@ static int raft_remove_log(struct raft_log *entry, struct raft_log **head,
         if (prev->next == entry)
             goto found;
 
+    if (lock)
+        pthread_rwlock_unlock(lock);
     errno = ENOENT;
     return -1;
 
@@ -7840,6 +7839,8 @@ found_head:
         *tail = prev;
 
     entry->next = NULL;
+    if (lock)
+        pthread_rwlock_unlock(lock);
     return 0;
 }
 
@@ -8077,6 +8078,7 @@ static int raft_await_client_response(struct raft_log *pending_event)
     {
         if ((rc = pthread_cond_timedwait(&pending_event->cv,
                         &pending_event->mutex, &ts)) != 0) {
+            pthread_mutex_unlock(&pending_event->mutex);
             errno = rc;
             return -1;
         }
@@ -8168,28 +8170,21 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
     }
 
     if (rc == -1) {
-        pthread_rwlock_wrlock(&raft_state.log_pending_lock);
-        raft_remove_log(new_client_event, &raft_state.log_pending, NULL);
-        pthread_rwlock_unlock(&raft_state.log_pending_lock);
+        pthread_mutex_unlock(&new_client_event->mutex);
+        raft_remove_log(new_client_event, &raft_state.log_pending, NULL, &raft_state.log_pending_lock);
         goto fail;
     }
 
     if (new_client_event) {
         if ((rc = raft_await_client_response(new_client_event)) == -1) {
             warn("raft_client_log_sendv: raft_await_client_response");
-            pthread_rwlock_wrlock(&raft_state.log_pending_lock);
-            raft_remove_log(new_client_event, &raft_state.log_pending, NULL);
-            pthread_rwlock_unlock(&raft_state.log_pending_lock);
+            raft_remove_log(new_client_event, &raft_state.log_pending, NULL, &raft_state.log_pending_lock);
             goto fail;
         }
 
-        pthread_rwlock_wrlock(&raft_state.log_pending_lock);
-        raft_remove_log(new_client_event, &raft_state.log_pending, NULL);
-        pthread_rwlock_unlock(&raft_state.log_pending_lock);
-
+        raft_remove_log(new_client_event, &raft_state.log_pending, NULL, &raft_state.log_pending_lock);
         pthread_mutex_unlock(&new_client_event->mutex);
         raft_free_log(new_client_event);
-
         return 0;
     }
 
@@ -8241,7 +8236,7 @@ static int raft_client_log_append_single(struct raft_log *raft_log, uint32_t lea
         while(tmp)
         {
             next = tmp->next;
-            raft_remove_log(tmp, &raft_state.log_head, &raft_state.log_tail);
+            raft_remove_log(tmp, &raft_state.log_head, &raft_state.log_tail, NULL);
             raft_free_log(tmp);
             tmp = next;
         }
@@ -8494,8 +8489,10 @@ static const struct {
 [[gnu::nonnull]]
 static int raft_add_write(struct raft_host_entry *client, const uint8_t *buffer, ssize_t size)
 {
+    pthread_rwlock_wrlock(&client->wr_lock);
     if (client->wr_packet_buffer) {
         errno = ENOSPC;
+        pthread_rwlock_unlock(&client->wr_lock);
         return -1;
     }
 
@@ -8504,6 +8501,7 @@ static int raft_add_write(struct raft_host_entry *client, const uint8_t *buffer,
     client->wr_offset = 0;
     client->wr_need = size;
 
+    pthread_rwlock_unlock(&client->wr_lock);
     return 0;
 }
 
@@ -8514,6 +8512,7 @@ static int raft_try_write(struct raft_host_entry *client)
 
     errno = 0;
 
+    pthread_rwlock_wrlock(&client->wr_lock);
     assert(client->wr_packet_buffer);
     assert(client->peer_fd != -1);
 
@@ -8521,19 +8520,25 @@ static int raft_try_write(struct raft_host_entry *client)
         if (rc == -1) {
             if (errno != EWOULDBLOCK && errno != EINTR && errno != EAGAIN)
                 raft_close(client);
-            return -1;
+            goto fail;
         } else if (rc == 0) {
             errno = EPIPE;
             raft_close(client);
-            return -1;
+            goto fail;
         }
         client->wr_offset += rc;
         client->wr_need -= rc;
 
+        pthread_rwlock_unlock(&client->wr_lock);
         return 0;
     }
 
     raft_reset_write_state(client);
+    pthread_rwlock_unlock(&client->wr_lock);
+    return 0;
+fail:
+
+    pthread_rwlock_unlock(&client->wr_lock);
     return 0;
 }
 
@@ -9393,8 +9398,7 @@ static raft_status_t process_append_entries(struct raft_host_entry *client,
     }
 
     /* 2. reply false if log doesn't contain an entry at
-     * prev_log_index whose term matches prev_log_term
-     * TODO: check this applies to "ping"s */
+     * prev_log_index whose term matches prev_log_term */
 
     if (raft_state.log_head == NULL) {
         if (prev_log_index > 0) {
@@ -10249,7 +10253,7 @@ static void raft_clean(void)
     for (next = NULL, tmp = raft_state.log_head; tmp; tmp = next)
     {
         next = tmp->next;
-        raft_remove_log(tmp, &raft_state.log_head, &raft_state.log_tail);
+        raft_remove_log(tmp, &raft_state.log_head, &raft_state.log_tail, NULL);
         raft_free_log(tmp);
     }
 
@@ -10308,6 +10312,7 @@ static int raft_init(void)
         raft_peers[idx].peer_fd = -1;
         raft_peers[idx].next_conn_attempt = timems() + rnd(RAFT_MIN_ELECTION * 2,
                 RAFT_MAX_ELECTION * 3);
+        pthread_rwlock_init(&raft_peers[idx].wr_lock, NULL);
     }
 
     /* Index 0 is 'self' */
@@ -11405,14 +11410,15 @@ int main(int argc, char *argv[])
 
 #ifdef FEATURE_THREADS
 # define NUM_THREADS 16
-    pthread_t main_thread[NUM_THREADS], tick_thread[NUM_THREADS], om_thread; //, raft_thread;
+    pthread_t main_thread[NUM_THREADS], tick_thread[NUM_THREADS], om_thread;
 
     if (opt_openmetrics &&
             pthread_create(&om_thread, NULL, openmetrics_loop, &start_args_om) == -1)
         err(EXIT_FAILURE, "pthread_create: openmetrics_loop");
 
     for (unsigned idx = 0; idx < NUM_THREADS; idx++)
-        if (pthread_create(&main_thread[idx], NULL, main_loop, idx == 0 ? &start_args0 : &start_argsn) == -1)
+        if (pthread_create(&main_thread[idx], NULL, main_loop,
+                    idx == 0 ? &start_args0 : &start_argsn) == -1)
             err(EXIT_FAILURE, "pthread_create: main_thread[%u]", idx);
 
     for (unsigned idx = 0; idx < NUM_THREADS; idx++)

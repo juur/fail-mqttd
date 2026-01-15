@@ -716,6 +716,7 @@ struct raft_host_entry {
     off_t wr_offset;
     ssize_t wr_need;
     ssize_t wr_packet_length;
+    pthread_rwlock_t wr_lock;
 };
 
 struct raft_state {
