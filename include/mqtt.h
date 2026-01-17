@@ -453,6 +453,7 @@ struct session {
     bool will_retain;
     time_t will_at;
 
+    _Atomic unsigned kill_attempts;
     _Atomic unsigned refcnt;
 };
 
@@ -712,11 +713,25 @@ struct raft_host_entry {
     uint8_t rd_packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
 
     /* write buffering */
-    const uint8_t *wr_packet_buffer;
+    _Atomic const uint8_t *wr_packet_buffer;
     off_t wr_offset;
     ssize_t wr_need;
     ssize_t wr_packet_length;
     pthread_rwlock_t wr_lock;
+
+    /* snapshot sending */
+    _Atomic const uint8_t *ss_data;
+    off_t ss_offset;
+    ssize_t ss_need;
+    uint32_t ss_length;
+    pthread_rwlock_t ss_lock;
+
+    uint32_t ss_tried_offset;      /* may have failed */
+    uint32_t ss_tried_length;      /* may have failed */
+    raft_state_t ss_tried_status;  /* may have failed */
+
+    uint32_t ss_last_index;        /* per RPC */
+    uint32_t ss_last_term;         /* per RPC */
 };
 
 struct raft_state {
@@ -724,14 +739,16 @@ struct raft_state {
     struct raft_log *log_head;
     struct raft_log *log_tail;
     uint32_t commit_index;      /* VARIABLE commitIndex */
+    _Atomic long log_length;
 
     /* serverVars = */
     uint32_t current_term;      /* VARIABLE currentTerm */
-    raft_state_t state;         /* VARIABLE state       */
     uint32_t voted_for;         /* VARIABLE votedFor    */
+    raft_state_t state;         /* VARIABLE state       */
+
+    uint32_t last_applied;
 
     uint32_t self_id;
-    uint32_t last_applied;
     uint32_t log_index;
     timems_t election_timer;
     bool     election;
@@ -742,7 +759,7 @@ struct raft_state {
      * typically this will be the raft thread, except for when the
      * leader is acting as a client to itself, where the mqtt thread
      * invokes the log append directly. */
-    pthread_mutex_t lock;      
+    pthread_mutex_t lock;
 };
 
 #include <stdarg.h>
@@ -758,7 +775,8 @@ struct raft_client_state {
     uint32_t current_leader_id;
     struct raft_host_entry *current_leader;
     _Atomic uint32_t sequence_num;
-    struct raft_log *log_pending;
+    struct raft_log *log_pending_head;
+    struct raft_log *log_pending_tail;
     struct raft_host_entry *unknown_clients;
     pthread_rwlock_t log_pending_lock;
     /* lock for the entire raft_client_state */
@@ -876,6 +894,22 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * TBC
  */
 #define RAFT_REGISTER_CLIENT_SIZE (0)
+
+/** RAFT_INSTALL_SNAPSHOT
+ *
+ * Header
+ * u32   leader_term
+ * u32   leader_id
+ * u32   last_index
+ * u32   last_term
+ * u32   offset
+ * u8    flags: 1 = done, 2 = has_last_config
+ * u16   last_config_length (optional)
+ * u8[]  last_config
+ * u32   data_length
+ * u8[]  data
+ */
+#define RAFT_INSTALL_SNAPSHOT_FIXED_SIZE (4+4+4+4+4+8)
 
 
 
