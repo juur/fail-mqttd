@@ -738,13 +738,31 @@ struct raft_state {
     timems_t next_ping;
     timems_t next_request_vote;
 
+    /* this is a 'global mutex' for which thread owns raft operations
+     * typically this will be the raft thread, except for when the
+     * leader is acting as a client to itself, where the mqtt thread
+     * invokes the log append directly. */
+    pthread_mutex_t lock;      
+};
+
+#include <stdarg.h>
+
+struct raft_local_append {
+    struct raft_local_append *next;
+    raft_log_t event;
+    va_list ap;
+};
+
+struct raft_client_state {
     /* for client */
-    uint32_t leader_id;
-    struct raft_host_entry *leader;
-    uint32_t sequence_num;
+    uint32_t current_leader_id;
+    struct raft_host_entry *current_leader;
+    _Atomic uint32_t sequence_num;
     struct raft_log *log_pending;
     struct raft_host_entry *unknown_clients;
     pthread_rwlock_t log_pending_lock;
+    /* lock for the entire raft_client_state */
+    pthread_rwlock_t lock;
 };
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
