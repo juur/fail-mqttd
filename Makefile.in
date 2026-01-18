@@ -45,7 +45,12 @@ sharedstatedir := @@SHAREDSTATEDIR@@
 sysconfdir     := @@SYSCONFDIR@@
 progprefix     := @@PROGPREFIX@@
 
-all_SRCS     := $(wildcard $(srcdir)/src/*.c)
+main_SRCS    := main.c constants.c
+raft_SRCS    := raft.c
+
+all_SRCS     := $(main_SRCS) @@EXTRASRCS@@
+all_SRCS     := $(addprefix $(srcdir)/src/,$(all_SRCS))
+
 all_HEADERS  := $(wildcard $(srcdir)/src/*.h)
 package_OBJS := $(addprefix $(objdir)/,$(notdir $(all_SRCS:.c=.o)))
 

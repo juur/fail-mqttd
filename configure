@@ -418,6 +418,11 @@ if [[ "${FEATURE_DEBUG}" -eq 1 || "${FEATURE_RAFT_DEBUG}" -eq 1 ]]; then
 	echo "#undef NDEBUG" >> "${OBJDIR}"/config.h
 fi
 
+EXTRASRCS=
+if [[ "${FEATURE_RAFT}" -eq 1 ]]; then
+	EXTRASRCS='$(raft_SRCS)' ${EXTRASRCS}
+fi
+
 # Finish config.h
 {
 	echo "#define SYSCONFDIR \"${SYSCONFDIR}\""
@@ -445,6 +450,7 @@ printf "\n#endif\n" >> "${OBJDIR}"/config.h
 # Create Makefile from template
 
 echo "Writing Makefile"
+
 
 ARGS=$(cat <<- __END
 	s#@@DEPS@@#${DEPS}#;
@@ -480,6 +486,7 @@ ARGS=$(cat <<- __END
 	s#@@VERSION@@#${VERSION}#;
 	s#@@PACKAGE@@#${PACKAGE}#;
 	s#@@PROGPREFIX@@#${PROGPREFIX}#;
+	s#@@EXTRASRCS@@#${EXTRASRCS}#;
 __END
 )
 

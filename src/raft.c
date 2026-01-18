@@ -1079,7 +1079,7 @@ static void raft_remove_and_free_unknown_host(struct raft_host_entry *entry)
 }
 
 static int raft_new_conn(int new_fd, struct raft_host_entry *unknown_host,
-        const struct sockaddr_in *sin, socklen_t /*sin_len*/)
+        [[maybe_unused]] const struct sockaddr_in *sin, socklen_t /*sin_len*/)
 {
     const uint8_t *ptr = NULL;
     raft_conn_t type;
@@ -2072,10 +2072,10 @@ static int raft_start_election(void)
 
 static int raft_tick(void)
 {
-    static uint32_t last_idx = 0, last_term = 0;
-    timems_t now = timems();
+    const timems_t now = timems();
 
 #ifdef FEATURE_RAFT_DEBUG
+    static uint32_t last_idx = 0, last_term = 0;
     static time_t last_run = 0;
     
     if (last_run == 0)
@@ -2835,7 +2835,7 @@ send_client_request_reply:
                     client->next_index--;
                 } else if (client->next_index > 1) {
                     /* TODO trigger RAFT_INSTALL_SNAPSHOT */
-                    warnx(BRED "raft_process_packet: i don't have what the client needs!" CRESET "\n");
+                    warnx("raft_process_packet: i don't have what the client needs!");
                 } else {
                     client->next_index = 1;
                 }

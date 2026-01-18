@@ -649,6 +649,16 @@ shit_usage:
  * debugging helpers
  */
 
+[[maybe_unused]] static int64_t timems(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
+        return -1;
+
+    return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+}
+
+
 [[gnu::nonnull(6,7)]]
 static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected,
         bool die, struct client *client,
@@ -3688,10 +3698,12 @@ struct topic *register_topic(const uint8_t *name,
 
     return ret;
 
+#ifdef FEATURE_RAFT
 fail:
     if (ret)
         free_topic(ret);
     return NULL;
+#endif
 }
 
 [[gnu::nonnull, gnu::warn_unused_result]]
@@ -8285,7 +8297,11 @@ int main(int argc, char *argv[])
         atexit(save_all_topics);
     }
 
-    if (opt_database || opt_raft) {
+    if (opt_database 
+#ifdef FEATURE_RAFT
+            || opt_raft
+#endif
+            ) {
         if (get_first_hwaddr(global_hwaddr, sizeof(global_hwaddr)) == -1)
             logger(LOG_EMERG, NULL, "main: cannot find MAC address");
 
