@@ -555,6 +555,11 @@ struct uuid_build {
     uint32_t node25;
 };
 
+struct start_args {
+    int fd;
+    int om_fd;
+};
+
 typedef enum {
     RAFT_HELLO = 0,
     RAFT_APPEND_ENTRIES,
