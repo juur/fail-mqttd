@@ -88,6 +88,13 @@ uninstall:
 
 .PHONY: mostlyclean clean distclean maintainer-clean
 
+maintainer-clean: distclean
+	$(RM) $(objdir)/config.status $(objdir)/config.log
+
+distclean: clean
+	$(RM) $(objdir)/config.h $(objdir)/Makefile $(objdir)/fail-mqttd.spec \
+		$(objdir)/fail-mqttd.service
+
 mostlyclean:
 	$(RM) $(package_OBJS) $(objdir)/$(PACKAGE)
 
