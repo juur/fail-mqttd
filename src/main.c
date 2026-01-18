@@ -1413,7 +1413,6 @@ static void close_socket(int *fd)
         close(*fd);
         *fd = -1;
     }
-    //abort();
 }
 
 [[gnu::nonnull]]
@@ -3668,21 +3667,21 @@ static struct message *find_message_by_uuid(const uint8_t uuid[static const UUID
 }
 
 [[gnu::nonnull, gnu::warn_unused_result]]
-static struct topic *find_topic(const uint8_t *name, bool active_only)
+static struct topic *find_topic(const uint8_t *name, bool active_only, bool need_lock)
 {
     errno = 0;
 
-    pthread_rwlock_rdlock(&global_topics_lock);
+    if (need_lock) pthread_rwlock_rdlock(&global_topics_lock);
     for (struct topic *tmp = global_topic_list; tmp; tmp = tmp->next)
     {
         if (!strcmp((const void *)name, (const void *)tmp->name)) {
             if (active_only && tmp->state != TOPIC_ACTIVE)
                 continue;
-            pthread_rwlock_unlock(&global_topics_lock);
+            if (need_lock) pthread_rwlock_unlock(&global_topics_lock);
             return tmp;
         }
     }
-    pthread_rwlock_unlock(&global_topics_lock);
+    if (need_lock) pthread_rwlock_unlock(&global_topics_lock);
 
     return NULL;
 }
@@ -3716,7 +3715,7 @@ static struct topic *find_or_register_topic(const uint8_t *name)
     struct topic *topic = NULL;
     const uint8_t *tmp_name = NULL;
 
-    if ((topic = find_topic(name, false)) == NULL) {
+    if ((topic = find_topic(name, false, true)) == NULL) {
         if ((tmp_name = (void *)strdup((const char *)name)) == NULL)
             goto fail;
 
@@ -7744,13 +7743,16 @@ static void close_session(struct session *session)
                         );
                 if ( (p->register_topic.flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) )
                     rdbg_cprintf("msg_uuid=%s ", uuid_to_string(p->register_topic.msg_uuid));
+                break;
+
             default:
-            break;
+                break;
         }
         rdbg_cprintf("\n");
 #endif
     }
 
+    /* Debugging as save state is incomplete */
     abort();
 
     pthread_rwlock_rdlock(&global_topics_lock);
@@ -7823,31 +7825,31 @@ static int raft_reset_ss_state(struct raft_host_entry *client, bool need_lock)
     client->ss_offset = 0;
     client->ss_tried_offset = 0;
     client->ss_tried_length = 0;
-    client->ss_tried_offset = RAFT_FALSE;
+    client->ss_tried_status = RAFT_ERR;
 
     if (need_lock)
-        pthread_rwlock_wrlock(&client->ss_lock);
+        pthread_rwlock_unlock(&client->ss_lock);
 
     return 0;
 }
 
-static int raft_update_leader_id(uint32_t leader_id)
+static int raft_update_leader_id(uint32_t leader_id, bool need_lock)
 {
 
     if (leader_id == NULL_ID) {
-        pthread_rwlock_wrlock(&raft_client_state.lock);
+        if (need_lock) pthread_rwlock_wrlock(&raft_client_state.lock);
         raft_client_state.current_leader_id = NULL_ID;
         raft_client_state.current_leader = NULL;
-        pthread_rwlock_unlock(&raft_client_state.lock);
+        if (need_lock) pthread_rwlock_unlock(&raft_client_state.lock);
         return 0;
     }
 
     for (unsigned idx = 0; idx < raft_num_peers; idx++)
         if (raft_peers[idx].server_id == leader_id) {
-            pthread_rwlock_wrlock(&raft_client_state.lock);
+            if (need_lock) pthread_rwlock_wrlock(&raft_client_state.lock);
             raft_client_state.current_leader_id = leader_id;
             raft_client_state.current_leader = &raft_peers[idx];
-            pthread_rwlock_unlock(&raft_client_state.lock);
+            if (need_lock) pthread_rwlock_unlock(&raft_client_state.lock);
             return 0;
         }
 
@@ -7921,6 +7923,51 @@ static int raft_close(struct raft_host_entry *client)
     return 0;
 }
 
+[[gnu::warn_unused_result]]
+static struct raft_log *raft_alloc_log(raft_conn_t conn_type, raft_log_t event)
+{
+    struct raft_log *ret;
+    bool mutex_init = false, cond_init = false;
+
+    assert(conn_type < RAFT_MAX_CONN);
+    assert(event < RAFT_MAX_LOG);
+
+    if ((ret = calloc(1, sizeof(struct raft_log))) == NULL)
+        return NULL;
+
+    if (conn_type == RAFT_CLIENT) {
+        if (pthread_mutex_init(&ret->mutex, NULL) != 0)
+            goto fail;
+        else
+            mutex_init = true;
+
+        if (pthread_cond_init(&ret->cv, NULL) != 0)
+            goto fail;
+        else
+            cond_init = true;
+    }
+
+    ret->done = false;
+    ret->role = conn_type;
+    ret->event = event;
+
+    return ret;
+
+fail:
+    if (ret) {
+        if (conn_type == RAFT_CLIENT) {
+            if (cond_init)
+                pthread_cond_destroy(&ret->cv);
+            if (mutex_init)
+                pthread_mutex_destroy(&ret->mutex);
+        }
+
+        free(ret);
+    }
+
+    return NULL;
+}
+
 [[gnu::nonnull]]
 static int raft_free_log(struct raft_log *entry)
 {
@@ -7936,6 +7983,8 @@ static int raft_free_log(struct raft_log *entry)
         default:
             errno = EINVAL;
             rc = -1;
+            warnx("raft_free_log: attempt to free unknown event type %u", entry->event);
+            break;
     }
 
     if (entry->role == RAFT_CLIENT) {
@@ -7979,7 +8028,8 @@ found_head:
 
     entry->next = NULL;
 
-    (*log_len)--;
+    if (log_len)
+        (*log_len)--;
 
     if (lock)
         pthread_rwlock_unlock(lock);
@@ -8039,20 +8089,27 @@ static int raft_commit_and_advance(void)
 
                 if (log_entry->register_topic.retained)
                     if ((message = find_message_by_uuid(log_entry->register_topic.msg_uuid)) == NULL) {
-                        errno = EINVAL;
+                        errno = ENOENT;
                         warn("raft_commit_and_advance: can't find retained message for UUID");
+                        goto fail;
                     }
 
-                if ((topic = find_topic(log_entry->register_topic.name, false)) != NULL) {
+                pthread_rwlock_wrlock(&global_topics_lock);
+                if ((topic = find_topic(log_entry->register_topic.name, false, false)) != NULL) {
                     if (topic->state != TOPIC_PREACTIVE)
                         goto fail;
                     topic->state = TOPIC_ACTIVE;
+                    pthread_rwlock_unlock(&global_topics_lock);
                     rdbg_printf("RAFT raft_commit_and_advance: activated topic <%s>\n", log_entry->register_topic.name);
-                } else if ((topic = register_topic(log_entry->register_topic.name, log_entry->register_topic.uuid, false)) == NULL) {
-                    warn("raft_commit_and_advance: register_topic");
-                    goto fail;
                 } else {
-                    rdbg_printf("RAFT raft_commit_and_advance: registered new topic <%s>\n", log_entry->register_topic.name);
+                    pthread_rwlock_unlock(&global_topics_lock);
+
+                    if ((topic = register_topic(log_entry->register_topic.name, log_entry->register_topic.uuid, false)) == NULL) {
+                        warn("raft_commit_and_advance: register_topic");
+                        goto fail;
+                    } else {
+                        rdbg_printf("RAFT raft_commit_and_advance: registered new topic <%s>\n", log_entry->register_topic.name);
+                    }
                 }
 
                 if (message && topic->retained_message == message) {
@@ -8133,15 +8190,11 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
     rdbg_printf("RAFT raft_leader_log_appendv: %s\n",
             raft_log_str[event]);
 
-    if ((new_log = calloc(1, sizeof(struct raft_log))) == NULL)
+    if ((new_log = raft_alloc_log(RAFT_PEER, event)) == NULL)
         goto fail;
 
-    new_log->role = RAFT_PEER;
-    new_log->event = event;
     new_log->term = raft_state.current_term;
     new_log->index = ++raft_state.log_index;
-    new_log->next = NULL;
-    new_log->flags = 0;
 
     switch(event)
     {
@@ -8213,11 +8266,14 @@ static int raft_leader_log_append(raft_log_t event, ...)
     return rc;
 }
 
+/**
+ * caller must have pending_event->mutex
+ */
 static int raft_await_client_response(struct raft_log *pending_event)
 {
     int rc;
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_REALTIME, &ts); /* TODO convert to CLOCK_MONOTONIC to avoid timejumps */
     ts.tv_sec += 5;
 
 
@@ -8225,7 +8281,6 @@ static int raft_await_client_response(struct raft_log *pending_event)
     {
         if ((rc = pthread_cond_timedwait(&pending_event->cv,
                         &pending_event->mutex, &ts)) != 0) {
-            pthread_mutex_unlock(&pending_event->mutex);
             errno = rc;
             return -1;
         }
@@ -8250,18 +8305,13 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
     rdbg_printf("RAFT raft_client_log_sendv: %s\n",
             raft_log_str[event]);
 
-    if ((new_client_event = calloc(1, sizeof(struct raft_log))) == NULL)
+    if ((new_client_event = raft_alloc_log(RAFT_CLIENT, event)) == NULL)
         goto fail;
 
-    new_client_event->role = RAFT_CLIENT;
-    new_client_event->event = event;
     /* sequence_num is _Atomic */
     new_client_event->sequence_num = ++raft_client_state.sequence_num;
-    new_client_event->done = false;
 
-    if ( ((rc = pthread_mutex_init(&new_client_event->mutex, NULL)) != 0)
-            || ((rc = pthread_cond_init(&new_client_event->cv, NULL)) != 0)
-            || ((rc = pthread_mutex_trylock(&new_client_event->mutex)) != 0) ) {
+    if ( ((rc = pthread_mutex_trylock(&new_client_event->mutex)) != 0) ) {
         warnx("raft_client_log_sendv: pthread_init: %s", strerror(rc));
         errno = rc;
         goto fail;
@@ -8280,7 +8330,6 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
 
     inserted = true;
     pthread_rwlock_unlock(&raft_client_state.log_pending_lock);
-
 
     switch (event)
     {
@@ -8325,28 +8374,23 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
 
     if (rc == -1) {
         pthread_mutex_unlock(&new_client_event->mutex);
-        raft_remove_log(new_client_event, &raft_client_state.log_pending_head,
-                &raft_client_state.log_pending_tail,
-                &raft_client_state.log_pending_lock, NULL);
         goto fail;
     }
 
-    if (new_client_event) {
-        if ((rc = raft_await_client_response(new_client_event)) == -1) {
-            warn("raft_client_log_sendv: raft_await_client_response");
-            raft_remove_log(new_client_event, &raft_client_state.log_pending_head,
-                    &raft_client_state.log_pending_tail,
-                    &raft_client_state.log_pending_lock, NULL);
-            goto fail;
-        }
-
-        raft_remove_log(new_client_event, &raft_client_state.log_pending_head,
-                &raft_client_state.log_pending_tail,
-                &raft_client_state.log_pending_lock, NULL);
+    if ((rc = raft_await_client_response(new_client_event)) == -1) {
         pthread_mutex_unlock(&new_client_event->mutex);
-        raft_free_log(new_client_event);
-        return 0;
+        warn("raft_client_log_sendv: raft_await_client_response");
+        goto fail;
     }
+
+    /* success */
+
+    raft_remove_log(new_client_event, &raft_client_state.log_pending_head,
+            &raft_client_state.log_pending_tail,
+            &raft_client_state.log_pending_lock, NULL);
+    pthread_mutex_unlock(&new_client_event->mutex);
+    raft_free_log(new_client_event);
+    return 0;
 
 fail:
     if (new_client_event) {
@@ -8367,9 +8411,12 @@ static int raft_client_log_send(raft_log_t event, ...)
     va_start(ap, event);
     pthread_mutex_lock(&raft_state.lock);
     if (raft_state.state == RAFT_STATE_LEADER) {
+        /* we're in raft_thread so need to preserve our lock of raft_state,
+         * so the main thread doesn't touch it */
         rc = raft_leader_log_appendv(event, ap);
         pthread_mutex_unlock(&raft_state.lock);
     } else {
+        /* we're not in raft_thread, so will not touch raft_state */
         pthread_mutex_unlock(&raft_state.lock);
         rc = raft_client_log_sendv(event, ap);
     }
@@ -8761,6 +8808,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 {
     ssize_t sendsz;
     uint8_t *packet_buffer = NULL, *ptr;
+    void *tmp_packet_buffer = NULL;
     struct raft_packet packet;
 
     uint16_t arg_req_len = 0;
@@ -8789,6 +8837,10 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
         return 0;
     } else if (mode == RAFT_CLIENT && raft_client_state.current_leader == NULL) {
         warnx("raft_send: current_leader == NULL");
+        errno = EBADF;
+        return -1;
+    } else if (mode == RAFT_SERVER && (client == NULL || client->peer_fd == -1)) {
+        warnx("raft_send: RAFT_SERVER without client or peer_fd");
         errno = EBADF;
         return -1;
     }
@@ -8931,6 +8983,11 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 
                 for (idx = 0; tmp && idx < arg_num_entries; idx++)
                 {
+                    if ( ((size_t)packet.length) + RAFT_LOG_FIXED_SIZE > RAFT_MAX_PACKET_SIZE) {
+                        errno = EOVERFLOW;
+                        goto fail;
+                    }
+
                     packet.length += RAFT_LOG_FIXED_SIZE;
                     switch (tmp->event)
                     {
@@ -9158,18 +9215,21 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     }
 
     unsigned sent = 0;
-    void *tmp_packet_buffer;
 
     if (client == NULL && mode != RAFT_CLIENT) {
-        for (unsigned idx = 1; idx < raft_num_peers; idx++) {
+        for (unsigned idx = 1; idx < raft_num_peers; idx++)
+        {
             if (raft_peers[idx].peer_fd == -1)
                 continue;
             if ((tmp_packet_buffer = malloc(sendsz)) == NULL)
                 goto fail;
+
             memcpy(tmp_packet_buffer, packet_buffer, sendsz);
+
             if (raft_add_write(&raft_peers[idx], tmp_packet_buffer, sendsz) == -1) {
                 warn("raft_send: bcast raft_add_write(%u)", idx);
                 free(tmp_packet_buffer);
+                tmp_packet_buffer = NULL;
                 raft_close(&raft_peers[idx]);
             } else if (raft_try_write(&raft_peers[idx]) == -1) {
                 if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR)
@@ -9231,9 +9291,10 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
     return sent;
 
 fail:
-    abort();
     if (packet_buffer)
         free(packet_buffer);
+    if (tmp_packet_buffer)
+        free(tmp_packet_buffer);
     va_end(ap);
     return -1;
 }
@@ -9268,7 +9329,8 @@ static int raft_change_to(raft_state_t mode)
             break;
 
         case RAFT_STATE_LEADER:
-            raft_update_leader_id(raft_state.self_id);
+            pthread_rwlock_wrlock(&raft_client_state.lock);
+            raft_update_leader_id(raft_state.self_id, false);
 
             const uint32_t last = raft_state.log_tail ? raft_state.log_tail->index : 0;
 
@@ -9288,6 +9350,10 @@ static int raft_change_to(raft_state_t mode)
     }
 
     raft_state.state = mode;
+
+    if (mode == RAFT_STATE_LEADER)
+        pthread_rwlock_unlock(&raft_client_state.lock);
+
     return mode;
 }
 
@@ -9437,7 +9503,7 @@ static int raft_start_election(void)
     raft_reset_election_timer();
 
     /* leader unknown untill RAFT_APPEND_ENTRIES */
-    raft_update_leader_id(NULL_ID);
+    raft_update_leader_id(NULL_ID, true);
 
     rdbg_printf(BWHT "RAFT raft_change_to: starting election (new term will be %u)" CRESET "\n",
             raft_state.current_term);
@@ -9456,14 +9522,15 @@ static int raft_start_election(void)
 
 static int raft_tick(void)
 {
-    static time_t last_run = 0;
     static uint32_t last_idx = 0, last_term = 0;
     timems_t now = timems();
 
+#ifdef FEATURE_RAFT_DEBUG
+    static time_t last_run = 0;
+    
     if (last_run == 0)
         last_run = time(NULL) - 1;
 
-#ifdef FEATURE_RAFT_DEBUG
     if (time(NULL) != last_run) {
         const uint32_t log_index = raft_state.log_tail ?
             raft_state.log_tail->index : 0;
@@ -9499,6 +9566,7 @@ static int raft_tick(void)
                 {
                     case RAFT_LOG_REGISTER_TOPIC:
                         rdbg_cprintf(" <%s>", ent->register_topic.name);
+                        break;
                     default:
                         break;
                 }
@@ -9628,7 +9696,10 @@ static int raft_tick(void)
 
     raft_tick_connection_check();
 
+#ifdef FEATURE_RAFT_DEBUG
     last_run = time(NULL);
+#endif
+
     return 0;
 }
 
@@ -9645,7 +9716,7 @@ static raft_status_t process_append_entries(struct raft_host_entry *client,
         reply = RAFT_FALSE;
         goto append_reply;
     } else {
-        raft_update_leader_id(leader_id);
+        raft_update_leader_id(leader_id, true);
         raft_reset_election_timer();
     }
 
@@ -9749,7 +9820,7 @@ got_prev_log:
 step_down:
         raft_change_to(RAFT_STATE_FOLLOWER);
         raft_stop_election();
-        raft_update_leader_id(leader_id);
+        raft_update_leader_id(leader_id, true);
     }
 
     /* This state may never happen, but just in case */
@@ -9775,9 +9846,6 @@ append_reply:
     }
 
     return reply;
-
-[[maybe_unused]] fail:
-    return RAFT_ERR;
 }
 
 [[gnu::nonnull]]
@@ -9889,14 +9957,16 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                 type = *ptr++;
                 /* flags = * */ ptr++;
 
+                if (bytes_remaining < RAFT_CLIENT_REQUEST_SIZE)
+                    goto fail;
+                bytes_remaining -= RAFT_CLIENT_REQUEST_SIZE;
+
                 /* TODO read the actual request */
                 memcpy(&len, ptr, sizeof(len));
                 ptr += sizeof(len); len = ntohs(len);
 
                 if (len > bytes_remaining)
                     goto fail;
-
-                bytes_remaining -= RAFT_CLIENT_REQUEST_SIZE;
 
                 if (raft_state.state != RAFT_STATE_LEADER) {
                     reply = RAFT_NOT_LEADER;
@@ -9962,11 +10032,14 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                             goto fail;
 
                         rdbg_printf("RAFT raft_recv: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n", temp_string);
-                        raft_leader_log_append(type,
+                        int rc = raft_leader_log_append(type,
                                 temp_string, uuid, flags,
                                 (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) ? msg_uuid : NULL);
                         free(temp_string);
                         temp_string = NULL;
+                        if (rc == -1) {
+                            reply = RAFT_ERR;
+                        }
                         break;
 
                     default:
@@ -9999,7 +10072,7 @@ send_client_request_reply:
                     raft_update_term(term);
                     raft_change_to(RAFT_STATE_FOLLOWER);
                     raft_stop_election();
-                    raft_update_leader_id(NULL_ID);
+                    raft_update_leader_id(NULL_ID, true);
                 }
 
                 bool is_upto_date = (last_log_term > log_term) ||
@@ -10037,6 +10110,11 @@ send_client_request_reply:
                 memcpy(&leader_commit, ptr, sizeof(uint32_t))  ; ptr += sizeof(uint32_t) ; leader_commit = ntohl(leader_commit)   ;
                 memcpy(&num_entries, ptr, sizeof(uint32_t))    ; ptr += sizeof(uint32_t) ; num_entries = ntohl(num_entries)       ;
 
+                if ( ((size_t)num_entries) * RAFT_LOG_FIXED_SIZE > RAFT_MAX_PACKET_SIZE) {
+                    errno = EOVERFLOW;
+                    goto fail;
+                }
+
                 bytes_remaining -= RAFT_APPEND_ENTRIES_FIXED_SIZE;
 
                 uint32_t new_match_index = prev_log_index;
@@ -10049,7 +10127,6 @@ send_client_request_reply:
 
                 /* 'discovers server with higher term' is valid exit from
                  * Leader state */
-                //assert(raft_state.mode != RAFT_MODE_LEADER);
 
                 /* go over each log entry, building a temporary list starting with
                  * log_entry_head */
@@ -10090,11 +10167,9 @@ send_client_request_reply:
 
                     bytes_remaining -= RAFT_LOG_FIXED_SIZE;
 
-                    if ((log_entry = calloc(1, sizeof(struct raft_log))) == NULL)
+                    if ((log_entry = raft_alloc_log(RAFT_PEER, type)) == NULL)
                         goto fail;
 
-                    log_entry->role = RAFT_PEER;
-                    log_entry->event = type;
                     log_entry->flags = flags;
                     log_entry->index = index;
                     log_entry->term = term;
@@ -10183,12 +10258,12 @@ send_client_request_reply:
                 new_match_index = ntohl(new_match_index);
 
                 if (client_term > raft_state.current_term) {
-                    dbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES_REPLY has higher term from id=%u, converting\n",
+                    rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES_REPLY has higher term from id=%u, converting\n",
                             client->server_id);
                     raft_update_term(client_term);
                     raft_change_to(RAFT_STATE_FOLLOWER);
                     raft_stop_election();
-                    raft_update_leader_id(NULL_ID);
+                    raft_update_leader_id(NULL_ID, true);
                     break;
                 }
 
@@ -10246,7 +10321,7 @@ send_client_request_reply:
                     raft_update_term(term);
                     raft_change_to(RAFT_STATE_FOLLOWER);
                     raft_stop_election(); /* triggers raft_reset_election_timer() */
-                    raft_update_leader_id(NULL_ID);
+                    raft_update_leader_id(NULL_ID, true);
                     break;
                 }
 
@@ -10286,7 +10361,7 @@ send_client_request_reply:
 
                 if (votes >= need) {
                     rdbg_printf(BYEL "RAFT raft_recv: RAFT_REQUEST_VOTE_REPLY: i have won!" CRESET "\n");
-                    raft_update_leader_id(raft_state.self_id);
+                    raft_update_leader_id(raft_state.self_id, true);
                     raft_change_to(RAFT_STATE_LEADER);
                     raft_stop_election();
                 }
@@ -10523,7 +10598,7 @@ static void raft_clean(void)
     }
 
     if (global_raft_fd != -1) {
-        dbg_printf("     close_socket: closing raft_fd %d\n", global_raft_fd);
+        rdbg_printf("     close_socket: closing raft_fd %d\n", global_raft_fd);
         close_socket(&global_raft_fd);
     }
 }
@@ -10618,11 +10693,11 @@ static void session_tick(void)
         if (session->state == SESSION_DELETE) {
             if (GET_REFCNT(&session->refcnt) > 0) {
                 if (++session->kill_attempts > 1)
-                    rdbg_printf("[%2d] session_tick: can't kill session refcnt is %u (attempts %u)\n",
+                    dbg_printf("[%2d] session_tick: can't kill session refcnt is %u (attempts %u)\n",
                             session->id, GET_REFCNT(&session->refcnt),
                             session->kill_attempts);
             } else if (session->will_at) {
-                rdbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
+                dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
                         session->id);
                 goto force_will;
             } else {
@@ -10634,11 +10709,11 @@ static void session_tick(void)
 
         if (session->client == NULL) { /* SESSION_ACTIVE */
             if (session->expires_at == 0 || now > session->expires_at) {
-                rdbg_printf("[%2d] session_tick: setting SESSION_DELETE refcnt is %u\n",
+                dbg_printf("[%2d] session_tick: setting SESSION_DELETE refcnt is %u\n",
                         session->id, GET_REFCNT(&session->refcnt));
 
                 if (session->will_at) {
-                    rdbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
+                    dbg_printf(BBLU"[%2d] session_tick: force_will"CRESET"\n",
                             session->id);
                     goto force_will;
                 }
@@ -10825,7 +10900,6 @@ static void *raft_loop(void *start_args)
                 FD_SET(raft_peers[idx].peer_fd, &fds_exc);
                 if (raft_peers[idx].wr_packet_buffer)
                     FD_SET(raft_peers[idx].peer_fd, &fds_out);
-
             }
         }
         for (struct raft_host_entry *tmp = raft_client_state.unknown_clients; tmp; tmp = tmp->unknown_next)
@@ -10868,7 +10942,7 @@ static void *raft_loop(void *start_args)
         {
             if (raft_peers[idx].peer_fd != -1) {
                 if (FD_ISSET(raft_peers[idx].peer_fd, &fds_exc)) {
-                    dbg_printf("RAFT main_loop: fds_exc, closing peer\n");
+                    rdbg_printf("RAFT main_loop: fds_exc, closing peer\n");
                     raft_close(&raft_peers[idx]);
                     continue;
                 }
@@ -10916,7 +10990,7 @@ static void *raft_loop(void *start_args)
                 }
 
                 if (FD_ISSET(tmp_host->peer_fd, &fds_in)) {
-                    if (raft_new_conn(-1, tmp_host, NULL, -1) == -1) {
+                    if (raft_new_conn(-1, tmp_host, NULL, 0) == -1) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                             continue;
                         warn("main_loop: tmp_host: raft_new_conn");
@@ -10933,11 +11007,11 @@ static void *raft_loop(void *start_args)
             socklen_t sin_len = sizeof(sin);
 
             if ((tmp_fd = accept(raft_fd, (struct sockaddr *)&sin, &sin_len)) != -1) {
-                dbg_printf("RAFT main_loop: accept fd %u\n", tmp_fd);
+                rdbg_printf("RAFT main_loop: accept fd %u\n", tmp_fd);
                 if (raft_new_conn(tmp_fd, NULL, &sin, sin_len) == -1) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                         goto raft_new_out;
-                    dbg_printf("RAFT main_loop: raft_new_conn: failed: %s\n", strerror(errno));
+                    rdbg_printf("RAFT main_loop: raft_new_conn: failed: %s\n", strerror(errno));
                     close_socket(&tmp_fd);
                 }
             } else
@@ -11237,7 +11311,7 @@ static int load_topic(datum /* key */, datum content)
     const struct topic_save *save = (void *)content.dptr;
     struct topic *topic = NULL;
 
-    if (find_topic((void *)save->name, false) != NULL) {
+    if (find_topic((void *)save->name, false, true) != NULL) {
         logger(LOG_WARNING, NULL, "open_databases: duplicate topic for %s",
                 save->name);
         errno = EEXIST;
@@ -11526,7 +11600,7 @@ int main(int argc, char *argv[])
             logger(LOG_WARNING, NULL,
                     "main: command line topic creation: <%s> is not a valid topic filter, skipping",
                     argv[optind]);
-        } else if (find_topic((const uint8_t *)argv[optind], false) != NULL) {
+        } else if (find_topic((const uint8_t *)argv[optind], false, true) != NULL) {
             logger(LOG_WARNING, NULL,
                     "main: command line topic creation: topic <%s> already exists, skipping",
                     argv[optind]);

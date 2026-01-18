@@ -728,7 +728,7 @@ struct raft_host_entry {
 
     uint32_t ss_tried_offset;      /* may have failed */
     uint32_t ss_tried_length;      /* may have failed */
-    raft_state_t ss_tried_status;  /* may have failed */
+    raft_status_t ss_tried_status;  /* may have failed */
 
     uint32_t ss_last_index;        /* per RPC */
     uint32_t ss_last_term;         /* per RPC */
