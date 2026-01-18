@@ -2193,9 +2193,9 @@ static struct session *alloc_session(struct client *client)
     if ((ret = calloc(1, sizeof(struct session))) == NULL)
         return NULL;
 
-    if (pthread_rwlock_init(&ret->subscriptions_lock, NULL) == -1)
+    if (pthread_rwlock_init(&ret->subscriptions_lock, NULL) != 0)
         goto fail;
-    if (pthread_rwlock_init(&ret->delivery_states_lock, NULL) == -1)
+    if (pthread_rwlock_init(&ret->delivery_states_lock, NULL) != 0)
         goto fail;
 
     if (client) {
@@ -2334,6 +2334,9 @@ static struct message *alloc_message(const uint8_t uuid[const UUID_SIZE])
         goto fail;
     else if (uuid != NULL)
         memcpy(ret->uuid, uuid, UUID_SIZE);
+
+    if (pthread_rwlock_init(&ret->delivery_states_lock, NULL) != 0)
+        goto fail;
 
     pthread_rwlock_wrlock(&global_messages_lock);
     ret->next = global_message_list;
