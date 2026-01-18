@@ -159,10 +159,12 @@ static int raft_recv(struct raft_host_entry *client);
             break;
 
 #ifdef FEATURE_RAFT_DEBUG
-        rdbg_printf("RAFT raft_save_state: [%02u-%02u/%02u]: %s:",
+        rdbg_printf("RAFT raft_save_state: [t:%02u-i:%02u/s:%02u vs ci:%02u|la:%02x]: %s:",
                 p->term,
                 p->index,
                 save_index,
+                raft_state.commit_index,
+                raft_state.last_applied,
                 raft_log_str[p->event]);
         switch(p->event)
         {
@@ -947,17 +949,24 @@ fail:
 int raft_client_log_send(raft_log_t event, ...)
 {
     int rc;
-    const bool is_raft_thread = pthread_equal(pthread_self(), raft_thread_id);
     va_list ap;
 
+    rdbg_printf("RAFT %lu vs %lu\n", pthread_self(), raft_thread_id);
+
     va_start(ap, event);
-    if (is_raft_thread /*raft_state.state == RAFT_STATE_LEADER*/) {
-        pthread_mutex_lock(&raft_state.lock);
+
+    /* Just checking that pthread_self() == raft_thread_id won't work,
+     * as there is no easy solution for raft_client_log_sendv() to send
+     * to "self" */
+
+    pthread_mutex_lock(&raft_state.lock);
+    if (raft_state.state == RAFT_STATE_LEADER) {
         /* we're in raft_thread so need to preserve our lock of raft_state,
          * so the main thread doesn't touch it */
         rc = raft_leader_log_appendv(event, ap);
         pthread_mutex_unlock(&raft_state.lock);
     } else {
+        pthread_mutex_unlock(&raft_state.lock);
         /* we're not in raft_thread, so will not touch raft_state */
         rc = raft_client_log_sendv(event, ap);
     }
