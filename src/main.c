@@ -223,6 +223,7 @@ static _Atomic bool has_clients = false;
 static struct raft_host_entry *raft_peers = NULL;
 static unsigned raft_num_peers = 1;
 static _Atomic int raft_active_peers = 0;
+static pthread_t raft_thread_id;
 #endif
 
 /*
@@ -8407,17 +8408,18 @@ fail:
 static int raft_client_log_send(raft_log_t event, ...)
 {
     int rc;
+    const bool is_raft_thread = pthread_equal(pthread_self(), raft_thread_id);
     va_list ap;
+
     va_start(ap, event);
-    pthread_mutex_lock(&raft_state.lock);
-    if (raft_state.state == RAFT_STATE_LEADER) {
+    if (is_raft_thread /*raft_state.state == RAFT_STATE_LEADER*/) {
+        pthread_mutex_lock(&raft_state.lock);
         /* we're in raft_thread so need to preserve our lock of raft_state,
          * so the main thread doesn't touch it */
         rc = raft_leader_log_appendv(event, ap);
         pthread_mutex_unlock(&raft_state.lock);
     } else {
         /* we're not in raft_thread, so will not touch raft_state */
-        pthread_mutex_unlock(&raft_state.lock);
         rc = raft_client_log_sendv(event, ap);
     }
     va_end(ap);
@@ -9849,18 +9851,23 @@ append_reply:
 }
 
 [[gnu::nonnull]]
+/** the caller (e.g. raft_recv) needs to ensure that client->rd_packet_buffer
+ * has been verified within sensible min/max bounds, e.g. raft_rpc_settings.
+ * this function will check variable length elements
+ */
 static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
 {
-    uint8_t *temp_string = NULL;
-    const uint8_t *ptr = client->rd_packet_buffer;
-    size_t bytes_remaining = client->rd_packet_length;
-    uint32_t term = 0;
-    struct raft_log *log_entry = NULL, *log_entry_head = NULL;
-    struct raft_log *prev_log_entry = NULL;
     const uint32_t log_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
     const uint32_t log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
-
+    const uint8_t *ptr = client->rd_packet_buffer;
+    size_t bytes_remaining = client->rd_packet_length;
+    struct raft_log *log_entry = NULL, *log_entry_head = NULL;
+    struct raft_log *prev_log_entry = NULL;
+    uint32_t term = 0;
     uint32_t leader_id;
+    uint8_t *temp_string = NULL;
+
+    assert(rpc < RAFT_MAX_RPC);
 
     pthread_rwlock_rdlock(&raft_client_state.lock);
     leader_id = raft_client_state.current_leader_id;
@@ -9924,8 +9931,8 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                     pthread_rwlock_unlock(&raft_client_state.log_pending_lock);
 
                     if (match == NULL) {
-                        errno = ENOENT;
-                        goto fail;
+                        /* late replies are not this bad */
+                        goto done;
                     }
 
                     pthread_mutex_lock(&match->mutex);
@@ -9957,8 +9964,6 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                 type = *ptr++;
                 /* flags = * */ ptr++;
 
-                if (bytes_remaining < RAFT_CLIENT_REQUEST_SIZE)
-                    goto fail;
                 bytes_remaining -= RAFT_CLIENT_REQUEST_SIZE;
 
                 /* TODO read the actual request */
@@ -10874,6 +10879,8 @@ static RETURN_TYPE openmetrics_loop(void *start_args)
 static void *raft_loop(void *start_args)
 {
     const int raft_fd = ((const struct start_args *)start_args)->raft_fd;
+    
+    raft_thread_id = pthread_self();
 
     raft_init();
 
