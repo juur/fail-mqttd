@@ -788,6 +788,28 @@ struct raft_client_state {
     pthread_rwlock_t lock;
 };
 
+struct send_state {
+    uint8_t *ptr;
+    uint16_t arg_req_len;
+
+    uint8_t *arg_str;
+    uint8_t *arg_uuid;
+    uint8_t *arg_msg_uuid;
+    uint8_t arg_flags;
+};
+
+struct raft_impl {
+    int (*free_log)(struct raft_log *);
+    int (*commit_and_advance)(struct raft_log *);
+    int (*leader_append)(struct raft_log *, va_list);
+    int (*client_append)(struct raft_log *, raft_log_t, va_list);
+    int (*pre_send)(struct raft_log *, struct send_state *);
+    int (*fill_send)(struct send_state *, const struct raft_log *);
+    raft_status_t (*process_packet)(size_t *, uint8_t **, raft_log_t);
+
+    const char *const name;
+};
+
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
 extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
 extern const type_t property_to_type[MQTT_PROPERTY_IDENT_MAX];

@@ -83,8 +83,10 @@ extern bool opt_database;
 extern struct in_addr opt_listen;
 extern in_port_t opt_port;
 extern pthread_rwlock_t global_topics_lock;
+extern _Atomic bool running;
 
 static int global_raft_fd = -1;
+const struct raft_impl *raft_impl = NULL;
 
 void close_socket(int *fd);
 void sock_linger(int fd);
@@ -518,6 +520,7 @@ static int raft_free_log(struct raft_log *entry)
     switch (entry->event)
     {
         case RAFT_LOG_REGISTER_TOPIC:
+            /* IMPL */
             if (entry->register_topic.name)
                 free(entry->register_topic.name);
             break;
@@ -625,6 +628,7 @@ static int raft_commit_and_advance(void)
     switch (log_entry->event)
     {
         case RAFT_LOG_REGISTER_TOPIC:
+            /* IMPL */
             {
                 struct topic *topic = NULL;
                 struct message *message = NULL;
@@ -740,6 +744,7 @@ static int raft_leader_log_appendv(raft_log_t event, va_list ap)
 
     switch(event)
     {
+        /* IMPL */
         /* name, *uuid, flags, [msg_uuid] */
         case RAFT_LOG_REGISTER_TOPIC:
             new_log->register_topic.name = (void *)strdup((void *)va_arg(ap, uint8_t *));
@@ -875,6 +880,7 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
 
     switch (event)
     {
+        /* IMPL */
         /* name, *uuid, flags, [msg_uuid] */
         case RAFT_LOG_REGISTER_TOPIC:
             str               = va_arg(ap, uint8_t *);
@@ -1476,14 +1482,15 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                 case RAFT_LOG_REGISTER_TOPIC:
                     {
                         arg_event = va_arg(ap, struct raft_log *);
+                        /* IMPL after the above !*/
                         arg_str = arg_event->register_topic.name;
                         arg_uuid = arg_event->register_topic.uuid;
                         arg_flags = arg_event->register_topic.flags;
 
+                        arg_req_len += sizeof(uint32_t); /* flags */
                         arg_req_len += sizeof(uint16_t); /* strlen */
                         arg_req_len += strlen((const void *)arg_str) + 1;
                         arg_req_len += UUID_SIZE;
-                        arg_req_len += sizeof(uint32_t); /* flags */
 
                         if (arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
                             arg_msg_uuid = arg_event->register_topic.msg_uuid;
@@ -1542,12 +1549,13 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     switch (tmp->event)
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
+                            /* IMPL - share with pre_send */
                             arg_str = tmp->register_topic.name;
                             arg_req_len += sizeof(uint32_t); /* u32 flags */
                             arg_req_len += sizeof(uint16_t); /* u16 strlen */
-                            arg_req_len += tmp->register_topic.length;
-                            arg_req_len++; /* 0 terminator */
+                            arg_req_len += tmp->register_topic.length + 1; /* NUL terminator */
                             arg_req_len += UUID_SIZE;
+
                             if (tmp->register_topic.retained)
                                 arg_req_len += UUID_SIZE;
                             /* TODO */
@@ -1636,6 +1644,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
             switch ((raft_log_t)arg_req_type)
             {
                 case RAFT_LOG_REGISTER_TOPIC:
+                    /* IMPL */
                     const size_t tmp_len     = strlen((void *)arg_str);
                     const uint16_t len       = htons(tmp_len);
                     const bool retained_uuid = (arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
@@ -1696,6 +1705,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
 
                 for (unsigned idx = 0; tmp && idx < arg_num_entries; idx++)
                 {
+                    /* IMPL check this can be shared! */
                     *ptr = (uint8_t)tmp->event; ptr++; /* type  */
                     *ptr = 0; ptr++;                   /* flags */
                     index = htonl(tmp->index);         /* index */
@@ -1709,7 +1719,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                     switch(tmp->event)
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
-                            uint16_t tmp_len = htons(tmp->register_topic.length);
+                            const uint16_t tmp_len = htons(tmp->register_topic.length);
                             uint32_t flags = tmp->register_topic.flags;
 
                             if (tmp->register_topic.retained)
@@ -1720,7 +1730,7 @@ static int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_
                             memcpy(ptr, &flags, sizeof(uint32_t)); ptr += sizeof(uint32_t);
                             memcpy(ptr, &tmp_len, sizeof(uint16_t)); ptr += sizeof(uint16_t);
                             memcpy(ptr, tmp->register_topic.name, tmp->register_topic.length); ptr += tmp->register_topic.length;
-                            *ptr++ = 0;
+                            *ptr++ = '\0';
                             memcpy(ptr, &tmp->register_topic.uuid, UUID_SIZE); ptr += UUID_SIZE;
                             if (tmp->register_topic.retained) {
                                 memcpy(ptr, &tmp->register_topic.msg_uuid, UUID_SIZE); ptr += UUID_SIZE;
@@ -3261,11 +3271,10 @@ static int raft_init(void)
     return global_raft_fd;
 }
 
-extern _Atomic bool running;
-
-void *raft_loop(void * /* start_args */)
+void *raft_loop(void *start_args)
 {
     raft_thread_id = pthread_self();
+    raft_impl = (const void *)start_args;
     const int raft_fd = raft_init();
 
     if (raft_fd == -1)

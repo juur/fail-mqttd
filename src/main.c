@@ -8430,9 +8430,10 @@ int main(int argc, char *argv[])
 
 #ifdef FEATURE_RAFT
     pthread_t raft_thread;
+    extern const struct raft_impl mqtt_raft_impl;
 
     if (opt_raft &&
-            pthread_create(&raft_thread, NULL, raft_loop, NULL) != 0)
+            pthread_create(&raft_thread, NULL, raft_loop, (void *)&mqtt_raft_impl) != 0)
         err(EXIT_FAILURE, "pthread_create: raft_loop");
 #endif
 
