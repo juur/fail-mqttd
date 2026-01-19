@@ -798,7 +798,7 @@ struct send_state {
     uint32_t arg_flags;
 };
 
-struct raft_impl {
+struct raft_impl_entry {
     int (*free_log)(struct raft_log *);
     int (*commit_and_advance)(struct raft_log *);
     int (*leader_append)(struct raft_log *, va_list);
@@ -806,8 +806,12 @@ struct raft_impl {
     int (*pre_send)(struct raft_log *, struct send_state *);
     int (*fill_send)(struct send_state *, const struct raft_log *);
     raft_status_t (*process_packet)(size_t *, const uint8_t **, raft_rpc_t rpc, raft_log_t, struct raft_log *);
+};
 
+struct raft_impl {
     const char *const name;
+    const int num_log_types;
+    const struct raft_impl_entry handlers[];
 };
 
 extern const payload_required_t packet_to_payload[MQTT_CP_MAX];

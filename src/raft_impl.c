@@ -324,13 +324,18 @@ fail:
 }
 
 const struct raft_impl mqtt_raft_impl = {
-    .free_log           = free_log,
-    .commit_and_advance = commit_and_advance,
-    .leader_append      = leader_append,
-    .client_append      = client_append,
-    .pre_send           = pre_send,
-    .fill_send          = fill_send,
-    .process_packet     = process_packet,
-
-    .name = "fail-mqttd"
+    .name = "fail-mqttd",
+    .num_log_types = RAFT_MAX_LOG,
+    .handlers = {
+        [RAFT_LOG_REGISTER_TOPIC] = {
+            .free_log           = free_log,
+            .commit_and_advance = commit_and_advance,
+            .leader_append      = leader_append,
+            .client_append      = client_append,
+            .pre_send           = pre_send,
+            .fill_send          = fill_send,
+            .process_packet     = process_packet,
+        },
+        { NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+    },
 };
