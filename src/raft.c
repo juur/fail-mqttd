@@ -2521,6 +2521,7 @@ send_client_request_reply:
                 bytes_remaining -= RAFT_APPEND_ENTRIES_FIXED_SIZE;
 
                 uint32_t new_match_index = prev_log_index;
+                uint32_t expected_index = prev_log_index + 1;
 
                 if (num_entries) {
                     rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: term=%u leader_id=%u prev_log_index=%u/%u leader_commit=%u num_entries=%u\n",
@@ -2570,6 +2571,12 @@ send_client_request_reply:
 
                     bytes_remaining -= RAFT_LOG_FIXED_SIZE;
 
+                    if (index != expected_index) {
+                        raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, RAFT_FALSE,
+                                prev_log_index);
+                        goto done;
+                    }
+
                     if ((log_entry = raft_alloc_log(RAFT_PEER, type)) == NULL)
                         goto fail;
 
@@ -2606,6 +2613,7 @@ send_client_request_reply:
                     prev_log_entry = log_entry;
                     /* NULL the valid entry, so that fail doesn't double-free */
                     log_entry = NULL;
+                    expected_index++;
                 }
 
                 if (process_append_entries(client, term, leader_id, prev_log_index,
