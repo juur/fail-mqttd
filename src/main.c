@@ -41,40 +41,12 @@
 #include <endian.h>
 #include <locale.h>
 
+#include "debug.h"
 #include "mqtt.h"
 
 #define MAX(a,b) (((a)>(b)) ? (a) : (b))
 #define MIN(a,b) (((a)<(b)) ? (a) : (b))
 
-#ifndef FEATURE_DEBUG
-# define dbg_printf(...) { }
-# define dbg_cprintf(...) { }
-#else
-# define dbg_printf(...) { long dbg_now = timems(); printf("%lu.%04lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
-# define dbg_cprintf(...) { printf(__VA_ARGS__); }
-#endif
-
-
-#if defined(FEATURE_DEBUG) || defined(FEATURE_RAFT_DEBUG)
-# define CRESET "\x1b[0m"
-
-# define BBLU "\x1b[1;34m"
-# define BCYN "\x1b[1;36m"
-# define BGRN "\x1b[1;32m"
-# define BMAG "\x1b[1;35m"
-# define BRED "\x1b[1;31m"
-# define BWHT "\x1b[1;37m"
-# define BYEL "\x1b[1;33m"
-
-# define NBLU "\x1b[0;34m"
-# define NCYN "\x1b[0;36m"
-# define NGRN "\x1b[0;32m"
-# define NMAG "\x1b[0;35m"
-# define NRED "\x1b[0;31m"
-# define NWHT "\x1b[0;37m"
-# define NYEL "\x1b[0;33m"
-
-#endif
 
 #ifdef HAVE_STDATOMIC_H
 # define GET_REFCNT(x) atomic_load_explicit(x, memory_order_relaxed)
@@ -110,14 +82,12 @@ typedef int (*control_func_t)(struct client *, struct packet *, const void *);
  * misc. globals
  */
 
+static uint8_t global_hwaddr[8];
+_Atomic bool running;
 static int global_mother_fd = -1;
 #ifdef FEATURE_OM
 static int global_om_fd = -1;
 #endif
-#ifdef FEATURE_RAFT
-#endif
-static uint8_t global_hwaddr[8];
-_Atomic bool running;
 
 /*
  * unique ids
@@ -203,9 +173,6 @@ static _Atomic unsigned long total_messages_sender_completed_at    = 0;
 
 static _Atomic bool has_clients = false;
 
-#ifdef FEATURE_RAFT
-#endif
-
 /*
  * databases
  */
@@ -259,13 +226,6 @@ static const struct {
     { &topic_dbm, "topics", load_topic, sizeof(struct topic_save) },
     { NULL, NULL, NULL, -1 },
 };
-
-/*
- * Raft
- */
-
-#ifdef FEATURE_RAFT
-#endif
 
 /*
  * forward declarations
@@ -410,11 +370,6 @@ static void show_usage(FILE *fp, const char *name)
         DEF_DB_PATH
             );
 }
-
-/* Command Line */
-
-#ifdef FEATURE_RAFT
-#endif
 
 [[gnu::nonnull]]
 static void parse_cmdline(int argc, char *argv[])
@@ -645,7 +600,7 @@ shit_usage:
  * debugging helpers
  */
 
-[[maybe_unused]] static int64_t timems(void)
+[[maybe_unused]] static inline int64_t timems(void)
 {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
@@ -8204,13 +8159,13 @@ int main(int argc, char *argv[])
     /* Set defaults */
 
     opt_listen.s_addr = htonl(INADDR_LOOPBACK);
+    opt_statepath = DEF_DB_PATH;
 #ifdef FEATURE_OM
     opt_om_listen.s_addr = htonl(INADDR_LOOPBACK);
 #endif
 #ifdef FEATURE_RAFT
     opt_raft_listen.s_addr = htonl(INADDR_LOOPBACK);
 #endif
-    opt_statepath = DEF_DB_PATH;
 
     parse_cmdline(argc, argv);
 
