@@ -46,7 +46,7 @@ sysconfdir     := @@SYSCONFDIR@@
 progprefix     := @@PROGPREFIX@@
 
 main_SRCS    := main.c constants.c
-raft_SRCS    := raft.c
+raft_SRCS    := raft.c raft_impl.c
 
 all_SRCS     := $(main_SRCS) @@EXTRASRCS@@
 all_SRCS     := $(addprefix $(srcdir)/src/,$(all_SRCS))
