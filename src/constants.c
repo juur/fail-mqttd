@@ -259,6 +259,7 @@ const char *const reason_codes_str[MQTT_REASON_CODE_MAX] =
     [MQTT_WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED] = "WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED",
 };
 
+#ifdef FEATURE_RAFT
 const char *const raft_status_str[RAFT_MAX_STATUS] = {
     [RAFT_OK] = "OK",
     [RAFT_TRUE] = "TRUE",
@@ -303,3 +304,4 @@ const char *const raft_conn_str[RAFT_MAX_CONN] = {
 const char *const raft_log_str[RAFT_MAX_LOG] = {
     [RAFT_LOG_REGISTER_TOPIC] = "REGISTER_TOPIC",
 };
+#endif

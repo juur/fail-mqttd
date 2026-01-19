@@ -16,7 +16,11 @@
 # else
 #  define counted_by(x)
 # endif
+#else
+# define counted_by(x)
 #endif
+
+#include "config.h"
 
 typedef long timems_t;
 
@@ -305,13 +309,11 @@ struct packet {
     unsigned flags;
 
     struct property (*properties)[];
-    //struct property (*will_props)[];
     void *payload;
     struct message *message;
     uint16_t packet_identifier;
     uint32_t payload_len;
     unsigned property_count;
-    //unsigned num_will_props;
     reason_code_t reason_code;
     packet_type_t direction;
 
@@ -360,7 +362,6 @@ struct message {
     bool deleted;
     struct message *next_queue;
     struct session *sender;
-    //uint16_t sender_packet_identifier;
     struct topic *topic;
     const void *payload;
     uint8_t format;
@@ -412,7 +413,6 @@ struct subscription {
         } shared;
     };
     const uint8_t *topic_filter;
-    //struct topic *topic;
     uint8_t option;
     subscription_type_t type;
     uint32_t subscription_identifier;
@@ -534,11 +534,8 @@ struct topic {
     id_t id;
     uint8_t uuid[UUID_SIZE];
     const uint8_t *name;
-    //unsigned num_subscribers;
-    //struct subscription **subscribers;
     struct message *retained_message;
     struct message *pending_queue;
-    //pthread_rwlock_t subscribers_lock;
     pthread_rwlock_t pending_queue_lock;
     _Atomic topic_state_t state;
     _Atomic unsigned refcnt;
@@ -560,6 +557,7 @@ struct start_args {
     int om_fd;
 };
 
+# ifdef FEATURE_RAFT
 typedef enum {
     RAFT_HELLO = 0,
     RAFT_APPEND_ENTRIES,
@@ -682,8 +680,6 @@ struct raft_packet {
  */
 
 #define RAFT_HELLO_SIZE (4 + 1 + 4 + 2)
-
-
 
 struct raft_host_entry {
     /* candidateVar = */
@@ -811,33 +807,14 @@ struct raft_impl_entry {
 struct raft_impl {
     const char *const name;
     const int num_log_types;
-    const struct raft_impl_entry handlers[];
+    const struct raft_impl_entry handlers[] __attribute__((counted_by(num_log_types)));
 };
 
-extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
-extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
-extern const type_t property_to_type[MQTT_PROPERTY_IDENT_MAX];
-extern const type_t property_per_control[MQTT_PROPERTY_IDENT_MAX][MQTT_CP_MAX];
-
-extern const char *const client_state_str[CLIENT_STATE_MAX];
-extern const char *const message_state_str[MSG_STATE_MAX];
-extern const char *const topic_state_str[TOPIC_STATE_MAX];
-extern const char *const session_state_str[SESSION_STATE_MAX];
-extern const char *const property_str[MQTT_PROPERTY_IDENT_MAX];
-extern const char *const control_packet_str[MQTT_CP_MAX];
-extern const char *const read_state_str[READ_STATE_MAX];
-extern const char *const priority_str[];
-extern const char *const reason_codes_str[MQTT_REASON_CODE_MAX];
-extern const char *const message_type_str[MSG_TYPE_MAX];
-extern const char *const subscription_type_str[SUB_TYPE_MAX];
-extern const char *const packet_dir_str[PACKET_DIR_MAX];
 extern const char *const raft_rpc_str[RAFT_MAX_RPC];
 extern const char *const raft_status_str[RAFT_MAX_STATUS];
 extern const char *const raft_mode_str[RAFT_MAX_STATES];
 extern const char *const raft_conn_str[RAFT_MAX_CONN];
 extern const char *const raft_log_str[RAFT_MAX_LOG];
-
-#endif
 
 /**
  * RAFT_CLIENT_REQUEST
@@ -968,7 +945,32 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
 
 #define RAFT_LOG_FIXED_SIZE (1+1+4+4+2)
 
-int raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_list ap);
-int raft_client_log_send(raft_log_t event, ...);
-int raft_leader_log_append(raft_log_t event, ...);
-int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...);
+extern int   raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_list ap);
+extern int   raft_client_log_send(raft_log_t event, ...);
+extern int   raft_leader_log_append(raft_log_t event, ...);
+extern int   raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...);
+extern void *raft_loop(void *start_args);
+extern bool  raft_is_leader(void);
+extern int   raft_parse_cmdline_host_list(const char *tmp, int extra);
+extern int   raft_get_leader_address(char tmpbuf[static INET_ADDRSTRLEN+1+5+1], size_t len);
+# endif /* #ifdef FEATURE_RAFT */
+
+extern const payload_required_t packet_to_payload[MQTT_CP_MAX];
+extern const uint8_t packet_permitted_flags[MQTT_CP_MAX];
+extern const type_t property_to_type[MQTT_PROPERTY_IDENT_MAX];
+extern const type_t property_per_control[MQTT_PROPERTY_IDENT_MAX][MQTT_CP_MAX];
+
+extern const char *const client_state_str[CLIENT_STATE_MAX];
+extern const char *const message_state_str[MSG_STATE_MAX];
+extern const char *const topic_state_str[TOPIC_STATE_MAX];
+extern const char *const session_state_str[SESSION_STATE_MAX];
+extern const char *const property_str[MQTT_PROPERTY_IDENT_MAX];
+extern const char *const control_packet_str[MQTT_CP_MAX];
+extern const char *const read_state_str[READ_STATE_MAX];
+extern const char *const priority_str[];
+extern const char *const reason_codes_str[MQTT_REASON_CODE_MAX];
+extern const char *const message_type_str[MSG_TYPE_MAX];
+extern const char *const subscription_type_str[SUB_TYPE_MAX];
+extern const char *const packet_dir_str[PACKET_DIR_MAX];
+#endif
+

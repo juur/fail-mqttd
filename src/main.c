@@ -295,14 +295,6 @@ static const struct {
 [[gnu::nonnull]] static int unsubscribe_session_from_all(struct session *session);
 [[gnu::nonnull]] static int find_str(const char *const *lookup, const char *value, int max);
 
-#ifdef FEATURE_RAFT
-extern void *raft_loop(void *start_args);
-extern int raft_client_log_send(raft_log_t event, ...);
-extern bool raft_is_leader(void);
-extern int raft_parse_cmdline_host_list(const char *tmp, int extra);
-extern int raft_get_leader_address(char tmpbuf[static INET_ADDRSTRLEN+1+5+1], size_t len);
-#endif
-
 /*
  * command line stuff
  */
