@@ -16,4 +16,5 @@ vgcore.*
 .clangd
 doc/html/
 test*.sh
+state_save*
 *.log
