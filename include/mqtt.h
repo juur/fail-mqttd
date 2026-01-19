@@ -795,7 +795,7 @@ struct send_state {
     uint8_t *arg_str;
     uint8_t *arg_uuid;
     uint8_t *arg_msg_uuid;
-    uint8_t arg_flags;
+    uint32_t arg_flags;
 };
 
 struct raft_impl {

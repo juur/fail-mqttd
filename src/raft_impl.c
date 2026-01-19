@@ -269,7 +269,7 @@ static raft_status_t process_packet(size_t *bytes_remaining, uint8_t **ptr, raft
     if (*bytes_remaining < (size_t)tmp_len + 1)
         goto fail;
 
-    if (*ptr[tmp_len] != '\0')
+    if ((*ptr)[tmp_len] != '\0')
         goto fail;
 
     if ((temp_string = (void *)strndup((void *)*ptr, tmp_len)) == NULL) {
