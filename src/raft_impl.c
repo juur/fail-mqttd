@@ -146,7 +146,7 @@ fail:
     return -1;
 }
 
-static int client_append(struct raft_log *new_client_event, raft_log_t event, va_list ap)
+static int client_append(struct raft_log *new_client_event, raft_log_t /* event */, va_list ap)
 {
     int rc = 0;
 
@@ -154,7 +154,7 @@ static int client_append(struct raft_log *new_client_event, raft_log_t event, va
     uint8_t *uuid     = va_arg(ap, void *);
     uint32_t flags    = va_arg(ap, uint32_t);
     uint8_t *msg_uuid = NULL;
-    
+
     if (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED)
         msg_uuid      = va_arg(ap, void *);
 
@@ -169,15 +169,6 @@ static int client_append(struct raft_log *new_client_event, raft_log_t event, va
         memcpy(&new_client_event->register_topic.msg_uuid, msg_uuid, UUID_SIZE);
     else
         memset(&new_client_event->register_topic.msg_uuid, 0, UUID_SIZE);
-
-    if ((rc = raft_send(RAFT_CLIENT, NULL,
-                    RAFT_CLIENT_REQUEST,
-                    raft_state.self_id, new_client_event->sequence_num,
-                    event,
-                    new_client_event
-                    )) == -1) {
-        warn("raft_client_log_sendv: raft_send");
-    }
 
     return rc;
 fail:
@@ -239,7 +230,8 @@ static int fill_send(struct send_state *out, const struct raft_log *tmp)
     return entry_length;
 }
 
-static raft_status_t process_packet(size_t *bytes_remaining, uint8_t **ptr, raft_log_t type)
+static raft_status_t process_packet(size_t *bytes_remaining, const uint8_t **ptr,
+        raft_rpc_t /* rpc */, raft_log_t /* type */, struct raft_log *out)
 {
     uint8_t *temp_string = NULL;
     uint32_t flags;
@@ -297,10 +289,26 @@ static raft_status_t process_packet(size_t *bytes_remaining, uint8_t **ptr, raft
     if (*bytes_remaining != 0)
         goto fail;
 
+    if (out != NULL) {
+        out->register_topic.retained = (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
+        if ((out->register_topic.name = (void *)strdup((void *)temp_string)) == NULL)
+            goto fail;
+
+        out->register_topic.length = tmp_len;
+        out->register_topic.flags = flags;
+        memcpy(out->register_topic.uuid, uuid, UUID_SIZE);
+        if (out->register_topic.retained)
+            memcpy(out->register_topic.msg_uuid, msg_uuid, UUID_SIZE);
+        else
+            memset(out->register_topic.msg_uuid, 0, UUID_SIZE);
+    }
+
     rdbg_printf("RAFT raft_recv: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n", temp_string);
+    /*
     rc = raft_leader_log_append(type,
             temp_string, uuid, flags,
             (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) ? msg_uuid : NULL);
+            */
     free(temp_string);
 
     if (rc == -1)

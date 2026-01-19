@@ -805,7 +805,7 @@ struct raft_impl {
     int (*client_append)(struct raft_log *, raft_log_t, va_list);
     int (*pre_send)(struct raft_log *, struct send_state *);
     int (*fill_send)(struct send_state *, const struct raft_log *);
-    raft_status_t (*process_packet)(size_t *, uint8_t **, raft_log_t);
+    raft_status_t (*process_packet)(size_t *, const uint8_t **, raft_rpc_t rpc, raft_log_t, struct raft_log *);
 
     const char *const name;
 };
@@ -963,3 +963,8 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
 #define RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED    (1<<0)
 
 #define RAFT_LOG_FIXED_SIZE (1+1+4+4+2)
+
+int raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_list ap);
+int raft_client_log_send(raft_log_t event, ...);
+int raft_leader_log_append(raft_log_t event, ...);
+int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...);

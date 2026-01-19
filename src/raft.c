@@ -106,8 +106,6 @@ int save_topic(const struct topic *topic);
 #endif
         );
 
-int raft_leader_log_append(raft_log_t event, ...);
-int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...);
 static int raft_recv(struct raft_host_entry *client);
 
 [[maybe_unused]] static inline long rnd(int from, int to)
@@ -115,7 +113,7 @@ static int raft_recv(struct raft_host_entry *client);
     return random() % (to - from + 1) + from;
 }
 
-[[maybe_unused]] static int64_t timems(void)
+[[maybe_unused]] static inline int64_t timems(void)
 {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
@@ -696,9 +694,9 @@ static int raft_check_commit_index(uint32_t best)
     return 0;
 }
 
-int raft_leader_log_appendv(raft_log_t event, va_list ap)
+int raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_list ap)
 {
-    struct raft_log *new_log = NULL;
+    struct raft_log *new_log = log_p;
 
     if (event >= RAFT_MAX_LOG) {
         errno = EINVAL;
@@ -708,24 +706,26 @@ int raft_leader_log_appendv(raft_log_t event, va_list ap)
     rdbg_printf("RAFT raft_leader_log_appendv: %s\n",
             raft_log_str[event]);
 
-    if ((new_log = raft_alloc_log(RAFT_PEER, event)) == NULL)
-        goto fail;
+    if (log_p == NULL)
+        if ((new_log = raft_alloc_log(RAFT_PEER, event)) == NULL)
+            goto fail;
 
     new_log->term = raft_state.current_term;
     new_log->index = ++raft_state.log_index;
 
-    switch(event)
-    {
-        /* name, *uuid, flags, [msg_uuid] */
-        case RAFT_LOG_REGISTER_TOPIC:
-            if (raft_impl->leader_append)
-                if (raft_impl->leader_append(new_log, ap) == -1)
-                    goto fail;
-            break;
+    if (log_p == NULL)
+        switch(event)
+        {
+            /* name, *uuid, flags, [msg_uuid] */
+            case RAFT_LOG_REGISTER_TOPIC:
+                if (raft_impl->leader_append)
+                    if (raft_impl->leader_append(new_log, ap) == -1)
+                        goto fail;
+                break;
 
-        default:
-            break;
-    }
+            default:
+                break;
+        }
 
     if (raft_append_log(new_log, &raft_state.log_head, &raft_state.log_tail, &raft_state.log_length) == -1)
         goto fail;
@@ -767,7 +767,7 @@ int raft_leader_log_append(raft_log_t event, ...)
     int rc;
     va_list ap;
     va_start(ap, event);
-    rc = raft_leader_log_appendv(event, ap);
+    rc = raft_leader_log_appendv(event, NULL, ap);
     va_end(ap);
     return rc;
 }
@@ -843,6 +843,15 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
             if (raft_impl->client_append)
                 if (raft_impl->client_append(new_client_event, event, ap) == -1)
                     goto fail;
+
+            if ((rc = raft_send(RAFT_CLIENT, NULL,
+                            RAFT_CLIENT_REQUEST,
+                            raft_state.self_id, new_client_event->sequence_num,
+                            event,
+                            new_client_event
+                            )) == -1) {
+                warn("raft_client_log_sendv: raft_send");
+            }
             break;
 
         default:
@@ -901,7 +910,7 @@ int raft_client_log_send(raft_log_t event, ...)
     if (raft_state.state == RAFT_STATE_LEADER) {
         /* we're in raft_thread so need to preserve our lock of raft_state,
          * so the main thread doesn't touch it */
-        rc = raft_leader_log_appendv(event, ap);
+        rc = raft_leader_log_appendv(event, NULL, ap);
         pthread_mutex_unlock(&raft_state.lock);
     } else {
         pthread_mutex_unlock(&raft_state.lock);
@@ -1302,12 +1311,12 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
 
     uint16_t arg_req_len = 0;
     uint32_t arg_client_id = 0, arg_leader_hint = 0;
-    uint32_t arg_id = 0, arg_flags = 0;
+    uint32_t arg_id = 0; //, arg_flags = 0;
     uint32_t arg_leader_id = 0, arg_prev_log_index = 0, arg_prev_log_term = 0;
     uint32_t arg_num_entries = 0, arg_new_match_index = 0, arg_leader_commit = 0;
     uint32_t arg_sequence_num = 0, arg_voted_for = NULL_ID;
     uint32_t arg_term = 0, arg_candidate_id, arg_last_log_index, arg_last_log_term;
-    const uint8_t *arg_str = NULL, *arg_uuid = NULL, *arg_msg_uuid = NULL;
+    //const uint8_t *arg_str = NULL, *arg_uuid = NULL, *arg_msg_uuid = NULL;
     uint8_t arg_status = 0, arg_conn_type = 0, arg_req_type = 0, arg_req_flags;
     uint8_t arg_log_type = 0;
 
@@ -2327,7 +2336,8 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
     struct raft_log *prev_log_entry = NULL;
     uint32_t term = 0;
     uint32_t leader_id;
-    uint8_t *temp_string = NULL;
+    //uint8_t *temp_string = NULL;
+    struct raft_log *out = NULL;
 
     assert(rpc < RAFT_MAX_RPC);
 
@@ -2440,72 +2450,22 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                     goto send_client_request_reply;
                 }
 
+                if (raft_impl->process_packet)
+                    if ((out = raft_alloc_log(RAFT_CLIENT, type)) == NULL)
+                        goto fail;
+
                 switch (type)
                 {
                     case RAFT_LOG_REGISTER_TOPIC:
-                        if (bytes_remaining < sizeof(uint32_t))
-                            goto fail;
-
-                        uint32_t flags;
-
-                        memcpy(&flags, ptr, sizeof(uint32_t));
-                        ptr += sizeof(uint32_t);
-                        bytes_remaining -= sizeof(uint32_t);
-
-                        flags = ntohl(flags);
-
-                        if (bytes_remaining < sizeof(uint16_t))
-                            goto fail;
-
-                        uint16_t tmp_len;
-
-                        memcpy(&tmp_len, ptr, sizeof(uint16_t));
-                        ptr += sizeof(uint16_t);
-                        bytes_remaining -= sizeof(uint16_t);
-
-                        tmp_len = ntohs(tmp_len);
-
-                        if (bytes_remaining < (size_t)tmp_len + 1)
-                            goto fail;
-
-                        if (ptr[tmp_len] != '\0')
-                            goto fail;
-
-                        if ((temp_string = (void *)strndup((void *)ptr, tmp_len)) == NULL) {
-                            warnx("raft_recv: strndup");
-                            goto fail;
-                        }
-                        ptr += tmp_len + 1;
-                        bytes_remaining -= (tmp_len + 1);
-
-                        if (bytes_remaining < UUID_SIZE)
-                            goto fail;
-
-                        uint8_t uuid[UUID_SIZE], msg_uuid[UUID_SIZE];
-
-                        memcpy(&uuid, ptr, UUID_SIZE);
-                        ptr += UUID_SIZE;
-                        bytes_remaining -= UUID_SIZE;
-
-                        if (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
-                            if (bytes_remaining < UUID_SIZE)
+                        if (raft_impl->process_packet) {
+                            size_t tmp_bytes_remaining = bytes_remaining;
+                            if ((reply = raft_impl->process_packet(&tmp_bytes_remaining, &ptr, rpc, type, out)) == -1)
                                 goto fail;
-                            memcpy(&msg_uuid, ptr, UUID_SIZE);
-                            ptr += UUID_SIZE;
-                            bytes_remaining -= UUID_SIZE;
-                        }
 
-                        if (bytes_remaining != 0)
-                            goto fail;
-
-                        rdbg_printf("RAFT raft_recv: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n", temp_string);
-                        int rc = raft_leader_log_append(type,
-                                temp_string, uuid, flags,
-                                (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) ? msg_uuid : NULL);
-                        free(temp_string);
-                        temp_string = NULL;
-                        if (rc == -1) {
-                            reply = RAFT_ERR;
+                            int rc = raft_leader_log_appendv(type, out, NULL);
+                            if (rc == -1) {
+                                reply = RAFT_ERR;
+                            }
                         }
                         break;
 
@@ -2644,44 +2604,15 @@ send_client_request_reply:
                     switch((raft_log_t)type)
                     {
                         case RAFT_LOG_REGISTER_TOPIC:
-                            if (bytes_remaining < entry_length) {
-                                warnx("raft_recv: APPEND_ENTRIES: REGISTER_TOPIC: bytes_remaining < entry_length");
-                                goto fail;
-                            }
-
-                            uint32_t flags = 0;
-                            memcpy(&flags, ptr, sizeof(uint32_t));
-                            ptr += sizeof(uint32_t);
-                            flags = ntohl(flags);
-
-                            log_entry->register_topic.retained = (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
-
-                            uint16_t str_len = 0;
-                            memcpy(&str_len, ptr, sizeof(uint16_t));
-                            ptr += sizeof(uint16_t);
-                            str_len = ntohs(str_len);
-
-                            if (ptr[str_len] != '\0')
-                                goto fail;
-
-                            if ((log_entry->register_topic.name = (void *)strndup((void *)ptr, str_len)) == NULL) {
-                                warn("raft_recv: strndup");
-                                goto fail;
-                            }
-                            log_entry->register_topic.length = str_len;
-
-                            ptr += log_entry->register_topic.length + 1;
-
-                            memcpy(&log_entry->register_topic.uuid, ptr, UUID_SIZE);
-                            ptr += UUID_SIZE;
-
-                            if (log_entry->register_topic.retained) {
-                                memcpy(&log_entry->register_topic.msg_uuid, ptr, UUID_SIZE);
-                                ptr += UUID_SIZE;
+                            if (raft_impl->process_packet) {
+                                size_t tmp_bytes_remaining = entry_length;
+                                if (raft_impl->process_packet(&tmp_bytes_remaining,
+                                            &ptr, rpc, (raft_log_t)type, log_entry) == -1)
+                                    goto fail;
+                                assert(tmp_bytes_remaining == 0);
                             }
 
                             bytes_remaining -= entry_length;
-
                             break;
 
                         default:
@@ -2857,6 +2788,9 @@ done:
     return 0;
 
 fail:
+    if (out) {
+        raft_free_log(out);
+    }
     if (log_entry) {
         raft_free_log(log_entry);
         log_entry = NULL;
