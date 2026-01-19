@@ -10,6 +10,7 @@
 #include <err.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdbool.h>
 #include <errno.h>
 #include <sys/select.h>
@@ -38,6 +39,7 @@
 #include <ndbm.h>
 #include <sys/stat.h>
 #include <endian.h>
+#include <locale.h>
 
 #include "mqtt.h"
 
@@ -325,6 +327,8 @@ static void show_usage(FILE *fp, const char *name)
 {
     char buf[BUFSIZ];
     char *ptr = buf;
+
+    setlocale(LC_ALL, "C");
 
     for (unsigned idx = 0; database_init[idx].filename; idx++)
     {
@@ -861,6 +865,9 @@ static const char *get_http_error(int error)
     {
         case 400: return "Bad Request";
         case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 414: return "URI Too Long";
+        case 431: return "Request Header Fields Too Large";
         case 501: return "Not Implemented";
         case 505: return "HTTP Version Not Supported";
     }
@@ -868,24 +875,49 @@ static const char *get_http_error(int error)
     return "unknown";
 }
 
+static const char *const om_datefmt = "%a, %d %b %Y %H:%M:%S GMT";
+
 static void http_error(FILE *out, int error)
 {
     logger(LOG_WARNING, NULL, "http_error: sending error %u", error);
+
+    char date[BUFSIZ];
+    struct tm *tm = NULL;
+    time_t now = time(NULL);
+    tm = gmtime(&now);
+
+    strftime(date, sizeof(date), om_datefmt, tm);
+
     fprintf(out,
             "HTTP/1.1 %u %s\r\n"
             "connection: close\r\n"
             "content-length: 0\r\n"
-            "\r\n"
+            "date: %s\r\n"
             ,
             error,
-            get_http_error(error)
+            get_http_error(error),
+            date
            );
+
+    switch (error)
+    {
+        case 405:
+            fprintf(out,
+                    "allow: GET, HEAD\r\n"
+                   );
+            break;
+    }
+
+    fprintf(out, "\r\n");
     fflush(out);
 }
 
 [[gnu::warn_unused_result]]
-static int openmetrics_export(int fd)
+static int openmetrics_export(int *fd)
 {
+    const size_t OM_MAX_LINE_SIZE = 8192;
+    const size_t OM_MAX_HEADER_SIZE = 32768;
+
     FILE *mem = NULL, *in = NULL;
     bool head_request = false;
     char *buffer = NULL;
@@ -903,10 +935,29 @@ static int openmetrics_export(int fd)
     struct tm *tm = NULL;
     time_t now;
     unsigned num_lines = 0;
+    bool host_header = false;
+    size_t header_size = 0;
 
     sin_len = sizeof(sin);
 
-    if (getpeername(fd, (struct sockaddr *)&sin, &sin_len) == -1) {
+    struct timeval tv = {
+        .tv_sec = 5,
+        .tv_usec = 0,
+    };
+
+    if (setsockopt(*fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(struct timeval)) == -1) {
+        logger(LOG_ERR, NULL, "openmetrics_export: setsockopt(SO_RCVTIMEO): %s",
+                strerror(errno));
+        return -1;
+    }
+
+    if (setsockopt(*fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(struct timeval)) == -1) {
+        logger(LOG_ERR, NULL, "openmetrics_export: setsockopt(SO_SNDTIMEO): %s",
+                strerror(errno));
+        return -1;
+    }
+
+    if (getpeername(*fd, (struct sockaddr *)&sin, &sin_len) == -1) {
         logger(LOG_WARNING, NULL, "openmetrics_export: getpeername: %s",
                 strerror(errno));
         return -1;
@@ -914,20 +965,26 @@ static int openmetrics_export(int fd)
 
     inet_ntop(AF_INET, &sin.sin_addr, remote_addr, sizeof(remote_addr));
     logger(LOG_INFO, NULL, "openmetrics_export connection from %s:%u",
-            remote_addr, htons(sin.sin_port));
+            remote_addr, ntohs(sin.sin_port));
 
-    if ((in = fdopen(fd, "r+b")) == NULL)
+    if ((in = fdopen(*fd, "r+b")) == NULL)
         goto fail;
 
     setvbuf(in, NULL, _IONBF, 0);
 
-    alarm(5);
     while ((nread = getline(&line, &line_len, in)) != -1)
     {
         if (nread == 0)
             break;
 
-        if (nread > 4096 || num_lines > 50) {
+        if ((size_t)nread > OM_MAX_LINE_SIZE || num_lines > 50) {
+            http_error(in, 431);
+            goto fail;
+        }
+
+        header_size += (size_t)nread;
+        if (header_size > OM_MAX_HEADER_SIZE) {
+            http_error(in, 431);
             goto fail;
         }
 
@@ -943,8 +1000,8 @@ static int openmetrics_export(int fd)
                 goto fail;
             }
 
-            if (strcmp("GET", http_method) && strcmp("HEAD", http_method)) {
-                http_error(in, 501);
+            if (strlen(http_uri) >= OM_MAX_LINE_SIZE) {
+                http_error(in, 414);
                 goto fail;
             }
 
@@ -958,6 +1015,11 @@ static int openmetrics_export(int fd)
                 goto fail;
             }
 
+            if (strcmp("GET", http_method) && strcmp("HEAD", http_method)) {
+                http_error(in, 405);
+                goto fail;
+            }
+
             if (!strcmp("HEAD", http_method))
                 head_request = true;
 
@@ -968,11 +1030,19 @@ static int openmetrics_export(int fd)
             http_method = NULL;
             http_version = NULL;
             http_uri = NULL;
+        } else {
+            if (!strncasecmp(line, "host:", 5)) {
+                const char *p = line + 5;
+                while (*p == ' ' || *p == '\t')
+                    p++;
+
+                if (*p != '\0' && *p != '\r' && *p != '\n')
+                    host_header = true;
+            }
         }
 
         num_lines++;
     }
-    alarm(0);
 
     if (line) {
         free(line);
@@ -985,11 +1055,14 @@ static int openmetrics_export(int fd)
         goto fail;
     }
 
-    const char *const datefmt = "%a, %d %b %Y %T %Z";
+    if (host_header == false) {
+        http_error(in, 400);
+        goto fail;
+    }
 
     now = time(NULL);
     tm = gmtime(&now);
-    strftime(date, sizeof(date), datefmt, tm);
+    strftime(date, sizeof(date), om_datefmt, tm);
 
     const char *const http_response =
         "HTTP/1.1 200 OK\r\n"
@@ -1001,7 +1074,7 @@ static int openmetrics_export(int fd)
         "allow: GET, HEAD\r\n"
         "retry-after: 5\r\n"
         "date: %s\r\n"
-        "content-length: %lu\r\n"
+        "content-length: %zu\r\n"
         "\r\n";
 
     if ((mem = open_memstream(&buffer, &size)) == NULL) {
@@ -1100,6 +1173,7 @@ static int openmetrics_export(int fd)
     if (buffer)
         free(buffer);
     fclose(in);
+    *fd = -1;
     alarm(0);
 
     logger(LOG_INFO, NULL, "openmetrics_export: sent %lu bytes of metrics", size);
@@ -7863,9 +7937,7 @@ static RETURN_TYPE main_loop(void *start_args)
             int tmp_fd;
 
             if ((tmp_fd = accept(om_fd, NULL, NULL)) != -1) {
-                if (openmetrics_export(tmp_fd) == -1)
-                    close_socket(&tmp_fd);
-                else
+                if (openmetrics_export(&tmp_fd) == -1)
                     close_socket(&tmp_fd);
             }
         }
@@ -8300,7 +8372,7 @@ int main(int argc, char *argv[])
         atexit(save_all_topics);
     }
 
-    if (opt_database 
+    if (opt_database
 #ifdef FEATURE_RAFT
             || opt_raft
 #endif
@@ -8411,7 +8483,7 @@ int main(int argc, char *argv[])
     struct start_args start_args_om = {
         .fd = -1,
 # ifdef FEATURE_OM
-        .om_fd = opt_openmetrics ? global_om_fd : 0,
+        .om_fd = opt_openmetrics ? global_om_fd : -1,
 # else
         .om_fd = -1,
 # endif
@@ -8420,7 +8492,7 @@ int main(int argc, char *argv[])
     struct start_args start_args = {
         .fd = global_mother_fd,
 # ifdef FEATURE_OM
-        .om_fd = opt_openmetrics ? global_om_fd : 0,
+        .om_fd = opt_openmetrics ? global_om_fd : -1,
 # else
         .om_fd = -1,
 # endif
