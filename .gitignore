@@ -14,5 +14,6 @@ config.status
 .d
 vgcore.*
 .clangd
-doc/
+doc/html/
+test*.sh
 *.log
