@@ -17,4 +17,5 @@ vgcore.*
 doc/html/
 test*.sh
 state_save*
+ignore/
 *.log
