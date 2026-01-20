@@ -10,6 +10,7 @@
 
 #include "config.h"
 #include "mqtt.h"
+#include "raft.h"
 
 #if defined(FEATURE_RAFT_DEBUG)
 # define CRESET "\x1b[0m"

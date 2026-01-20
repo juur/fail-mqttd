@@ -24,7 +24,7 @@
 #include <syslog.h>
 
 #include "debug.h"
-#include "mqtt.h"
+#include "raft.h"
 
 #define MAX(a,b) (((a)>(b)) ? (a) : (b))
 #define MIN(a,b) (((a)<(b)) ? (a) : (b))

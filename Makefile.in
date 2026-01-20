@@ -46,7 +46,7 @@ sysconfdir     := @@SYSCONFDIR@@
 progprefix     := @@PROGPREFIX@@
 
 main_SRCS    := main.c constants.c
-raft_SRCS    := raft.c raft_impl.c
+raft_SRCS    := raft.c raft_impl.c raft_constants.c
 
 all_SRCS     := $(main_SRCS) @@EXTRASRCS@@
 all_SRCS     := $(addprefix $(srcdir)/src/,$(all_SRCS))
@@ -100,6 +100,7 @@ mostlyclean:
 
 clean: mostlyclean
 	$(RM) $(objdir)/$(PACKAGE).8
+	$(RM) -rf $(objdir)/.d/*
 
 dist:
 	pushd $(srcdir) >/dev/null ; \
