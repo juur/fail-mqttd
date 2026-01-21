@@ -18,4 +18,5 @@ doc/html/
 test*.sh
 state_save*
 ignore/
+test_*
 *.log
