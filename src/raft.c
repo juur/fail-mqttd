@@ -25,6 +25,9 @@
 
 #include "debug.h"
 #include "raft.h"
+#ifdef TESTS
+#include "raft_test_api.h"
+#endif
 
 #define MAX(a,b) (((a)>(b)) ? (a) : (b))
 #define MIN(a,b) (((a)<(b)) ? (a) : (b))
@@ -3252,3 +3255,64 @@ int raft_get_leader_address(char tmpbuf[static INET_ADDRSTRLEN+1+5+1], size_t le
     pthread_rwlock_unlock(&raft_client_state.lock);
     return -1;
 }
+
+#ifdef TESTS
+static struct raft_host_entry **raft_test_peers_ptr(void)
+{
+    return &raft_peers;
+}
+
+static unsigned *raft_test_num_peers_ptr(void)
+{
+    return &raft_num_peers;
+}
+
+static struct raft_client_state *raft_test_client_state_ptr(void)
+{
+    return &raft_client_state;
+}
+
+const struct raft_test_api raft_test_api = {
+    .rnd = rnd,
+    .timems = timems,
+    .raft_save_state = raft_save_state,
+    .raft_reset_read_state = raft_reset_read_state,
+    .raft_reset_write_state = raft_reset_write_state,
+    .raft_reset_ss_state = raft_reset_ss_state,
+    .raft_update_leader_id = raft_update_leader_id,
+    .raft_update_term = raft_update_term,
+    .raft_log_at = raft_log_at,
+    .raft_term_at = raft_term_at,
+    .raft_close = raft_close,
+    .raft_alloc_log = raft_alloc_log,
+    .raft_free_log = raft_free_log,
+    .raft_remove_log = raft_remove_log,
+    .raft_append_log = raft_append_log,
+    .raft_prepend_log = raft_prepend_log,
+    .raft_commit_and_advance = raft_commit_and_advance,
+    .raft_check_commit_index = raft_check_commit_index,
+    .raft_await_client_response = raft_await_client_response,
+    .raft_client_log_sendv = raft_client_log_sendv,
+    .raft_client_log_append_single = raft_client_log_append_single,
+    .raft_remove_and_free_unknown_host = raft_remove_and_free_unknown_host,
+    .raft_new_conn = raft_new_conn,
+    .raft_add_write = raft_add_write,
+    .raft_try_write = raft_try_write,
+    .raft_reset_election_timer = raft_reset_election_timer,
+    .raft_reset_next_ping = raft_reset_next_ping,
+    .raft_change_to = raft_change_to,
+    .raft_tick_connection_check = raft_tick_connection_check,
+    .raft_stop_election = raft_stop_election,
+    .raft_request_votes = raft_request_votes,
+    .raft_start_election = raft_start_election,
+    .raft_tick = raft_tick,
+    .process_append_entries = process_append_entries,
+    .raft_process_packet = raft_process_packet,
+    .raft_recv = raft_recv,
+    .raft_clean = raft_clean,
+    .raft_init = raft_init,
+    .peers_ptr = raft_test_peers_ptr,
+    .num_peers_ptr = raft_test_num_peers_ptr,
+    .client_state_ptr = raft_test_client_state_ptr,
+};
+#endif

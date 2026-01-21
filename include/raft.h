@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #ifndef UUID_SIZE
 # define UUID_SIZE 16
