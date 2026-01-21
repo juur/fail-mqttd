@@ -335,6 +335,9 @@ TOOL_CHECK=""
 
 # Application specific variables
 
+CHECK_CFLAGS=
+CHECK_LIBS=
+
 # Check for pkg-config (mandatory)
 
 echo -n "Checking for pkg-config ... "
@@ -366,6 +369,17 @@ for f in ${PKG_CHECK} ; do
 		LDFLAGS="${LDFLAGS} $(${PKG_CONFIG} --libs "${f}")"
 	fi
 done
+
+# Optional Check unit test framework (no hard failure)
+
+if check_pkg "check"; then
+	CHECK_CFLAGS=$(${PKG_CONFIG} --cflags check)
+	CHECK_LIBS=$(${PKG_CONFIG} --libs check)
+else
+	if check_lib "check"; then
+		CHECK_LIBS="-lcheck"
+	fi
+fi
 
 # library checks
 
@@ -487,6 +501,8 @@ ARGS=$(cat <<- __END
 	s#@@PACKAGE@@#${PACKAGE}#;
 	s#@@PROGPREFIX@@#${PROGPREFIX}#;
 	s#@@EXTRASRCS@@#${EXTRASRCS}#;
+	s#@@CHECK_CFLAGS@@#${CHECK_CFLAGS}#;
+	s#@@CHECK_LIBS@@#${CHECK_LIBS}#;
 __END
 )
 

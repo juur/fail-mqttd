@@ -47,12 +47,18 @@ progprefix     := @@PROGPREFIX@@
 
 main_SRCS    := main.c constants.c
 raft_SRCS    := raft.c raft_impl.c raft_constants.c
+test_SRCS    := $(wildcard $(srcdir)/tests/test-*.c)
 
 all_SRCS     := $(main_SRCS) @@EXTRASRCS@@
 all_SRCS     := $(addprefix $(srcdir)/src/,$(all_SRCS))
 
 all_HEADERS  := $(wildcard $(srcdir)/src/*.h)
 package_OBJS := $(addprefix $(objdir)/,$(notdir $(all_SRCS:.c=.o)))
+test_OBJS    := $(patsubst $(srcdir)/tests/%.c,$(objdir)/%.o,$(test_SRCS))
+test_BINS    := $(patsubst $(srcdir)/tests/%.c,$(objdir)/%,$(test_SRCS))
+
+CHECK_CFLAGS := @@CHECK_CFLAGS@@
+CHECK_LIBS   := @@CHECK_LIBS@@
 
 ifeq ($(DEPS),1)
 CPPFLAGS += -MMD -MP
@@ -60,8 +66,16 @@ endif
 CPPFLAGS += -I$(objdir) -I$(srcdir)/src
 CPPFLAGS += -I$(srcdir)/include
 
-.PHONY: all
+.PHONY: all check test
 all: $(objdir)/.d $(objdir)/$(progprefix)$(PACKAGE) $(objdir)/$(PACKAGE).8
+
+check: $(test_BINS)
+	@set -e; for t in $(test_BINS); do \
+		echo "RUN $$t"; \
+		$$t; \
+	done
+
+test: check
 
 $(objdir)/.d:
 	@mkdir -p $(objdir)/.d 2>/dev/null
@@ -116,6 +130,12 @@ ifeq ($(DEPS),1)
 else
 	$(CC) -c $(CFLAGS) $(CPPFLAGS) $< -o $@
 endif
+
+$(objdir)/%.o: $(srcdir)/tests/%.c
+	$(CC) -c $(CFLAGS) $(CPPFLAGS) $(CHECK_CFLAGS) $< -o $@
+
+$(objdir)/test-%: $(objdir)/test-%.o
+	$(CC) $(objdir)/test-$*.o $(LDFLAGS) $(CHECK_LIBS) -o $@
 
 ifeq ($(DEPS),1)
 -include $(all_SRCS:$(srcdir)/src/%.c=$(objdir)/.d/%.d)
