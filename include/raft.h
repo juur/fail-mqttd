@@ -166,6 +166,7 @@ struct raft_host_entry {
     int peer_fd;
     uint32_t server_id;
     timems_t next_conn_attempt;
+    timems_t last_leader_sync; /* rate limit RAFT_APPEND_ENTRIES (non-PING) */
 
     struct in_addr address;
     in_port_t port;

@@ -92,11 +92,13 @@ static int commit_and_advance(struct raft_log *log_entry)
 
     pthread_rwlock_wrlock(&global_topics_lock);
     if ((topic = find_topic(log_entry->register_topic.name, false, false)) != NULL) {
-        if (topic->state != TOPIC_PREACTIVE)
+        if (topic->state != TOPIC_PREACTIVE) {
+            pthread_rwlock_unlock(&global_topics_lock);
             goto fail;
+        }
         topic->state = TOPIC_ACTIVE;
         pthread_rwlock_unlock(&global_topics_lock);
-        rdbg_printf("RAFT raft_commit_and_advance: activated topic <%s>\n", log_entry->register_topic.name);
+        rdbg_printf("IMPL raft_commit_and_advance: activated topic <%s>\n", log_entry->register_topic.name);
     } else {
         pthread_rwlock_unlock(&global_topics_lock);
 
@@ -104,7 +106,7 @@ static int commit_and_advance(struct raft_log *log_entry)
             warn("raft_commit_and_advance: register_topic");
             goto fail;
         } else {
-            rdbg_printf("RAFT raft_commit_and_advance: registered new topic <%s>\n", log_entry->register_topic.name);
+            rdbg_printf("IMPL raft_commit_and_advance: registered new topic <%s>\n", log_entry->register_topic.name);
         }
     }
 
@@ -128,10 +130,16 @@ fail:
 
 static int leader_append(struct raft_log *new_log, va_list ap)
 {
+    size_t name_len;
+
     new_log->register_topic.name = (void *)strdup((void *)va_arg(ap, uint8_t *));
     if (new_log->register_topic.name == NULL)
         goto fail;
-    new_log->register_topic.length = strlen((void *)new_log->register_topic.name);
+    if ((name_len = strlen((void *)new_log->register_topic.name)) > UINT16_MAX) {
+        errno = EOVERFLOW;
+        goto fail;
+    }
+    new_log->register_topic.length = name_len;
 
     memcpy(&new_log->register_topic.uuid, va_arg(ap, uint8_t *), UUID_SIZE);
 
@@ -151,6 +159,7 @@ fail:
 static int client_append(struct raft_log *new_client_event, raft_log_t /* event */, va_list ap)
 {
     int rc = 0;
+    size_t name_len;
 
     uint8_t *str      = va_arg(ap, uint8_t *);
     uint8_t *uuid     = va_arg(ap, void *);
@@ -164,7 +173,13 @@ static int client_append(struct raft_log *new_client_event, raft_log_t /* event 
         warn("raft_client_log_sendv: strdup");
         goto fail;
     }
-    new_client_event->register_topic.length = strlen((void *)str);
+    
+    if ((name_len = strlen((void *)str)) > UINT16_MAX) {
+        errno = EOVERFLOW;
+        goto fail;
+    }
+    
+    new_client_event->register_topic.length = name_len;
     memcpy(&new_client_event->register_topic.uuid, uuid, UUID_SIZE);
     new_client_event->register_topic.flags = flags;
     if (msg_uuid)
@@ -216,7 +231,7 @@ static int fill_send(struct send_state *out, const struct raft_log *tmp)
         memcpy(out->ptr, out->arg_msg_uuid, UUID_SIZE)  ; out->ptr += UUID_SIZE        ;
     }
 
-    //rdbg_printf(BGRN "RAFT fill_send: CLIENT_REQUEST: REGISTER_TOPIC <%s, %ld, %s>" CRESET "\n",
+    //rdbg_printf(BGRN "IMPL fill_send: CLIENT_REQUEST: REGISTER_TOPIC <%s, %ld, %s>" CRESET "\n",
     //        out->arg_str, tmp_len, uuid_to_string(out->arg_uuid));
 
     if (tmp) {
@@ -233,7 +248,7 @@ static int fill_send(struct send_state *out, const struct raft_log *tmp)
 }
 
 static raft_status_t process_packet(size_t *bytes_remaining, const uint8_t **ptr,
-        raft_rpc_t /* rpc */, raft_log_t /* type */, struct raft_log *out)
+        raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *out)
 {
     uint8_t *temp_string = NULL;
     uint32_t flags;
@@ -267,7 +282,7 @@ static raft_status_t process_packet(size_t *bytes_remaining, const uint8_t **ptr
         goto fail;
 
     if ((temp_string = (void *)strndup((void *)*ptr, tmp_len)) == NULL) {
-        warnx("raft_recv: strndup");
+        warnx("process_packet: strndup");
         goto fail;
     }
     *ptr += tmp_len + 1;
@@ -305,7 +320,7 @@ static raft_status_t process_packet(size_t *bytes_remaining, const uint8_t **ptr
             memset(out->register_topic.msg_uuid, 0, UUID_SIZE);
     }
 
-    rdbg_printf("RAFT raft_recv: CLIENT_REQUEST: REGISTER_TOPIC(%s)\n", temp_string);
+    rdbg_printf("IMPL process_packet: %s: REGISTER_TOPIC(%s)\n", raft_rpc_str[rpc], temp_string);
     /*
     rc = raft_leader_log_append(type,
             temp_string, uuid, flags,
@@ -355,7 +370,6 @@ static int save_log(const struct raft_log *l, uint8_t **event_buf)
             }
             
             assert(ptr == (ret + rc));
-            rdbg_printf("RAFT save_log: rc = %d\n", rc);
             break;
 
         default:
@@ -377,8 +391,9 @@ static int read_log(struct raft_log *l, const uint8_t *event_buf, int len)
 {
     const uint8_t *ptr = event_buf;
     errno = EINVAL;
+    size_t bytes_remaining = len;
 
-    rdbg_printf("RAFT read_log: event_buf=%p len=%d\n", event_buf, len);
+    rdbg_printf("IMPL read_log: event_buf=%p len=%d\n", event_buf, len);
 
     if (event_buf == NULL || len == 0)
         goto fail;
@@ -386,32 +401,31 @@ static int read_log(struct raft_log *l, const uint8_t *event_buf, int len)
     switch (l->event)
     {
         case RAFT_LOG_REGISTER_TOPIC:
-            if ((size_t)len < sizeof(uint32_t) + sizeof(uint16_t) + l->register_topic.length + UUID_SIZE) {
-                rdbg_printf("RAFT read_log: %d < %ld\n",
-                        len, sizeof(uint32_t) + sizeof(uint16_t) + l->register_topic.length + UUID_SIZE);
-                errno = EINVAL;
+            if (bytes_remaining < sizeof(uint32_t) + sizeof(uint16_t) + UUID_SIZE)
                 goto fail;
-            }
 
-            memcpy(&l->register_topic.flags, ptr, sizeof(uint32_t))  ; ptr += sizeof(uint32_t) ;
-            memcpy(&l->register_topic.length, ptr, sizeof(uint16_t)) ; ptr += sizeof(uint16_t) ;
-            memcpy(&l->register_topic.uuid, ptr, UUID_SIZE)          ; ptr += UUID_SIZE        ;
-            
+            memcpy(&l->register_topic.flags, ptr, sizeof(uint32_t))  ; ptr += sizeof(uint32_t) ; bytes_remaining -= sizeof(uint32_t) ;
+            memcpy(&l->register_topic.length, ptr, sizeof(uint16_t)) ; ptr += sizeof(uint16_t) ; bytes_remaining -= sizeof(uint16_t) ;
+            memcpy(&l->register_topic.uuid, ptr, UUID_SIZE)          ; ptr += UUID_SIZE        ; bytes_remaining -= UUID_SIZE        ;
+
+            if (bytes_remaining < l->register_topic.length)
+                goto fail;
+
             l->register_topic.name = (void *)strndup((const void *)ptr, l->register_topic.length);
             if (l->register_topic.name == NULL)
                 goto fail;
             ptr += l->register_topic.length;
+            bytes_remaining -= l->register_topic.length;
 
             if (l->register_topic.flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
                 l->register_topic.retained = true;
-                if (ptr + UUID_SIZE > event_buf + len) {
-                    errno = EMSGSIZE;
+                if (bytes_remaining < UUID_SIZE)
                     goto fail;
-                }
-                memcpy(&l->register_topic.msg_uuid, ptr, UUID_SIZE)  ; ptr += UUID_SIZE        ;
+
+                memcpy(&l->register_topic.msg_uuid, ptr, UUID_SIZE)  ; ptr += UUID_SIZE        ; bytes_remaining -= UUID_SIZE        ;
             }
 
-            rdbg_printf("RAFT read_log: REGISTER_TOPIC [%d/%d] <%s>\n", l->index, l->term, l->register_topic.name);
+            rdbg_printf("IMPL read_log: REGISTER_TOPIC [%d/%d] <%s>\n", l->index, l->term, l->register_topic.name);
             assert(ptr == (event_buf + len));
             break;
 
