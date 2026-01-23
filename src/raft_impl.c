@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <assert.h>
 
 #include "config.h"
 #include "mqtt.h"
@@ -215,8 +216,8 @@ static int fill_send(struct send_state *out, const struct raft_log *tmp)
         memcpy(out->ptr, out->arg_msg_uuid, UUID_SIZE)  ; out->ptr += UUID_SIZE        ;
     }
 
-    rdbg_printf(BGRN "RAFT raft_send: CLIENT_REQUEST: REGISTER_TOPIC <%s, %ld, %s>" CRESET "\n",
-            out->arg_str, tmp_len, uuid_to_string(out->arg_uuid));
+    //rdbg_printf(BGRN "RAFT fill_send: CLIENT_REQUEST: REGISTER_TOPIC <%s, %ld, %s>" CRESET "\n",
+    //        out->arg_str, tmp_len, uuid_to_string(out->arg_uuid));
 
     if (tmp) {
         entry_length += sizeof(uint32_t);
@@ -324,6 +325,111 @@ fail:
     return -1;
 }
 
+static int save_log(const struct raft_log *l, uint8_t **event_buf)
+{
+    int rc = 0;
+    errno = EINVAL;
+    uint8_t *ret = NULL, *ptr = NULL;
+
+    if (event_buf == NULL)
+        goto fail;
+
+    switch (l->event)
+    {
+        case RAFT_LOG_REGISTER_TOPIC:
+            assert(l->register_topic.length > 0);
+
+            rc = sizeof(uint32_t) + sizeof(uint16_t) + l->register_topic.length + UUID_SIZE;
+            if (l->register_topic.retained)
+                rc += UUID_SIZE;
+
+            if ((ptr = ret = malloc(rc)) == NULL)
+                goto fail;
+
+            memcpy(ptr, &l->register_topic.flags, sizeof(uint32_t))       ; ptr += sizeof(uint32_t)         ; 
+            memcpy(ptr, &l->register_topic.length, sizeof(uint16_t))      ; ptr += sizeof(uint16_t)         ; 
+            memcpy(ptr, &l->register_topic.uuid, UUID_SIZE)               ; ptr += UUID_SIZE                ; 
+            memcpy(ptr, l->register_topic.name, l->register_topic.length) ; ptr += l->register_topic.length ; 
+            if (l->register_topic.retained) {
+                memcpy(ptr, &l->register_topic.msg_uuid, UUID_SIZE)       ; ptr += UUID_SIZE                ;
+            }
+            
+            assert(ptr == (ret + rc));
+            rdbg_printf("RAFT save_log: rc = %d\n", rc);
+            break;
+
+        default:
+            warnx("save_log: unknown event %d", l->event);
+            goto fail;
+    }
+
+    *event_buf = ret;
+    errno = 0;
+    return rc;
+
+fail:
+    if (ret)
+        free(ret);
+    return -1;
+}
+
+static int read_log(struct raft_log *l, const uint8_t *event_buf, int len)
+{
+    const uint8_t *ptr = event_buf;
+    errno = EINVAL;
+
+    rdbg_printf("RAFT read_log: event_buf=%p len=%d\n", event_buf, len);
+
+    if (event_buf == NULL || len == 0)
+        goto fail;
+
+    switch (l->event)
+    {
+        case RAFT_LOG_REGISTER_TOPIC:
+            if ((size_t)len < sizeof(uint32_t) + sizeof(uint16_t) + l->register_topic.length + UUID_SIZE) {
+                rdbg_printf("RAFT read_log: %d < %ld\n",
+                        len, sizeof(uint32_t) + sizeof(uint16_t) + l->register_topic.length + UUID_SIZE);
+                errno = EINVAL;
+                goto fail;
+            }
+
+            memcpy(&l->register_topic.flags, ptr, sizeof(uint32_t))  ; ptr += sizeof(uint32_t) ;
+            memcpy(&l->register_topic.length, ptr, sizeof(uint16_t)) ; ptr += sizeof(uint16_t) ;
+            memcpy(&l->register_topic.uuid, ptr, UUID_SIZE)          ; ptr += UUID_SIZE        ;
+            
+            l->register_topic.name = (void *)strndup((const void *)ptr, l->register_topic.length);
+            if (l->register_topic.name == NULL)
+                goto fail;
+            ptr += l->register_topic.length;
+
+            if (l->register_topic.flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
+                l->register_topic.retained = true;
+                if (ptr + UUID_SIZE > event_buf + len) {
+                    errno = EMSGSIZE;
+                    goto fail;
+                }
+                memcpy(&l->register_topic.msg_uuid, ptr, UUID_SIZE)  ; ptr += UUID_SIZE        ;
+            }
+
+            rdbg_printf("RAFT read_log: REGISTER_TOPIC [%d/%d] <%s>\n", l->index, l->term, l->register_topic.name);
+            assert(ptr == (event_buf + len));
+            break;
+
+        default:
+            warnx("read_log: unknown event %d", l->event);
+            goto fail;
+    }
+
+    return 0;
+
+fail:
+    if (l->register_topic.name) {
+        free (l->register_topic.name);
+        l->register_topic.name = NULL;
+    }
+    return -1;
+}
+
 const struct raft_impl mqtt_raft_impl = {
     .name = "fail-mqttd",
     .num_log_types = RAFT_MAX_LOG,
@@ -336,7 +442,9 @@ const struct raft_impl mqtt_raft_impl = {
             .pre_send           = pre_send,
             .fill_send          = fill_send,
             .process_packet     = process_packet,
+            .save_log           = save_log,
+            .read_log           = read_log,
         },
-        { NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+        { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
     },
 };

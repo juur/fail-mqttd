@@ -3434,10 +3434,13 @@ static void close_all_sockets(void)
 
 }
 
-static int attempt_save_all_topics(void)
+int attempt_save_all_topics(void)
 {
     int rc = 0;
     const struct topic *topic;
+
+    if (opt_database == false)
+        return 0;
 
     dbg_printf("     "BYEL"save_all_topics"CRESET"\n");
     for (topic = global_topic_list; topic; topic = topic->next)

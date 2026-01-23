@@ -100,8 +100,9 @@ coverage-run:
 	$(MAKE) check \
 		CFLAGS="$(CFLAGS) $(COVERAGE_CFLAGS)" \
 		LDFLAGS="$(LDFLAGS) $(COVERAGE_LDFLAGS)"
-	$(GCOVR) -r $(srcdir) --print-summary --xml $(objdir)/coverage.xml \
-		--html-details $(objdir)/coverage.html
+	-$(MKDIR) $(objdir)/coverage/ 2>/dev/null
+	$(GCOVR) -r $(srcdir) --print-summary --xml $(objdir)/coverage/coverage.xml \
+		--html-details $(objdir)/coverage/coverage.html
 
 $(objdir)/doc:
 	@mkdir -p $(objdir)/doc 2>/dev/null
@@ -153,6 +154,8 @@ distclean: clean
 mostlyclean:
 	-$(RM) $(package_OBJS) $(objdir)/$(PACKAGE) $(test_OBJS) $(test_CORE_OBJS) \
 		$(test_SUPPORT_OBJS) $(test_BINS)
+	-$(RM) -f $(objdir)/*.gcda $(objdir)/*.gcno
+	-$(RM) -f $(objdir)/tests/*.gcda $(objdir)/tests/*.gcno
 
 clean: mostlyclean
 	-$(RM) $(objdir)/$(PACKAGE).8

@@ -273,6 +273,8 @@ struct raft_impl_entry {
     int (*pre_send)(struct raft_log *, struct send_state *);
     int (*fill_send)(struct send_state *, const struct raft_log *);
     raft_status_t (*process_packet)(size_t *, const uint8_t **, raft_rpc_t rpc, raft_log_t, struct raft_log *);
+    int (*save_log)(const struct raft_log *, uint8_t **);
+    int (*read_log)(struct raft_log *, const uint8_t *, int);
 };
 
 struct raft_impl {

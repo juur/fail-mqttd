@@ -27,11 +27,19 @@ extern struct raft_state raft_state;
 extern const struct raft_impl *raft_impl;
 
 static int free_log_called;
+static int commit_called;
 
 static int test_free_log(struct raft_log *entry)
 {
 	(void)entry;
 	free_log_called++;
+	return 0;
+}
+
+static int test_commit_and_advance(struct raft_log *entry)
+{
+	(void)entry;
+	commit_called++;
 	return 0;
 }
 
@@ -57,6 +65,7 @@ static const struct raft_impl test_impl = {
 	.handlers = {
 		[RAFT_LOG_REGISTER_TOPIC] = {
 			.free_log = test_free_log,
+			.commit_and_advance = test_commit_and_advance,
 			.process_packet = test_process_packet,
 		},
 	},
@@ -115,6 +124,41 @@ static void reset_raft_state(void)
 	raft_state.self_id = 1;
 }
 
+static void simulate_restart(void)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+
+	raft_state.state = RAFT_STATE_FOLLOWER;
+	raft_state.commit_index = 0;
+	raft_state.last_applied = 0;
+	raft_state.election = false;
+	raft_state.election_timer = 0;
+	raft_state.next_ping = 0;
+	raft_state.next_request_vote = 0;
+
+	if (client_state) {
+		client_state->current_leader_id = NULL_ID;
+		client_state->current_leader = NULL;
+	}
+
+	if (*peers_ptr) {
+		for (unsigned idx = 0; idx < *num_ptr; idx++) {
+			struct raft_host_entry *entry = &(*peers_ptr)[idx];
+
+			entry->vote_responded = false;
+			entry->vote_granted = NULL_ID;
+			entry->next_index = 1;
+			entry->match_index = 0;
+
+			raft_test_api.raft_reset_read_state(entry);
+			raft_test_api.raft_reset_write_state(entry, true);
+			raft_test_api.raft_reset_ss_state(entry, true);
+		}
+	}
+}
+
 static void setup_cluster(unsigned count)
 {
 	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
@@ -156,6 +200,7 @@ static void setup(void)
 {
 	raft_impl = &test_impl;
 	free_log_called = 0;
+	commit_called = 0;
 	reset_raft_state();
 	init_client_state();
 }
@@ -592,6 +637,23 @@ struct impl_cluster {
 	struct impl_node nodes[3];
 };
 
+static bool impl_logs_match(const struct raft_state *lhs, const struct raft_state *rhs)
+{
+	const struct raft_log *a = lhs->log_head;
+	const struct raft_log *b = rhs->log_head;
+
+	for (; a && b; a = a->next, b = b->next) {
+		if (a->index != b->index)
+			return false;
+		if (a->term != b->term)
+			return false;
+		if (a->event != b->event)
+			return false;
+	}
+
+	return a == NULL && b == NULL;
+}
+
 static void model_set_entry(struct model_node *node, uint32_t index, uint32_t term)
 {
 	ck_assert_uint_ge(index, 1);
@@ -772,6 +834,19 @@ static void model_append_from_leader(struct model_node *follower,
 {
 	ck_assert_uint_le(index, leader->log_len);
 	model_set_entry(follower, index, leader->log[index - 1].term);
+}
+
+static bool model_deliver_append(struct model_node *follower,
+		const struct model_node *leader, uint32_t prev_index, uint32_t prev_term,
+		uint32_t entry_index)
+{
+	if (!model_accept_append_entries(follower, leader, prev_index, prev_term))
+		return false;
+
+	if (entry_index != 0)
+		model_append_from_leader(follower, leader, entry_index);
+
+	return true;
 }
 
 static bool model_quorum_intersection(void)
@@ -1334,6 +1409,51 @@ START_TEST(test_conformance_append_entries_appends_and_commits)
 }
 END_TEST
 
+START_TEST(test_conformance_append_entries_out_of_order_recovery)
+{
+	struct conformance_ctx ctx = {
+		.last_term = raft_state.current_term,
+		.last_commit = raft_state.commit_index,
+	};
+	raft_status_t reply;
+
+	setup_cluster(2);
+	raft_state.state = RAFT_STATE_FOLLOWER;
+	raft_state.current_term = 2;
+
+	ck_assert_int_eq(send_append_entries_single(2, 2, 1, 2, 0, 2, 2, &reply), 0);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_int_eq(reply, RAFT_FALSE);
+	ck_assert_ptr_eq(raft_state.log_head, NULL);
+
+	ck_assert_int_eq(send_append_entries_single(2, 2, 0, 0, 0, 1, 2, &reply), 0);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_int_eq(reply, RAFT_TRUE);
+	ck_assert_uint_eq(raft_state.log_tail->index, 1);
+
+	ck_assert_int_eq(send_append_entries_single(2, 2, 1, 2, 0, 2, 2, &reply), 0);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_int_eq(reply, RAFT_TRUE);
+	ck_assert_uint_eq(raft_state.log_tail->index, 2);
+	ck_assert_int_eq(atomic_load(&raft_state.log_length), 2);
+}
+END_TEST
+
 START_TEST(test_conformance_append_entries_commit_cap)
 {
 	struct conformance_ctx ctx = {
@@ -1676,6 +1796,107 @@ START_TEST(test_model_partition_merge_higher_term_wins)
 }
 END_TEST
 
+START_TEST(test_model_liveness_eventual_leader_and_commit)
+{
+	struct model_cluster cluster;
+	struct model_node *candidate;
+	struct model_node *leader;
+
+	model_init_cluster(&cluster);
+
+	candidate = &cluster.nodes[0];
+	model_timeout(candidate);
+	model_grant_votes(&cluster, candidate);
+
+	ck_assert_int_eq(candidate->state, RAFT_STATE_LEADER);
+
+	leader = candidate;
+	model_append_entry(leader, leader->term);
+	model_replicate_to_all(&cluster, leader);
+	model_commit_all(&cluster, leader->log_len);
+
+	ck_assert_uint_eq(cluster.nodes[0].commit_index, leader->log_len);
+	ck_assert_uint_eq(cluster.nodes[1].commit_index, leader->log_len);
+	ck_assert_uint_eq(cluster.nodes[2].commit_index, leader->log_len);
+}
+END_TEST
+
+START_TEST(test_model_message_reorder_recovery)
+{
+	struct model_cluster cluster;
+	struct model_node *leader;
+	struct model_node *follower;
+
+	model_init_cluster(&cluster);
+	leader = &cluster.nodes[0];
+	follower = &cluster.nodes[1];
+
+	leader->state = RAFT_STATE_LEADER;
+	leader->term = 2;
+	model_append_entry(leader, 2);
+	model_append_entry(leader, 2);
+
+	ck_assert(!model_deliver_append(follower, leader, 1, 2, 2));
+	ck_assert_uint_eq(follower->log_len, 0);
+
+	ck_assert(model_deliver_append(follower, leader, 0, 0, 1));
+	ck_assert_uint_eq(follower->log_len, 1);
+
+	ck_assert(model_deliver_append(follower, leader, 1, 2, 2));
+	ck_assert_uint_eq(follower->log_len, 2);
+	ck_assert(model_log_matching(cluster.nodes, 2));
+}
+END_TEST
+
+START_TEST(test_model_duplicate_append_entries_idempotent)
+{
+	struct model_cluster cluster;
+	struct model_node *leader;
+	struct model_node *follower;
+
+	model_init_cluster(&cluster);
+	leader = &cluster.nodes[0];
+	follower = &cluster.nodes[1];
+
+	leader->state = RAFT_STATE_LEADER;
+	leader->term = 2;
+	model_append_entry(leader, 2);
+
+	ck_assert(model_accept_append_entries(follower, leader, 0, 0));
+	model_append_from_leader(follower, leader, 1);
+
+	ck_assert_uint_eq(follower->log_len, 1);
+	ck_assert_uint_eq(follower->log[0].term, 2);
+
+	ck_assert(model_accept_append_entries(follower, leader, 0, 0));
+	model_append_from_leader(follower, leader, 1);
+
+	ck_assert_uint_eq(follower->log_len, 1);
+	ck_assert_uint_eq(follower->log[0].term, 2);
+	ck_assert(model_log_matching(cluster.nodes, 2));
+}
+END_TEST
+
+START_TEST(test_model_drop_append_entries_no_effect)
+{
+	struct model_cluster cluster;
+	struct model_node *leader;
+	struct model_node *follower;
+
+	model_init_cluster(&cluster);
+	leader = &cluster.nodes[0];
+	follower = &cluster.nodes[1];
+
+	leader->state = RAFT_STATE_LEADER;
+	leader->term = 2;
+	model_append_entry(leader, 2);
+
+	ck_assert_uint_eq(follower->log_len, 0);
+	ck_assert_uint_eq(leader->log_len, 1);
+	ck_assert(model_log_matching(cluster.nodes, 2));
+}
+END_TEST
+
 START_TEST(test_impl_three_node_leader_replication)
 {
 	struct impl_cluster cluster;
@@ -1748,6 +1969,116 @@ START_TEST(test_impl_three_node_leader_replication)
 }
 END_TEST
 
+START_TEST(test_impl_log_matching_after_replication)
+{
+	struct impl_cluster cluster;
+	struct impl_node *leader;
+	struct impl_node *follower_a;
+	struct impl_node *follower_b;
+	struct raft_log *entry;
+
+	impl_cluster_init(&cluster);
+
+	leader = &cluster.nodes[0];
+	follower_a = &cluster.nodes[1];
+	follower_b = &cluster.nodes[2];
+
+	leader->state.state = RAFT_STATE_LEADER;
+	leader->state.current_term = 2;
+	leader->state.voted_for = leader->id;
+
+	impl_load_node(leader);
+	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
+	ck_assert_ptr_nonnull(entry);
+	entry->index = 1;
+	entry->term = leader->state.current_term;
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
+	ck_assert_ptr_nonnull(entry);
+	entry->index = 2;
+	entry->term = leader->state.current_term;
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	raft_state.log_index = 2;
+	impl_save_node(leader);
+
+	ck_assert_int_eq(impl_append_entries(leader, follower_a, 1, leader->state.current_term, 0), 0);
+	ck_assert_int_eq(impl_append_entries(leader, follower_a, 2, leader->state.current_term, 0), 0);
+	ck_assert_int_eq(impl_append_entries(leader, follower_b, 1, leader->state.current_term, 0), 0);
+	ck_assert_int_eq(impl_append_entries(leader, follower_b, 2, leader->state.current_term, 0), 0);
+
+	ck_assert(impl_logs_match(&leader->state, &follower_a->state));
+	ck_assert(impl_logs_match(&leader->state, &follower_b->state));
+
+	impl_cluster_free(&cluster);
+	{
+		struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+		unsigned *num_ptr = raft_test_api.num_peers_ptr();
+
+		*peers_ptr = NULL;
+		*num_ptr = 1;
+	}
+}
+END_TEST
+
+START_TEST(test_impl_leader_completeness_after_leader_change)
+{
+	struct impl_cluster cluster;
+	struct impl_node *leader;
+	struct impl_node *follower;
+	struct raft_log *entry;
+
+	impl_cluster_init(&cluster);
+
+	leader = &cluster.nodes[0];
+	follower = &cluster.nodes[1];
+
+	leader->state.state = RAFT_STATE_LEADER;
+	leader->state.current_term = 2;
+	leader->state.voted_for = leader->id;
+
+	impl_load_node(leader);
+	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
+	ck_assert_ptr_nonnull(entry);
+	entry->index = 1;
+	entry->term = leader->state.current_term;
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	raft_state.log_index = 1;
+	impl_save_node(leader);
+
+	ck_assert_int_eq(impl_append_entries(leader, follower, 1, leader->state.current_term, 0), 0);
+
+	impl_load_node(leader);
+	ck_assert_int_ge(raft_test_api.raft_check_commit_index(1), 0);
+	ck_assert_uint_eq(raft_state.commit_index, 1);
+	impl_save_node(leader);
+
+	impl_load_node(follower);
+	ck_assert_int_eq(send_append_entries_heartbeat(leader->state.current_term, leader->id,
+				1, leader->state.current_term, 1, NULL), 0);
+	impl_save_node(follower);
+
+	follower->state.state = RAFT_STATE_LEADER;
+	follower->state.current_term = 3;
+	follower->state.voted_for = follower->id;
+
+	ck_assert_ptr_nonnull(follower->state.log_head);
+	ck_assert_uint_eq(follower->state.log_head->index, 1);
+	ck_assert_uint_eq(follower->state.log_head->term, 2);
+
+	impl_cluster_free(&cluster);
+	{
+		struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+		unsigned *num_ptr = raft_test_api.num_peers_ptr();
+
+		*peers_ptr = NULL;
+		*num_ptr = 1;
+	}
+}
+END_TEST
+
 START_TEST(test_model_quorum_intersection_majority)
 {
 	ck_assert(model_quorum_intersection());
@@ -1767,6 +2098,37 @@ START_TEST(test_conformance_request_vote_reply_higher_term_steps_down)
 	peers = *peers_ptr;
 
 	raft_state.state = RAFT_STATE_CANDIDATE;
+	raft_state.current_term = 2;
+	raft_state.voted_for = raft_state.self_id;
+	client_state->current_leader_id = raft_state.self_id;
+
+	ck_assert_int_eq(process_request_vote_reply(&peers[1], RAFT_TRUE, 3, peers[1].server_id), 0);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_int_eq(raft_state.state, RAFT_STATE_FOLLOWER);
+	ck_assert_uint_eq(raft_state.current_term, 3);
+	ck_assert_uint_eq(client_state->current_leader_id, NULL_ID);
+}
+END_TEST
+
+START_TEST(test_conformance_request_vote_reply_higher_term_steps_down_leader)
+{
+	struct conformance_ctx ctx = {
+		.last_term = raft_state.current_term,
+		.last_commit = raft_state.commit_index,
+	};
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	struct raft_host_entry *peers;
+
+	setup_cluster(2);
+	peers = *peers_ptr;
+
+	raft_state.state = RAFT_STATE_LEADER;
 	raft_state.current_term = 2;
 	raft_state.voted_for = raft_state.self_id;
 	client_state->current_leader_id = raft_state.self_id;
@@ -1905,6 +2267,39 @@ START_TEST(test_conformance_append_entries_reply_next_index_floor)
 }
 END_TEST
 
+START_TEST(test_conformance_append_entries_reply_needs_snapshot)
+{
+	struct conformance_ctx ctx = {
+		.last_term = raft_state.current_term,
+		.last_commit = raft_state.commit_index,
+	};
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	struct raft_host_entry *peers;
+	struct raft_log *entry;
+
+	setup_cluster(2);
+	peers = *peers_ptr;
+
+	raft_state.current_term = 2;
+	entry = make_log(5, 2);
+	raft_state.log_head = entry;
+	raft_state.log_tail = entry;
+	atomic_store(&raft_state.log_length, 1);
+
+	peers[1].next_index = 3;
+	peers[1].match_index = 0;
+
+	ck_assert_int_eq(process_append_entries_reply(&peers[1], RAFT_FALSE, 2, 0), 0);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_uint_eq(peers[1].next_index, 3);
+}
+END_TEST
+
 START_TEST(test_conformance_client_request_appends_log)
 {
 	struct conformance_ctx ctx = {
@@ -1969,6 +2364,46 @@ START_TEST(test_conformance_client_request_rejected_when_not_leader)
 	ck_assert_uint_eq(reply_type, RAFT_LOG_REGISTER_TOPIC);
 	ck_assert_ptr_eq(raft_state.log_head, NULL);
 	ck_assert_int_eq(atomic_load(&raft_state.log_length), 0);
+}
+END_TEST
+
+START_TEST(test_conformance_client_request_commit_applies_with_quorum)
+{
+	struct conformance_ctx ctx = {
+		.last_term = raft_state.current_term,
+		.last_commit = raft_state.commit_index,
+	};
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_host_entry *peers;
+	raft_status_t reply;
+
+	setup_cluster(3);
+	peers = *peers_ptr;
+	*num_ptr = 3;
+
+	raft_state.state = RAFT_STATE_LEADER;
+	raft_state.current_term = 2;
+	raft_state.voted_for = raft_state.self_id;
+	client_state->current_leader_id = raft_state.self_id;
+
+	ck_assert_int_eq(send_client_request(1, 1, RAFT_LOG_REGISTER_TOPIC, &reply,
+				NULL, NULL, NULL), 0);
+	ck_assert_int_eq(reply, RAFT_OK);
+
+	peers[1].match_index = 1;
+	peers[2].match_index = 1;
+
+	ck_assert_int_eq(raft_test_api.raft_check_commit_index(1), 1);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_uint_eq(raft_state.commit_index, 1);
+	ck_assert_int_eq(commit_called, 1);
 }
 END_TEST
 
@@ -2052,6 +2487,80 @@ START_TEST(test_conformance_advance_commit_index_current_term_quorum)
 }
 END_TEST
 
+START_TEST(test_conformance_restart_preserves_stable_state)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_host_entry *peers;
+	struct raft_log *entry;
+
+	setup_cluster(3);
+	peers = *peers_ptr;
+	*num_ptr = 3;
+
+	raft_state.current_term = 5;
+	raft_state.voted_for = 2;
+	raft_state.state = RAFT_STATE_LEADER;
+	raft_state.commit_index = 2;
+	raft_state.last_applied = 2;
+
+	entry = make_log(1, 4);
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	entry = make_log(2, 5);
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	raft_state.log_index = 2;
+
+	peers[1].next_index = 3;
+	peers[1].match_index = 2;
+	peers[1].vote_responded = true;
+	peers[1].vote_granted = raft_state.self_id;
+
+	simulate_restart();
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+
+	ck_assert_int_eq(raft_state.state, RAFT_STATE_FOLLOWER);
+	ck_assert_uint_eq(raft_state.current_term, 5);
+	ck_assert_uint_eq(raft_state.voted_for, 2);
+	ck_assert_uint_eq(raft_state.commit_index, 0);
+	ck_assert_uint_eq(raft_state.last_applied, 0);
+	ck_assert_uint_eq(raft_state.log_tail->index, 2);
+	ck_assert_uint_eq(raft_state.log_tail->term, 5);
+	ck_assert_int_eq(atomic_load(&raft_state.log_length), 2);
+	ck_assert_uint_eq(peers[1].next_index, 1);
+	ck_assert_uint_eq(peers[1].match_index, 0);
+	ck_assert(!peers[1].vote_responded);
+	ck_assert_uint_eq(peers[1].vote_granted, NULL_ID);
+}
+END_TEST
+
+START_TEST(test_conformance_restart_keeps_voted_for)
+{
+	raft_status_t reply;
+
+	setup_cluster(1);
+	raft_state.current_term = 4;
+	raft_state.voted_for = 2;
+	raft_state.state = RAFT_STATE_LEADER;
+	raft_state.commit_index = 1;
+
+	simulate_restart();
+
+	ck_assert_int_eq(send_request_vote(4, 3, 0, 0, &reply, NULL, NULL), 0);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+
+	ck_assert_int_eq(reply, RAFT_FALSE);
+	ck_assert_uint_eq(raft_state.voted_for, 2);
+}
+END_TEST
+
 static Suite *raft_conformance_suite(void)
 {
 	Suite *s = suite_create("raft_conformance");
@@ -2073,12 +2582,16 @@ static Suite *raft_conformance_suite(void)
 	tcase_add_test(tc, test_conformance_append_entries_conflict_replaces_entry);
 	tcase_add_test(tc, test_conformance_append_entries_duplicate_no_growth);
 	tcase_add_test(tc, test_conformance_append_entries_appends_and_commits);
+	tcase_add_test(tc, test_conformance_append_entries_out_of_order_recovery);
 	tcase_add_test(tc, test_conformance_append_entries_commit_cap);
 	tcase_add_test(tc, test_conformance_append_entries_reply_updates_match_index);
 	tcase_add_test(tc, test_conformance_append_entries_reply_higher_term_steps_down);
 	tcase_add_test(tc, test_conformance_append_entries_reply_decrements_next_index);
+	tcase_add_test(tc, test_conformance_restart_preserves_stable_state);
+	tcase_add_test(tc, test_conformance_restart_keeps_voted_for);
 	tcase_add_test(tc, test_conformance_client_request_appends_log);
 	tcase_add_test(tc, test_conformance_client_request_rejected_when_not_leader);
+	tcase_add_test(tc, test_conformance_client_request_commit_applies_with_quorum);
 	tcase_add_test(tc, test_conformance_advance_commit_index_requires_current_term);
 	tcase_add_test(tc, test_conformance_advance_commit_index_current_term_quorum);
 	tcase_add_test(tc, test_model_log_matching_prefix_holds);
@@ -2091,13 +2604,21 @@ static Suite *raft_conformance_suite(void)
 	tcase_add_test(tc, test_model_leadership_change_preserves_log_matching);
 	tcase_add_test(tc, test_model_append_entries_backtrack_converges);
 	tcase_add_test(tc, test_model_partition_merge_higher_term_wins);
+	tcase_add_test(tc, test_model_liveness_eventual_leader_and_commit);
+	tcase_add_test(tc, test_model_message_reorder_recovery);
+	tcase_add_test(tc, test_model_duplicate_append_entries_idempotent);
+	tcase_add_test(tc, test_model_drop_append_entries_no_effect);
 	tcase_add_test(tc, test_impl_three_node_leader_replication);
+	tcase_add_test(tc, test_impl_log_matching_after_replication);
+	tcase_add_test(tc, test_impl_leader_completeness_after_leader_change);
 	tcase_add_test(tc, test_model_quorum_intersection_majority);
 	tcase_add_test(tc, test_conformance_request_vote_reply_higher_term_steps_down);
+	tcase_add_test(tc, test_conformance_request_vote_reply_higher_term_steps_down_leader);
 	tcase_add_test(tc, test_conformance_request_vote_reply_majority);
 	tcase_add_test(tc, test_conformance_request_vote_reply_stale_term_ignored);
 	tcase_add_test(tc, test_conformance_request_vote_reply_ignored_if_not_candidate);
 	tcase_add_test(tc, test_conformance_append_entries_reply_next_index_floor);
+	tcase_add_test(tc, test_conformance_append_entries_reply_needs_snapshot);
 
 	suite_add_tcase(s, tc);
 	return s;
@@ -2109,7 +2630,7 @@ int main(void)
 	SRunner *sr = srunner_create(s);
 	int failed;
 
-	srunner_run_all(sr, CK_VERBOSE);
+	srunner_run_all(sr, CK_ENV);
 	failed = srunner_ntests_failed(sr);
 	srunner_free(sr);
 	return failed == 0 ? 0 : 1;
