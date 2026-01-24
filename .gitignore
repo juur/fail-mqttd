@@ -17,6 +17,10 @@ vgcore.*
 doc/html/
 test*.sh
 state_save*
+save_state*
 ignore/
 test_*
+*.gcda
+*.gcno
+coverage/
 *.log
