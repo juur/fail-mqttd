@@ -14,7 +14,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: prep
-      run: sudo apt-get install -y libgdbm-dev libgdbm-compat-dev
+      run: sudo apt-get install -y libgdbm-dev libgdbm-compat-dev check
     - name: configure
       run: ./configure --enable-raft --enable-openmetrics
     - name: make
