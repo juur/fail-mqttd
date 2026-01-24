@@ -125,7 +125,7 @@ static int raft_save_state(bool header_only)
     uint8_t *event_buf = NULL;
     char file_name[BUFSIZ], new_file_name[BUFSIZ];
 
-    rdbg_printf("RAFT raft_save_state: start\n");
+    //rdbg_printf("RAFT raft_save_state: start\n");
 
     const uint32_t save_current_term = raft_state.current_term;
     const uint32_t save_voted_for = raft_state.voted_for;
@@ -255,7 +255,7 @@ skip_log:
         }
     }
 
-    rdbg_printf("RAFT raft_save_state: done\n");
+    //rdbg_printf("RAFT raft_save_state: done\n");
     return 0;
 
 fail:
@@ -1528,7 +1528,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
         errno = EBADF;
         return -1;
     } else if (mode == RAFT_SERVER && (client == NULL || client->peer_fd == -1)) {
-        warnx("raft_send: RAFT_SERVER without client or peer_fd");
+        warnx("raft_send: SERVER without client or peer_fd");
         errno = EBADF;
         return -1;
     }
@@ -1637,7 +1637,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
             arg_num_entries    = va_arg(ap, uint32_t);
 
             if (packet.length < (RAFT_HDR_SIZE + RAFT_APPEND_ENTRIES_FIXED_SIZE)) {
-                warn("raft_send: RAFT_APPEND_ENTRIES: packet.length too short");
+                warn("raft_send: APPEND_ENTRIES: packet.length too short");
                 goto fail;
             }
 
@@ -2171,7 +2171,6 @@ static int raft_tick(void)
     const timems_t now = timems();
 
 #ifdef FEATURE_RAFT_DEBUG
-    static uint32_t last_idx = 0, last_term = 0;
     static time_t last_run = 0;
 
     if (last_run == 0)
@@ -2191,6 +2190,8 @@ static int raft_tick(void)
                 raft_active_peers, raft_client_state.current_leader_id,
                 raft_state.voted_for);
 
+#if 0
+        static uint32_t last_idx = 0, last_term = 0;
         if (last_term != raft_state.current_term || log_index != last_idx) {
             last_term = raft_state.current_term;
             last_idx = log_index;
@@ -2219,13 +2220,14 @@ static int raft_tick(void)
                 rdbg_cprintf("\n");
             }
         }
+#endif
     }
 #endif
 
     switch(raft_state.state)
     {
         case RAFT_STATE_NONE:
-            warnx("raft_tick: RAFT_STATE_NONE");
+            warnx("raft_tick: STATE_NONE");
             abort();
             break;
 
@@ -2268,7 +2270,7 @@ static int raft_tick(void)
                                 raft_state.commit_index,
                                 (uint32_t)0, NULL
                                 ) == -1) {
-                        warn("raft_tick: RAFT_LEADER: raft_send(%u)",
+                        warn("raft_tick: LEADER: raft_send(%u)",
                                 raft_peers[idx].server_id);
                     }
                 }
@@ -2328,7 +2330,7 @@ static int raft_tick(void)
                                     tmp_prev_index, tmp_prev_term,
                                     raft_state.commit_index, log_cnt,
                                     (const struct raft_log *)tmp) == -1)
-                            warn("raft_tick: RAFT_LEADER: raft_send");
+                            warn("raft_tick: LEADER: raft_send");
                         /* we have sent all the remaining ones so exit this loop */
                         break;
                     }
@@ -2371,16 +2373,17 @@ static raft_status_t process_append_entries(struct raft_host_entry *client,
     if (term < raft_state.current_term) {
         reply = RAFT_FALSE;
         goto append_reply;
-    } else {
-        raft_update_leader_id(leader_id, true);
-        raft_reset_election_timer();
     }
+
+    raft_update_leader_id(leader_id, true);
+    raft_reset_election_timer();
 
     /* 2. reply false if log doesn't contain an entry at
      * prev_log_index whose term matches prev_log_term */
 
     if (raft_state.log_head == NULL) {
         if (prev_log_index > 0) {
+            new_match_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
             reply = RAFT_FALSE; /* signal we have nothing so we're at index=0 */
             goto append_reply;
         }
@@ -2394,7 +2397,9 @@ static raft_status_t process_append_entries(struct raft_host_entry *client,
         if (tmp->index == prev_log_index && tmp->term == prev_log_term)
             goto got_prev_log;
     }
-    rdbg_printf("RAFT no log matches\n");
+    rdbg_printf("RAFT process_append_entries: no log matches for [%d/%d]\n",
+            prev_log_term, prev_log_index);
+    new_match_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
     reply = RAFT_FALSE;
     goto append_reply;
 
@@ -2466,11 +2471,11 @@ got_prev_log:
 
     if (term == raft_state.current_term &&
             raft_state.state == RAFT_STATE_CANDIDATE) {
-        rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: received term matched leader ping from %u, stepping down.\n",
+        rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: received term matched leader ping from %u, ceasing CANDIDATE.\n",
                 client->server_id);
         goto step_down;
     } else if (term > raft_state.current_term) {
-        rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: received newer term from %u, stepping down.\n",
+        rdbg_printf("RAFT raft_recv: APPEND_ENTRIES: received newer term from %u, stepping down.\n",
                 client->server_id);
         raft_update_term(term);
 step_down:
@@ -2487,7 +2492,7 @@ append_reply:
     if (reply == RAFT_TRUE) {
         raft_reset_election_timer();
     } else {
-        rdbg_printf("RAFT raft_recv: RAFT_APPEND_ENTRIES: sending reply of %s idx=%u\n",
+        rdbg_printf(BRED "RAFT raft_recv: APPEND_ENTRIES: sending reply of %s idx=%u " CRESET "\n",
                 raft_status_str[reply], new_match_index);
     }
 
@@ -2597,7 +2602,7 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
                     goto done;
                 }
 
-                warn("raft_process_packet: RAFT_CLIENT_REQUEST_REPLY: got an error: <%s>",
+                warn("raft_process_packet: CLIENT_REQUEST_REPLY: got an error: <%s>",
                         reply < RAFT_MAX_STATUS ? raft_status_str[reply] : "ILLEGAL_CODE");
                 goto fail;
             }
@@ -2781,6 +2786,8 @@ send_client_request_reply:
                     bytes_remaining -= RAFT_LOG_FIXED_SIZE;
 
                     if (index != expected_index) {
+                        rdbg_printf(BRED "RAFT raft_process_packet: sending RAFT_FALSE: index %d != expected_index %d " CRESET "\n",
+                                index, expected_index);
                         raft_send(RAFT_PEER, client, RAFT_APPEND_ENTRIES_REPLY, RAFT_FALSE,
                                 prev_log_index);
                         goto done;
@@ -2845,7 +2852,7 @@ send_client_request_reply:
                 memcpy(&new_match_index, ptr, sizeof(uint32_t)) ; ptr += sizeof(uint32_t) ; new_match_index = ntohl(new_match_index) ;
 
                 if (client_term > raft_state.current_term) {
-                    rdbg_printf("RAFT raft_process_packet: RAFT_APPEND_ENTRIES_REPLY has higher term from id=%u, converting\n",
+                    rdbg_printf("RAFT raft_process_packet: APPEND_ENTRIES_REPLY has higher term from id=%u, converting\n",
                             client->server_id);
                     raft_update_term(client_term);
                     raft_change_to(RAFT_STATE_FOLLOWER);
@@ -2854,8 +2861,10 @@ send_client_request_reply:
                     break;
                 }
 
+                if (raft_state.state != RAFT_STATE_LEADER)
+                    break;
+
                 if (status == RAFT_TRUE) {
-                    /* TODO one of this match/next index should increase monotonically? */
                     if (new_match_index > client->match_index) {
                         rdbg_printf("RAFT raft_process_packet: APPEND_ENTRIES_REPLY: updating match_index[%u] to %u\n",
                                 client->server_id, new_match_index);
@@ -2865,9 +2874,29 @@ send_client_request_reply:
                     if (new_match_index >= client->next_index) {
                         client->next_index = new_match_index + 1;
                     }
-                } else if (raft_state.log_head && client->next_index > raft_state.log_head->index) {
-                    if (client->next_index > 1)
-                        client->next_index--;
+
+                    break;
+                }
+
+                rdbg_printf(BRED "RAFT raft_process_packet: APPEND_ENTRIES_REPLY %s from %u new_match_index %d " CRESET "\n",
+                      raft_status_str[status], client->server_id, new_match_index);
+
+                const uint32_t old_next = client->next_index;
+                const uint32_t leader_tail = raft_state.log_tail ? raft_state.log_tail->index : 0;
+                /* Follower hint: earliest index worth retrying: its match + 1, min 1 */
+                const uint32_t hinted_next = MAX(1, new_match_index + 1);
+                /* Clamp hint so we never point past the leader's own log */
+                const uint32_t target_next = MIN(leader_tail +1, hinted_next);
+
+                /* Fast backtrack */
+                if (target_next < old_next)
+                    client->next_index = target_next;
+                /* Slow backtrack */
+                if (client->next_index == old_next && client->next_index > 1)
+                    client->next_index--;
+
+                if (raft_state.log_head && client->next_index > raft_state.log_head->index) {
+                    /* leader has the entries needed at/after next_index */
                 } else if (client->next_index > 1) {
                     /* TODO trigger RAFT_INSTALL_SNAPSHOT */
                     warnx("raft_process_packet: i don't have what the client needs!");
@@ -2875,8 +2904,6 @@ send_client_request_reply:
                     client->next_index = 1;
                 }
 
-                //rdbg_printf("RAFT raft_process_packet: APPEND_ENTRIES_REPLY %s from %u\n",
-                //      raft_status_str[status], sender);
             }
             break;
 
@@ -2900,7 +2927,7 @@ send_client_request_reply:
                     break;
 
                 if (term > raft_state.current_term) {
-                    rdbg_printf("RAFT raft_process_packet: RAFT_REQUEST_VOTE_REPLY has higher term from id=%u, converting.\n",
+                    rdbg_printf("RAFT raft_process_packet: REQUEST_VOTE_REPLY has higher term from id=%u, converting.\n",
                             client->server_id);
                     raft_update_term(term);
                     raft_change_to(RAFT_STATE_FOLLOWER);
@@ -2913,7 +2940,7 @@ send_client_request_reply:
                 if (raft_state.state != RAFT_STATE_CANDIDATE)
                     break;
 
-                rdbg_printf("RAFT raft_process_packet: RAFT_REQUEST_VOTE_REPLY: %u voted %s\n",
+                rdbg_printf("RAFT raft_process_packet: REQUEST_VOTE_REPLY: %u voted %s\n",
                         client->server_id, raft_status_str[status]);
 
                 client->vote_responded = true;
@@ -2944,11 +2971,11 @@ send_client_request_reply:
                 if (raft_state.self_id == raft_state.voted_for)
                     votes++;
 
-                rdbg_printf(BRED "RAFT raft_process_packet: RAFT_REQUEST_VOTE_REPLY: %d/%d votes. %d voted. need %d" CRESET "\n",
+                rdbg_printf(BCYN "RAFT raft_process_packet: REQUEST_VOTE_REPLY: %d/%d votes. %d voted. need %d" CRESET "\n",
                         votes, total, has_voted, need);
 
                 if (votes >= need) {
-                    rdbg_printf(BYEL "RAFT raft_process_packet: RAFT_REQUEST_VOTE_REPLY: i have won!" CRESET "\n");
+                    rdbg_printf(BYEL "RAFT raft_process_packet: REQUEST_VOTE_REPLY: i have won!" CRESET "\n");
                     raft_update_leader_id(raft_state.self_id, true);
                     raft_change_to(RAFT_STATE_LEADER);
                     raft_stop_election();

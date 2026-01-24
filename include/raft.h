@@ -280,7 +280,7 @@ struct raft_impl_entry {
 
 struct raft_impl {
     const char *const name;
-    const int num_log_types;
+    const unsigned num_log_types;
     const struct raft_impl_entry handlers[] __attribute__((counted_by(num_log_types)));
 };
 

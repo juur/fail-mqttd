@@ -13,7 +13,7 @@
 #include "mqtt.h"
 #include "raft.h"
 
-#if defined(FEATURE_RAFT_DEBUG)
+#if defined(FEATURE_RAFT_IMPL_DEBUG)
 # define CRESET "\x1b[0m"
 
 # define BBLU "\x1b[1;34m"
@@ -34,7 +34,7 @@
 
 #endif
 
-#ifndef FEATURE_RAFT_DEBUG
+#ifndef FEATURE_RAFT_IMPL_DEBUG
 # define rdbg_printf(...) { }
 # define rdbg_cprintf(...) { }
 #else
@@ -248,7 +248,7 @@ static int fill_send(struct send_state *out, const struct raft_log *tmp)
 }
 
 static raft_status_t process_packet(size_t *bytes_remaining, const uint8_t **ptr,
-        raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *out)
+        [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *out)
 {
     uint8_t *temp_string = NULL;
     uint32_t flags;
@@ -393,7 +393,7 @@ static int read_log(struct raft_log *l, const uint8_t *event_buf, int len)
     errno = EINVAL;
     size_t bytes_remaining = len;
 
-    rdbg_printf("IMPL read_log: event_buf=%p len=%d\n", event_buf, len);
+    //rdbg_printf("IMPL read_log: event_buf=%p len=%d\n", event_buf, len);
 
     if (event_buf == NULL || len == 0)
         goto fail;
