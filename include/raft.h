@@ -191,6 +191,9 @@ struct raft_host_entry {
     ssize_t wr_need;
     ssize_t wr_packet_length;
     pthread_rwlock_t wr_lock;
+    struct io_buf *wr_head;
+    struct io_buf *wr_tail;
+    struct io_buf *wr_active;
 
     /* snapshot sending */
     _Atomic const uint8_t *ss_data;
@@ -254,6 +257,12 @@ struct raft_client_state {
     pthread_rwlock_t log_pending_lock;
     /* lock for the entire raft_client_state */
     pthread_rwlock_t lock;
+};
+
+struct io_buf {
+    struct io_buf *next;
+    const uint8_t *buf;
+    ssize_t size;
 };
 
 struct send_state {

@@ -6258,7 +6258,7 @@ static int handle_cp_disconnect(struct client *client, struct packet *packet,
         bytes_left--;
         dbg_printf("[%2d] handle_cp_disconnect: disconnect reason was %u\n",
                 client->session->id, disconnect_reason);
-        logger(LOG_INFO, client, "handle_cp_disconnect: disconnect request with reason %s",
+        logger(LOG_DEBUG, client, "handle_cp_disconnect: disconnect request with reason %s",
                 (disconnect_reason < MQTT_REASON_CODE_MAX) ? reason_codes_str[disconnect_reason] :
                 "UNKNOWN");
     }
@@ -6272,7 +6272,7 @@ static int handle_cp_disconnect(struct client *client, struct packet *packet,
 skip:
         dbg_printf("[%2d] handle_cp_disconnect: no reason\n",
                 client->session->id);
-        logger(LOG_INFO, client, "handle_cp_disconnect: disconnect request with no reason");
+        logger(LOG_DEBUG, client, "handle_cp_disconnect: disconnect request with no reason");
     }
 
     if (bytes_left)
@@ -6698,7 +6698,7 @@ create_new_session:
 
     client->session->state = SESSION_ACTIVE;
 
-    logger(LOG_INFO, client, "handle_cp_connect: session established%s%s%s",
+    logger(LOG_DEBUG, client, "handle_cp_connect: session established%s%s%s",
             reconnect ? " (reconnect)" : "",
             clean ? " (clean_start)" : "",
             (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) ? " (will)" : "");
@@ -7209,7 +7209,7 @@ static void client_tick(void)
                 break;
 
             case CS_DISCONNECTED:
-                logger(LOG_INFO, clnt, "client_tick: client disconnected");
+                logger(LOG_DEBUG, clnt, "client_tick: client disconnected");
                 if (clnt->session) {
 
                     /* Prepare the Will Message to be sent, optionally
