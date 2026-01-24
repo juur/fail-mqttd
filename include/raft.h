@@ -194,6 +194,7 @@ struct raft_host_entry {
     struct io_buf *wr_head;
     struct io_buf *wr_tail;
     struct io_buf *wr_active;
+    unsigned wr_queue;
 
     /* snapshot sending */
     _Atomic const uint8_t *ss_data;
@@ -261,7 +262,7 @@ struct raft_client_state {
 
 struct io_buf {
     struct io_buf *next;
-    const uint8_t *buf;
+    uint8_t *buf;
     ssize_t size;
 };
 
@@ -428,7 +429,6 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
 
 #define RAFT_LOG_FIXED_SIZE (1+1+4+4+2)
 
-extern int   raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_list ap);
 extern int   raft_client_log_send(raft_log_t event, ...);
 extern int   raft_leader_log_append(raft_log_t event, ...);
 extern int   raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...);

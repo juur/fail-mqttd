@@ -25,8 +25,9 @@
 
 #include "debug.h"
 #include "raft.h"
+
 #ifdef TESTS
-#include "raft_test_api.h"
+# include "raft_test_api.h"
 #endif
 
 #define MAX(a,b) (((a)>(b)) ? (a) : (b))
@@ -89,14 +90,14 @@ static struct raft_log *raft_alloc_log(raft_conn_t, raft_log_t);
 static int raft_free_log(struct raft_log *);
 static int raft_append_log(struct raft_log *, struct raft_log **, struct raft_log **, _Atomic long *);
 static int raft_commit_and_advance(void);
-static int raft_remove_iobuf(struct io_buf *, struct io_buf **, struct io_buf **);
+static int raft_remove_iobuf(struct io_buf *, struct io_buf **, struct io_buf **, unsigned *);
 
-static inline long rnd(int from, int to)
+static long rnd(int from, int to)
 {
     return random() % (to - from + 1) + from;
 }
 
-static inline int64_t timems(void)
+static int64_t timems(void)
 {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
@@ -511,6 +512,28 @@ static void raft_reset_read_state(struct raft_host_entry *client)
     client->rd_packet_length = 0;
 }
 
+static inline bool raft_has_pending_write(struct raft_host_entry *client)
+{
+    bool ret;
+    pthread_rwlock_rdlock(&client->wr_lock);
+    ret = (client->wr_active || client->wr_head);
+    pthread_rwlock_unlock(&client->wr_lock);
+    return ret;
+}
+
+[[gnu::nonnull]]
+static int raft_clear_active_write(struct raft_host_entry *client)
+{
+    client->wr_need          = 0;
+    client->wr_packet_buffer = NULL;
+    client->wr_packet_length = 0;
+    client->wr_offset        = 0;
+    client->wr_active        = NULL;
+
+    return 0;
+}
+
+[[gnu::nonnull]]
 static int raft_reset_write_state(struct raft_host_entry *client, bool need_lock)
 {
     struct io_buf *tmp, *next;
@@ -518,12 +541,8 @@ static int raft_reset_write_state(struct raft_host_entry *client, bool need_lock
     if (need_lock)
         pthread_rwlock_wrlock(&client->wr_lock);
 
-    client->wr_need = 0;
-    client->wr_offset = 0;
-    client->wr_packet_length = 0;
-    client->wr_packet_buffer = NULL;
-
     free_iobuf(client->wr_active);
+    raft_clear_active_write(client);
 
     for (tmp = client->wr_head; tmp; tmp = next)
     {
@@ -534,6 +553,7 @@ static int raft_reset_write_state(struct raft_host_entry *client, bool need_lock
     client->wr_head = NULL;
     client->wr_tail = NULL;
     client->wr_active = NULL;
+    client->wr_queue = 0;
 
     if (need_lock)
         pthread_rwlock_unlock(&client->wr_lock);
@@ -758,7 +778,7 @@ static int raft_free_log(struct raft_log *entry)
 }
 
 [[gnu::nonnull(1,2)]]
-static int raft_remove_iobuf(struct io_buf *entry, struct io_buf **head, struct io_buf **tail)
+static int raft_remove_iobuf(struct io_buf *entry, struct io_buf **head, struct io_buf **tail, unsigned *len)
 {
     struct io_buf *prev = NULL;
 
@@ -782,6 +802,8 @@ found_head:
         *tail = prev;
 
     entry->next = NULL;
+
+    (*len)--;
 
     return 0;
 }
@@ -843,13 +865,15 @@ static int raft_append_log(struct raft_log *entry, struct raft_log **head,
 
 [[gnu::nonnull]]
 static int raft_append_iobuf(struct io_buf *entry, struct io_buf **head,
-        struct io_buf **tail)
+        struct io_buf **tail, unsigned *iobuf_len)
 {
     if (*head == NULL)
         *head = entry;
     if (*tail != NULL)
         (*tail)->next = entry;
     *tail = entry;
+
+    (*iobuf_len)++;
 
     return 0;
 }
@@ -940,7 +964,7 @@ static int raft_check_commit_index(uint32_t best)
     return 0;
 }
 
-int raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_list ap)
+static int raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_list ap)
 {
     struct raft_log *new_log = log_p;
 
@@ -1485,12 +1509,31 @@ static const struct {
 
 
 [[gnu::nonnull]]
+/**
+ * Adds a buffer to the pending writes for a client.
+ *
+ * @param client the client to add to
+ * @param[in] buffer ownership of buffer is transferred
+ * @param size length of buffer
+ *
+ * @return -1 on error, @c errno is set
+ */
 static int raft_add_write(struct raft_host_entry *client, uint8_t *buffer, ssize_t size)
 {
     struct io_buf *io_buf;
 
     if (size <= 0) {
         errno = EINVAL;
+        return -1;
+    }
+
+    if (client->peer_fd == -1) {
+        errno = EBADF;
+        return -1;
+    }
+
+    if (client->wr_queue > 10) {
+        errno = ENOSPC;
         return -1;
     }
 
@@ -1502,7 +1545,7 @@ static int raft_add_write(struct raft_host_entry *client, uint8_t *buffer, ssize
     io_buf->size = size;
 
     pthread_rwlock_wrlock(&client->wr_lock);
-    raft_append_iobuf(io_buf, &client->wr_head, &client->wr_tail);
+    raft_append_iobuf(io_buf, &client->wr_head, &client->wr_tail, &client->wr_queue);
     pthread_rwlock_unlock(&client->wr_lock);
     return 0;
 }
@@ -1523,7 +1566,7 @@ static int raft_try_write(struct raft_host_entry *client)
         if (cur == NULL)
             goto done;
 
-        raft_remove_iobuf(cur, &client->wr_head, &client->wr_tail);
+        raft_remove_iobuf(cur, &client->wr_head, &client->wr_tail, &client->wr_queue);
         client->wr_active = cur;
 
         client->wr_need = client->wr_packet_length = cur->size;
@@ -1536,7 +1579,7 @@ static int raft_try_write(struct raft_host_entry *client)
         free_iobuf(client->wr_active);
         /* subsequent calls to raft_try_write will advance to the next
          * pending io_buf */
-        client->wr_active = NULL;
+        raft_clear_active_write(client);
         goto done;
     }
 
@@ -1948,7 +1991,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                 tmp_packet_buffer = NULL;
                 raft_close(&raft_peers[idx]);
             } else if (raft_try_write(&raft_peers[idx]) == -1) {
-                if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR)
+                if (!(errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR))
                     warn("raft_send: bcast raft_try_write(%u)", idx);
             } else {
                 sent++;
@@ -1993,7 +2036,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
         packet_buffer = NULL;
 
         if (raft_try_write(client) == -1) {
-            if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) {
+            if (!(errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)) {
                 warn("raft_send: raft_try_write(%u)", client->server_id);
                 goto fail;
             }
@@ -2373,7 +2416,7 @@ static int raft_tick(void)
                 if (now < raft_peers[idx].last_leader_sync)
                     continue;
 
-                if (raft_peers[idx].wr_packet_buffer)
+                if (raft_has_pending_write(&raft_peers[idx]))
                     continue;
 
                 raft_peers[idx].last_leader_sync = timems() + RAFT_PING_DELAY;
@@ -3450,7 +3493,7 @@ void *raft_loop(void *start_args)
                 max_fd = MAX(max_fd, raft_peers[idx].peer_fd);
                 FD_SET(raft_peers[idx].peer_fd, &fds_in);
                 FD_SET(raft_peers[idx].peer_fd, &fds_exc);
-                if (raft_peers[idx].wr_packet_buffer)
+                if (raft_has_pending_write(&raft_peers[idx]))
                     FD_SET(raft_peers[idx].peer_fd, &fds_out);
             }
         }
@@ -3499,10 +3542,10 @@ void *raft_loop(void *start_args)
                     continue;
                 }
 
-                if (raft_peers[idx].wr_packet_buffer &&
+                if (raft_has_pending_write(&raft_peers[idx]) &&
                         FD_ISSET(raft_peers[idx].peer_fd, &fds_out)) {
                     if (raft_try_write(&raft_peers[idx]) == -1)
-                        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                        if (!(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
                             rdbg_printf("RAFT main_loop: raft_try_write: %s\n", strerror(errno));
                             continue;
                         }

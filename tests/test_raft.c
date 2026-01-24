@@ -839,7 +839,7 @@ START_TEST(test_add_write_and_try_write_success)
 	init_entry_locks(&entry);
 	entry.peer_fd = fds[1];
 
-	ck_assert_int_eq(raft_test_api.raft_add_write(&entry, (const uint8_t *)strdup((const char *)payload),
+	ck_assert_int_eq(raft_test_api.raft_add_write(&entry, (uint8_t *)strdup((char *)payload),
 				sizeof(payload) - 1), 0);
 	ck_assert_int_eq(raft_test_api.raft_try_write(&entry), 0);
 	ck_assert_ptr_eq(__atomic_load_n(&entry.wr_packet_buffer, __ATOMIC_SEQ_CST), NULL);
