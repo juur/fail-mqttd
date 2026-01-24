@@ -18,6 +18,7 @@ struct raft_test_api {
     int64_t (*timems)(void);
 
     int (*raft_save_state)(bool);
+    int (*raft_load_state)(void);
     void (*raft_reset_read_state)(struct raft_host_entry *client);
     int (*raft_reset_write_state)(struct raft_host_entry *client, bool need_lock);
     int (*raft_reset_ss_state)(struct raft_host_entry *client, bool need_lock);

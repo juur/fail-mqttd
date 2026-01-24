@@ -171,7 +171,7 @@ static int raft_save_state(bool header_only)
         if (p->index > save_tail_index) /* WTF is this for ? */
             break;
 
-        if ((int)p->event > raft_impl->num_log_types)
+        if (p->event > raft_impl->num_log_types)
             abort();
 
         int event_buf_len;
@@ -724,7 +724,7 @@ static int raft_free_log(struct raft_log *entry)
 {
     int rc = 0;
 
-    if ((int)entry->event >= raft_impl->num_log_types) {
+    if (entry->event >= raft_impl->num_log_types) {
         errno = EINVAL;
         rc = -1;
         warnx("raft_free_log: attempt to free unknown event type %u", entry->event);
@@ -827,7 +827,7 @@ static int raft_commit_and_advance(void)
             log_entry->term
             );
 
-    if ((int)log_entry->event >= raft_impl->num_log_types) {
+    if (log_entry->event >= raft_impl->num_log_types) {
         errno = EINVAL;
         warnx("raft_commit_and_advance: unknown log entry %u@%u/%u",
                 log_entry->event,
@@ -904,7 +904,7 @@ int raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_list ap
     new_log->index = ++raft_state.log_index;
 
     if (log_p == NULL) {
-        if ((int)event >= raft_impl->num_log_types) {
+        if (event >= raft_impl->num_log_types) {
             errno = EINVAL;
             goto fail;
         }
@@ -1028,7 +1028,7 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
     inserted = true;
     pthread_rwlock_unlock(&raft_client_state.log_pending_lock);
 
-    if ((int)event >= raft_impl->num_log_types) {
+    if (event >= raft_impl->num_log_types) {
         errno = EINVAL;
         goto fail;
     }
@@ -1606,7 +1606,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
             arg_req_flags    = 0;
             arg_req_len      = 0;
 
-            if ((int)arg_req_type >= raft_impl->num_log_types) {
+            if (arg_req_type >= raft_impl->num_log_types) {
                 errno = EINVAL;
                 warnx("raft_send: CLIENT_REQUEST: unknown type (%u)", arg_req_type);
                 goto fail;
@@ -1664,7 +1664,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
 
                     packet.length += RAFT_LOG_FIXED_SIZE;
 
-                    if ((int)tmp->event >= raft_impl->num_log_types) {
+                    if (tmp->event >= raft_impl->num_log_types) {
                         errno = EINVAL;
                         goto fail;
                     }
@@ -1753,7 +1753,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
             /* actual request payload */
             memcpy(ptr, &arg_req_len, sizeof(uint16_t)); ptr += sizeof(uint16_t);
 
-            if ((int)arg_req_type >= raft_impl->num_log_types) {
+            if (arg_req_type >= raft_impl->num_log_types) {
                 errno = EINVAL;
                 goto fail;
             }
@@ -1817,7 +1817,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                     ptr += sizeof(uint16_t);
                     entry_length = 0;
 
-                    if ((int)tmp->event >= raft_impl->num_log_types) {
+                    if (tmp->event >= raft_impl->num_log_types) {
                         errno = EINVAL;
                         warnx("raft_send: tmp->event (%u) unknown inside RAFT_APPEND_ENTRIES", tmp->event);
                         goto fail;
@@ -2341,8 +2341,6 @@ static int raft_tick(void)
             /*
             if (raft_state.log_length > RAFT_MAX_LOG_LENGTH) {
                 rdbg_printf("RAFT raft_tick: saving state and compacting log\n");
-                if (raft_save_state() == -1)
-                    warn("raft_tick: raft_save_state");
             }
             */
 
@@ -3545,6 +3543,7 @@ const struct raft_test_api raft_test_api = {
     .rnd = rnd,
     .timems = timems,
     .raft_save_state = raft_save_state,
+    .raft_load_state = raft_load_state,
     .raft_reset_read_state = raft_reset_read_state,
     .raft_reset_write_state = raft_reset_write_state,
     .raft_reset_ss_state = raft_reset_ss_state,

@@ -43,6 +43,14 @@ static int test_commit_and_advance(struct raft_log *entry)
 	return 0;
 }
 
+static int test_save_log(const struct raft_log *entry, uint8_t **buf)
+{
+	(void)entry;
+	if (buf)
+		*buf = NULL;
+	return 0;
+}
+
 static raft_status_t test_process_packet(size_t *bytes_remaining,
 		const uint8_t **ptr, raft_rpc_t rpc, raft_log_t log_type,
 		struct raft_log *out)
@@ -67,6 +75,7 @@ static const struct raft_impl test_impl = {
 			.free_log = test_free_log,
 			.commit_and_advance = test_commit_and_advance,
 			.process_packet = test_process_packet,
+			.save_log = test_save_log,
 		},
 	},
 };
@@ -566,6 +575,29 @@ fail:
 	close(fds[1]);
 	destroy_entry_locks(&client);
 	return -1;
+}
+
+static void append_local_log(uint32_t index, uint32_t term)
+{
+	struct raft_log *entry = make_log(index, term);
+
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	raft_state.log_index = raft_state.log_tail->index;
+}
+
+static void catch_up_follower(uint32_t leader_term, uint32_t leader_id,
+		uint32_t start_index, uint32_t target_index)
+{
+	for (uint32_t idx = start_index + 1; idx <= target_index; idx++) {
+		raft_status_t status = RAFT_ERR;
+		uint32_t prev_index = idx - 1;
+		uint32_t prev_term = prev_index == 0 ? 0 : leader_term;
+
+		ck_assert_int_eq(send_append_entries_single(leader_term, leader_id,
+					prev_index, prev_term, idx, idx, leader_term, &status), 0);
+		ck_assert_int_eq(status, RAFT_TRUE);
+	}
 }
 
 static int process_append_entries_reply(struct raft_host_entry *client,
@@ -1489,6 +1521,7 @@ START_TEST(test_conformance_append_entries_reply_updates_match_index)
 	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
 	unsigned *num_ptr = raft_test_api.num_peers_ptr();
 	struct raft_host_entry *peers;
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
 
 	setup_cluster(3);
 	peers = *peers_ptr;
@@ -1496,6 +1529,9 @@ START_TEST(test_conformance_append_entries_reply_updates_match_index)
 
 	raft_state.current_term = 2;
 	raft_state.commit_index = 0;
+	raft_state.state = RAFT_STATE_LEADER;
+	raft_state.voted_for = raft_state.self_id;
+	client_state->current_leader_id = raft_state.self_id;
 	raft_state.log_head = make_log(1, 2);
 	raft_state.log_tail = raft_state.log_head;
 	atomic_store(&raft_state.log_length, 1);
@@ -1554,12 +1590,16 @@ START_TEST(test_conformance_append_entries_reply_decrements_next_index)
 	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
 	unsigned *num_ptr = raft_test_api.num_peers_ptr();
 	struct raft_host_entry *peers;
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
 
 	setup_cluster(2);
 	peers = *peers_ptr;
 	*num_ptr = 2;
 
 	raft_state.current_term = 2;
+	raft_state.state = RAFT_STATE_LEADER;
+	raft_state.voted_for = raft_state.self_id;
+	client_state->current_leader_id = raft_state.self_id;
 	raft_state.log_head = make_log(1, 2);
 	raft_state.log_tail = raft_state.log_head;
 	atomic_store(&raft_state.log_length, 1);
@@ -1576,6 +1616,103 @@ START_TEST(test_conformance_append_entries_reply_decrements_next_index)
 
 	ck_assert_uint_eq(peers[1].next_index, 1);
 	ck_assert_uint_eq(peers[1].match_index, 0);
+}
+END_TEST
+
+START_TEST(test_conformance_follower_catch_up_fresh_short)
+{
+	struct conformance_ctx ctx = {
+		.last_term = raft_state.current_term,
+		.last_commit = raft_state.commit_index,
+	};
+
+	setup_cluster(1);
+
+	raft_state.self_id = 2;
+	raft_state.state = RAFT_STATE_FOLLOWER;
+	raft_state.current_term = 1;
+	raft_state.voted_for = NULL_ID;
+	raft_state.commit_index = 0;
+	commit_called = 0;
+
+	catch_up_follower(2, 1, 0, 1);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_uint_eq(raft_state.log_tail->index, 1);
+	ck_assert_int_eq(atomic_load(&raft_state.log_length), 1);
+	ck_assert_uint_eq(raft_state.commit_index, 1);
+	ck_assert_int_eq(commit_called, 1);
+}
+END_TEST
+
+START_TEST(test_conformance_follower_catch_up_fresh_long)
+{
+	struct conformance_ctx ctx = {
+		.last_term = raft_state.current_term,
+		.last_commit = raft_state.commit_index,
+	};
+
+	setup_cluster(1);
+
+	raft_state.self_id = 2;
+	raft_state.state = RAFT_STATE_FOLLOWER;
+	raft_state.current_term = 1;
+	raft_state.voted_for = NULL_ID;
+	raft_state.commit_index = 0;
+	commit_called = 0;
+
+	catch_up_follower(2, 1, 0, 5);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_ptr_nonnull(raft_state.log_tail);
+	ck_assert_uint_eq(raft_state.log_tail->index, 5);
+	ck_assert_int_eq(atomic_load(&raft_state.log_length), 5);
+	ck_assert_uint_eq(raft_state.commit_index, 5);
+	ck_assert_int_eq(commit_called, 5);
+}
+END_TEST
+
+START_TEST(test_conformance_follower_catch_up_after_restart)
+{
+	struct conformance_ctx ctx = {
+		.last_term = raft_state.current_term,
+		.last_commit = raft_state.commit_index,
+	};
+
+	setup_cluster(1);
+
+	raft_state.self_id = 2;
+	raft_state.state = RAFT_STATE_FOLLOWER;
+	raft_state.current_term = 2;
+	raft_state.voted_for = NULL_ID;
+	raft_state.commit_index = 2;
+
+	append_local_log(1, 2);
+	append_local_log(2, 2);
+
+	simulate_restart();
+	commit_called = 0;
+
+	catch_up_follower(2, 1, 2, 6);
+
+	assert_election_safety();
+	assert_log_matching();
+	assert_leader_completeness();
+	assert_monotonicity(&ctx);
+
+	ck_assert_ptr_nonnull(raft_state.log_tail);
+	ck_assert_uint_eq(raft_state.log_tail->index, 6);
+	ck_assert_int_eq(atomic_load(&raft_state.log_length), 6);
+	ck_assert_uint_eq(raft_state.commit_index, 6);
+	ck_assert_int_eq(commit_called, 6);
 }
 END_TEST
 
@@ -2587,6 +2724,9 @@ static Suite *raft_conformance_suite(void)
 	tcase_add_test(tc, test_conformance_append_entries_reply_updates_match_index);
 	tcase_add_test(tc, test_conformance_append_entries_reply_higher_term_steps_down);
 	tcase_add_test(tc, test_conformance_append_entries_reply_decrements_next_index);
+	tcase_add_test(tc, test_conformance_follower_catch_up_fresh_short);
+	tcase_add_test(tc, test_conformance_follower_catch_up_fresh_long);
+	tcase_add_test(tc, test_conformance_follower_catch_up_after_restart);
 	tcase_add_test(tc, test_conformance_restart_preserves_stable_state);
 	tcase_add_test(tc, test_conformance_restart_keeps_voted_for);
 	tcase_add_test(tc, test_conformance_client_request_appends_log);

@@ -12,11 +12,14 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 #include "raft.h"
 #include "raft_test_api.h"
@@ -38,6 +41,38 @@ static int test_commit_and_advance(struct raft_log *entry)
 {
 	(void)entry;
 	commit_called++;
+	return 0;
+}
+
+static int test_save_log(const struct raft_log *entry, uint8_t **buf)
+{
+	uint32_t value;
+
+	if (!buf) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	value = htonl(entry->sequence_num);
+	*buf = malloc(sizeof(value));
+	if (!*buf)
+		return -1;
+
+	memcpy(*buf, &value, sizeof(value));
+	return (int)sizeof(value);
+}
+
+static int test_read_log(struct raft_log *entry, const uint8_t *buf, int len)
+{
+	uint32_t value;
+
+	if (!entry || !buf || len != (int)sizeof(value)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	memcpy(&value, buf, sizeof(value));
+	entry->sequence_num = ntohl(value);
 	return 0;
 }
 
@@ -69,6 +104,8 @@ static const struct raft_impl test_impl = {
 		[RAFT_LOG_REGISTER_TOPIC] = {
 			.free_log = test_free_log,
 			.commit_and_advance = test_commit_and_advance,
+			.save_log = test_save_log,
+			.read_log = test_read_log,
 		},
 	},
 };
@@ -203,6 +240,70 @@ static int call_client_log_sendv(raft_log_t event, ...)
 	return rc;
 }
 
+static int enter_temp_dir(char *path, size_t path_len, int *saved_cwd_fd)
+{
+	const char *tmpdir = getenv("TMPDIR");
+
+	if (!tmpdir)
+		tmpdir = "/tmp";
+
+	if (snprintf(path, path_len, "%s/raft-test-XXXXXX", tmpdir) >= (int)path_len)
+		return -1;
+
+	if (mkdtemp(path) == NULL)
+		return -1;
+
+	*saved_cwd_fd = open(".", O_RDONLY);
+	if (*saved_cwd_fd == -1)
+		return -1;
+
+	if (chdir(path) == -1)
+		return -1;
+
+	return 0;
+}
+
+static void leave_temp_dir(const char *path, int saved_cwd_fd)
+{
+	if (saved_cwd_fd != -1) {
+		if (fchdir(saved_cwd_fd) == -1)
+			(void)0;
+		close(saved_cwd_fd);
+	}
+
+	if (path) {
+		unlink("save_state.1");
+		unlink("save_state.1.new");
+		rmdir(path);
+	}
+}
+
+enum {
+	TEST_RSS_CURRENT_TERM = 0,
+	TEST_RSS_VOTED_FOR,
+	TEST_RSS_TAIL_TERM,
+	TEST_RSS_TAIL_INDEX,
+	TEST_RSS_SIZE
+};
+
+static int read_state_header(const char *path, uint32_t header[TEST_RSS_SIZE])
+{
+	int fd;
+	ssize_t rc;
+
+	fd = open(path, O_RDONLY);
+	if (fd == -1)
+		return -1;
+
+	rc = read(fd, header, sizeof(uint32_t) * TEST_RSS_SIZE);
+	close(fd);
+
+	if (rc != (ssize_t)(sizeof(uint32_t) * TEST_RSS_SIZE))
+		return -1;
+
+	return 0;
+}
+
 static void setup(void)
 {
 	raft_impl = &test_impl;
@@ -241,6 +342,158 @@ START_TEST(test_parse_cmdline_host_list_valid)
 	ck_assert_uint_eq((*peers_ptr)[0].address.s_addr, addr1.s_addr);
 	ck_assert_uint_eq((*peers_ptr)[1].address.s_addr, addr2.s_addr);
 	ck_assert_int_eq((*peers_ptr)[0].peer_fd, -1);
+}
+END_TEST
+
+START_TEST(test_save_and_load_state_round_trip)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	int saved_stderr = -1;
+	struct raft_log *log1;
+	struct raft_log *log2;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	raft_state.current_term = 7;
+	raft_state.voted_for = 2;
+
+	log1 = make_log(1, 7);
+	log1->sequence_num = 111;
+	log2 = make_log(2, 7);
+	log2->sequence_num = 222;
+
+	ck_assert_int_eq(raft_test_api.raft_append_log(log1, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	ck_assert_int_eq(raft_test_api.raft_append_log(log2, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	raft_state.log_index = raft_state.log_tail->index;
+
+	ck_assert_int_eq(raft_test_api.raft_save_state(false), 0);
+
+	reset_raft_state();
+	raft_state.self_id = 1;
+	commit_called = 0;
+
+	ck_assert_int_eq(redirect_stderr_to_null(&saved_stderr), 0);
+	ck_assert_int_eq(raft_test_api.raft_load_state(), 0);
+	restore_stderr(saved_stderr);
+
+	ck_assert_uint_eq(raft_state.current_term, 7);
+	ck_assert_uint_eq(raft_state.voted_for, 2);
+	ck_assert_ptr_nonnull(raft_state.log_head);
+	ck_assert_ptr_nonnull(raft_state.log_tail);
+	ck_assert_uint_eq(raft_state.log_tail->index, 2);
+	ck_assert_int_eq(atomic_load(&raft_state.log_length), 2);
+	ck_assert_int_eq(commit_called, 2);
+	ck_assert_uint_eq(raft_state.commit_index, 2);
+	ck_assert_uint_eq(raft_state.log_head->sequence_num, 111);
+	ck_assert_ptr_nonnull(raft_state.log_head->next);
+	ck_assert_uint_eq(raft_state.log_head->next->sequence_num, 222);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_save_state_header_only_preserves_log)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	struct raft_log *log1;
+	struct raft_log *log2;
+	struct stat st_before;
+	struct stat st_after;
+	uint32_t header[TEST_RSS_SIZE];
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	raft_state.current_term = 3;
+	raft_state.voted_for = 1;
+
+	log1 = make_log(1, 3);
+	log1->sequence_num = 10;
+	log2 = make_log(2, 3);
+	log2->sequence_num = 20;
+
+	ck_assert_int_eq(raft_test_api.raft_append_log(log1, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	ck_assert_int_eq(raft_test_api.raft_append_log(log2, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	raft_state.log_index = raft_state.log_tail->index;
+
+	ck_assert_int_eq(raft_test_api.raft_save_state(false), 0);
+	ck_assert_int_eq(stat("save_state.1", &st_before), 0);
+
+	raft_state.current_term = 9;
+	raft_state.voted_for = 4;
+	ck_assert_int_eq(raft_test_api.raft_save_state(true), 0);
+
+	ck_assert_int_eq(stat("save_state.1", &st_after), 0);
+	ck_assert_int_eq(st_before.st_size, st_after.st_size);
+	ck_assert_int_eq(read_state_header("save_state.1", header), 0);
+	ck_assert_uint_eq(header[TEST_RSS_CURRENT_TERM], 9);
+	ck_assert_uint_eq(header[TEST_RSS_VOTED_FOR], 4);
+	ck_assert_uint_eq(header[TEST_RSS_TAIL_TERM], 3);
+	ck_assert_uint_eq(header[TEST_RSS_TAIL_INDEX], 2);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_load_state_missing_file)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	int saved_stderr = -1;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	errno = 0;
+
+	ck_assert_int_eq(redirect_stderr_to_null(&saved_stderr), 0);
+	ck_assert_int_eq(raft_test_api.raft_load_state(), -1);
+	restore_stderr(saved_stderr);
+
+	ck_assert_int_eq(errno, ENOENT);
+	ck_assert_ptr_eq(raft_state.log_head, NULL);
+	ck_assert_uint_eq(raft_state.commit_index, 0);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_load_state_truncated_log_entry)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	int saved_stderr = -1;
+	int fd;
+	uint32_t header[TEST_RSS_SIZE] = { 1, 0, 1, 1 };
+	uint32_t log_word = 1;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	fd = open("save_state.1", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	ck_assert_int_ne(fd, -1);
+	ck_assert_int_eq(write(fd, header, sizeof(header)), (int)sizeof(header));
+	ck_assert_int_eq(write(fd, &log_word, sizeof(log_word)), (int)sizeof(log_word));
+	close(fd);
+
+	raft_state.self_id = 1;
+	commit_called = 0;
+	errno = 0;
+
+	ck_assert_int_eq(redirect_stderr_to_null(&saved_stderr), 0);
+	ck_assert_int_eq(raft_test_api.raft_load_state(), -1);
+	restore_stderr(saved_stderr);
+
+	ck_assert_ptr_eq(raft_state.log_head, NULL);
+	ck_assert_int_eq(commit_called, 0);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
 }
 END_TEST
 
@@ -2056,6 +2309,12 @@ END_TEST
 
 START_TEST(test_update_term)
 {
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
 	raft_state.current_term = 5;
 	raft_state.voted_for = 123;
 
@@ -2066,6 +2325,8 @@ START_TEST(test_update_term)
 	ck_assert_int_eq(raft_test_api.raft_update_term(6), 0);
 	ck_assert_uint_eq(raft_state.current_term, 6);
 	ck_assert_uint_eq(raft_state.voted_for, NULL_ID);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
 }
 END_TEST
 
@@ -2539,6 +2800,10 @@ static Suite *raft_suite(void)
 	tcase_add_test(tc, test_new_conn_bad_length);
 	tcase_add_test(tc, test_process_packet_append_entries_invalid_log_type);
 	tcase_add_test(tc, test_process_packet_client_request_overlong);
+	tcase_add_test(tc, test_save_and_load_state_round_trip);
+	tcase_add_test(tc, test_save_state_header_only_preserves_log);
+	tcase_add_test(tc, test_load_state_missing_file);
+	tcase_add_test(tc, test_load_state_truncated_log_entry);
 
 	suite_add_tcase(s, tc);
 	return s;
