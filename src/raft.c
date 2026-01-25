@@ -2238,6 +2238,8 @@ static int raft_change_to(raft_state_t mode)
             /* ensures a 'welcome' ping-style RAFT_APPEND_ENTRIES is sent swiftly */
             raft_state.next_ping = timems();
 
+            /* this NOOP ensures any pending (i.e. loaded from durable storage)
+             * logs are applied up till this point */
             raft_leader_log_appendv(RAFT_LOG_NOOP, NULL, NULL);
 
             const uint32_t last = raft_state.log_tail ? raft_state.log_tail->index : 0;
