@@ -75,6 +75,9 @@ static const struct raft_impl test_impl = {
 	.name = "conformance",
 	.num_log_types = RAFT_MAX_LOG,
 	.handlers = {
+		[RAFT_LOG_NOOP] = {
+			.save_log = test_save_log,
+		},
 		[RAFT_LOG_REGISTER_TOPIC] = {
 			.free_log = test_free_log,
 			.commit_and_advance = test_commit_and_advance,
@@ -88,6 +91,8 @@ struct conformance_ctx {
 	uint32_t last_term;
 	uint32_t last_commit;
 };
+
+static void init_state_filenames(void);
 
 static void init_entry_locks(struct raft_host_entry *entry)
 {
@@ -135,6 +140,7 @@ static void reset_raft_state(void)
 	raft_state.state = RAFT_STATE_FOLLOWER;
 	raft_state.current_term = 1;
 	raft_state.self_id = 1;
+	init_state_filenames();
 }
 
 static void simulate_restart(void)
@@ -215,11 +221,16 @@ static void setup(void)
 	free_log_called = 0;
 	commit_called = 0;
 	reset_raft_state();
+	raft_state.self_id = 1;
+	init_state_filenames();
 	init_client_state();
 }
 
 static void teardown(void)
 {
+	unlink(raft_state.fn_vars);
+	unlink(raft_state.fn_vars_new);
+	unlink(raft_state.fn_log);
 	reset_raft_state();
 	teardown_cluster();
 	destroy_client_state();
@@ -248,19 +259,34 @@ static int enter_temp_dir(char *path, size_t path_len, int *saved_cwd_fd)
 	return 0;
 }
 
+static void init_state_filenames(void)
+{
+	snprintf(raft_state.fn_prefix, sizeof(raft_state.fn_prefix),
+			"save_state_%u_", raft_state.self_id);
+	snprintf(raft_state.fn_vars, sizeof(raft_state.fn_vars),
+			"%svars.bin", raft_state.fn_prefix);
+	snprintf(raft_state.fn_log, sizeof(raft_state.fn_log),
+			"%slog.bin", raft_state.fn_prefix);
+	snprintf(raft_state.fn_vars_new, sizeof(raft_state.fn_vars_new),
+			"%s.new", raft_state.fn_vars);
+}
+
 static void leave_temp_dir(const char *path, int saved_cwd_fd)
 {
+	if (path) {
+		unlink(raft_state.fn_vars);
+		unlink(raft_state.fn_vars_new);
+		unlink(raft_state.fn_log);
+	}
+
 	if (saved_cwd_fd != -1) {
 		if (fchdir(saved_cwd_fd) == -1)
 			(void)0;
 		close(saved_cwd_fd);
 	}
 
-	if (path) {
-		unlink("save_state.1");
-		unlink("save_state.1.new");
+	if (path)
 		rmdir(path);
-	}
 }
 
 static struct raft_log *make_log(uint32_t index, uint32_t term)
@@ -968,6 +994,7 @@ static void impl_load_node(struct impl_node *node)
 	unsigned *num_ptr = raft_test_api.num_peers_ptr();
 
 	raft_state = node->state;
+	init_state_filenames();
 	*peers_ptr = node->peers;
 	*num_ptr = node->num_peers;
 
@@ -1181,14 +1208,22 @@ START_TEST(test_conformance_request_vote_rejects_outdated_log)
 	};
 	raft_status_t reply;
 	struct raft_log *entry;
+	struct raft_log *entry2;
 
 	setup_cluster(1);
 	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
 	ck_assert_ptr_nonnull(entry);
-	entry->index = 2;
+	entry->index = 1;
 	entry->term = 5;
-	raft_test_api.raft_append_log(entry, &raft_state.log_head,
-			&raft_state.log_tail, &raft_state.log_length);
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
+			&raft_state.log_tail, &raft_state.log_length), 0);
+
+	entry2 = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
+	ck_assert_ptr_nonnull(entry2);
+	entry2->index = 2;
+	entry2->term = 5;
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry2, &raft_state.log_head,
+			&raft_state.log_tail, &raft_state.log_length), 0);
 
 	ck_assert_int_eq(send_request_vote(5, 2, 1, 4, &reply, NULL, NULL), 0);
 
@@ -2083,6 +2118,8 @@ START_TEST(test_impl_three_node_leader_replication)
 	struct impl_node *follower_a;
 	struct impl_node *follower_b;
 	struct raft_log *entry;
+	uint32_t noop_index;
+	uint32_t noop_term;
 
 	impl_cluster_init(&cluster);
 
@@ -2102,39 +2139,45 @@ START_TEST(test_impl_three_node_leader_replication)
 	ck_assert_int_eq(leader->state.state, RAFT_STATE_LEADER);
 
 	impl_load_node(leader);
+	noop_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
+	noop_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
 	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
 	ck_assert_ptr_nonnull(entry);
-	entry->index = 1;
+	entry->index = noop_index + 1;
 	entry->term = leader->state.current_term;
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = 1;
+	raft_state.log_index = entry->index;
 	impl_save_node(leader);
 
-	ck_assert_int_eq(impl_append_entries(leader, follower_a, 1, entry->term, 0), 0);
-	ck_assert_int_eq(impl_append_entries(leader, follower_b, 1, entry->term, 0), 0);
+	if (noop_index > 0) {
+		ck_assert_int_eq(impl_append_entries(leader, follower_a, noop_index, noop_term, 0), 0);
+		ck_assert_int_eq(impl_append_entries(leader, follower_b, noop_index, noop_term, 0), 0);
+	}
+	ck_assert_int_eq(impl_append_entries(leader, follower_a, entry->index, entry->term, 0), 0);
+	ck_assert_int_eq(impl_append_entries(leader, follower_b, entry->index, entry->term, 0), 0);
 
 	impl_load_node(leader);
-	ck_assert_uint_eq(impl_find_peer(leader, follower_a->id)->match_index, 1);
-	ck_assert_uint_eq(impl_find_peer(leader, follower_b->id)->match_index, 1);
+	ck_assert_uint_eq(impl_find_peer(leader, follower_a->id)->match_index, entry->index);
+	ck_assert_uint_eq(impl_find_peer(leader, follower_b->id)->match_index, entry->index);
 	ck_assert_ptr_nonnull(raft_state.log_tail);
-	ck_assert_uint_eq(raft_state.log_tail->index, 1);
+	ck_assert_uint_eq(raft_state.log_tail->index, entry->index);
 	ck_assert_uint_eq(raft_state.log_tail->term, raft_state.current_term);
-	ck_assert_uint_eq(raft_test_api.raft_term_at(1), raft_state.current_term);
-	(void)raft_test_api.raft_check_commit_index(1);
-	ck_assert_uint_eq(raft_state.commit_index, 1);
+	ck_assert_uint_eq(raft_test_api.raft_term_at(entry->index), raft_state.current_term);
+	(void)raft_test_api.raft_check_commit_index(entry->index);
+	ck_assert_uint_eq(raft_state.commit_index, entry->index);
 	impl_save_node(leader);
 
 	impl_load_node(follower_a);
 	ck_assert_int_eq(send_append_entries_heartbeat(leader->state.current_term, leader->id,
-				1, entry->term, 1, NULL), 0);
-	ck_assert_uint_eq(raft_state.commit_index, 1);
+				entry->index, entry->term, entry->index, NULL), 0);
+	ck_assert_uint_eq(raft_state.commit_index, entry->index);
 	impl_save_node(follower_a);
 
 	impl_load_node(follower_b);
 	ck_assert_int_eq(send_append_entries_heartbeat(leader->state.current_term, leader->id,
-				1, entry->term, 1, NULL), 0);
-	ck_assert_uint_eq(raft_state.commit_index, 1);
+				entry->index, entry->term, entry->index, NULL), 0);
+	ck_assert_uint_eq(raft_state.commit_index, entry->index);
 	impl_save_node(follower_b);
 
 	impl_cluster_free(&cluster);
@@ -2155,6 +2198,9 @@ START_TEST(test_impl_log_matching_after_replication)
 	struct impl_node *follower_a;
 	struct impl_node *follower_b;
 	struct raft_log *entry;
+	uint32_t noop_index;
+	uint32_t noop_term;
+	uint32_t entry_index;
 
 	impl_cluster_init(&cluster);
 
@@ -2167,25 +2213,36 @@ START_TEST(test_impl_log_matching_after_replication)
 	leader->state.voted_for = leader->id;
 
 	impl_load_node(leader);
+	noop_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
+	noop_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
 	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
 	ck_assert_ptr_nonnull(entry);
-	entry->index = 1;
+	entry_index = noop_index + 1;
+	entry->index = entry_index;
 	entry->term = leader->state.current_term;
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
 	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
 	ck_assert_ptr_nonnull(entry);
-	entry->index = 2;
+	entry->index = entry_index + 1;
 	entry->term = leader->state.current_term;
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = 2;
+	raft_state.log_index = entry->index;
 	impl_save_node(leader);
 
-	ck_assert_int_eq(impl_append_entries(leader, follower_a, 1, leader->state.current_term, 0), 0);
-	ck_assert_int_eq(impl_append_entries(leader, follower_a, 2, leader->state.current_term, 0), 0);
-	ck_assert_int_eq(impl_append_entries(leader, follower_b, 1, leader->state.current_term, 0), 0);
-	ck_assert_int_eq(impl_append_entries(leader, follower_b, 2, leader->state.current_term, 0), 0);
+	if (noop_index > 0) {
+		ck_assert_int_eq(impl_append_entries(leader, follower_a, noop_index, noop_term, 0), 0);
+		ck_assert_int_eq(impl_append_entries(leader, follower_b, noop_index, noop_term, 0), 0);
+	}
+	ck_assert_int_eq(impl_append_entries(leader, follower_a, entry_index,
+				leader->state.current_term, 0), 0);
+	ck_assert_int_eq(impl_append_entries(leader, follower_a, entry_index + 1,
+				leader->state.current_term, 0), 0);
+	ck_assert_int_eq(impl_append_entries(leader, follower_b, entry_index,
+				leader->state.current_term, 0), 0);
+	ck_assert_int_eq(impl_append_entries(leader, follower_b, entry_index + 1,
+				leader->state.current_term, 0), 0);
 
 	ck_assert(impl_logs_match(&leader->state, &follower_a->state));
 	ck_assert(impl_logs_match(&leader->state, &follower_b->state));
@@ -2207,6 +2264,8 @@ START_TEST(test_impl_leader_completeness_after_leader_change)
 	struct impl_node *leader;
 	struct impl_node *follower;
 	struct raft_log *entry;
+	uint32_t noop_index;
+	uint32_t noop_term;
 
 	impl_cluster_init(&cluster);
 
@@ -2218,25 +2277,30 @@ START_TEST(test_impl_leader_completeness_after_leader_change)
 	leader->state.voted_for = leader->id;
 
 	impl_load_node(leader);
+	noop_index = raft_state.log_tail ? raft_state.log_tail->index : 0;
+	noop_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
 	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
 	ck_assert_ptr_nonnull(entry);
-	entry->index = 1;
+	entry->index = noop_index + 1;
 	entry->term = leader->state.current_term;
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = 1;
+	raft_state.log_index = entry->index;
 	impl_save_node(leader);
 
-	ck_assert_int_eq(impl_append_entries(leader, follower, 1, leader->state.current_term, 0), 0);
+	if (noop_index > 0)
+		ck_assert_int_eq(impl_append_entries(leader, follower, noop_index, noop_term, 0), 0);
+	ck_assert_int_eq(impl_append_entries(leader, follower, entry->index,
+				leader->state.current_term, 0), 0);
 
 	impl_load_node(leader);
-	ck_assert_int_ge(raft_test_api.raft_check_commit_index(1), 0);
-	ck_assert_uint_eq(raft_state.commit_index, 1);
+	ck_assert_int_ge(raft_test_api.raft_check_commit_index(entry->index), 0);
+	ck_assert_uint_eq(raft_state.commit_index, entry->index);
 	impl_save_node(leader);
 
 	impl_load_node(follower);
 	ck_assert_int_eq(send_append_entries_heartbeat(leader->state.current_term, leader->id,
-				1, leader->state.current_term, 1, NULL), 0);
+				entry->index, leader->state.current_term, entry->index, NULL), 0);
 	impl_save_node(follower);
 
 	follower->state.state = RAFT_STATE_LEADER;
@@ -2752,6 +2816,7 @@ START_TEST(test_conformance_durable_state_round_trip)
 	raft_state.self_id = 1;
 	raft_state.current_term = 7;
 	raft_state.voted_for = 2;
+	init_state_filenames();
 
 	log1 = make_log(1, 7);
 	log2 = make_log(2, 7);
@@ -2762,13 +2827,16 @@ START_TEST(test_conformance_durable_state_round_trip)
 				&raft_state.log_tail, &raft_state.log_length), 0);
 	raft_state.log_index = raft_state.log_tail->index;
 
-	ck_assert_int_eq(raft_test_api.raft_save_state(false), 0);
+	ck_assert_int_eq(raft_test_api.raft_save_state_vars(), 0);
+	ck_assert_int_eq(raft_test_api.raft_save_state_log(), 0);
 
 	reset_raft_state();
 	raft_state.self_id = 1;
 	commit_called = 0;
+	init_state_filenames();
 
-	ck_assert_int_eq(raft_test_api.raft_load_state(), 0);
+	ck_assert_int_eq(raft_test_api.raft_load_state_vars(), 0);
+	ck_assert_int_eq(raft_test_api.raft_load_state_logs(), 0);
 
 	ck_assert_uint_eq(raft_state.current_term, 7);
 	ck_assert_uint_eq(raft_state.voted_for, 2);
@@ -2776,8 +2844,8 @@ START_TEST(test_conformance_durable_state_round_trip)
 	ck_assert_ptr_nonnull(raft_state.log_tail);
 	ck_assert_uint_eq(raft_state.log_tail->index, 2);
 	ck_assert_int_eq(atomic_load(&raft_state.log_length), 2);
-	ck_assert_int_eq(commit_called, 2);
-	ck_assert_uint_eq(raft_state.commit_index, 2);
+	ck_assert_int_eq(commit_called, 0);
+	ck_assert_uint_eq(raft_state.commit_index, 0);
 
 	leave_temp_dir(tmpdir, saved_cwd_fd);
 }
@@ -2788,22 +2856,24 @@ START_TEST(test_conformance_durable_state_truncated_log)
 	char tmpdir[PATH_MAX];
 	int saved_cwd_fd = -1;
 	int fd;
-	uint32_t header[4] = { 1, 0, 1, 1 };
-	uint32_t log_word = 1;
+	uint32_t header[4] = { 1, 1, RAFT_LOG_REGISTER_TOPIC, sizeof(uint32_t) };
+	uint8_t log_byte = 0x5a;
 
 	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
 
-	fd = open("save_state.1", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	raft_state.self_id = 1;
+	init_state_filenames();
+
+	fd = open(raft_state.fn_log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	ck_assert_int_ne(fd, -1);
 	ck_assert_int_eq(write(fd, header, sizeof(header)), (int)sizeof(header));
-	ck_assert_int_eq(write(fd, &log_word, sizeof(log_word)), (int)sizeof(log_word));
+	ck_assert_int_eq(write(fd, &log_byte, sizeof(log_byte)), (int)sizeof(log_byte));
 	close(fd);
 
-	raft_state.self_id = 1;
 	commit_called = 0;
 	errno = 0;
 
-	ck_assert_int_eq(raft_test_api.raft_load_state(), -1);
+	ck_assert_int_eq(raft_test_api.raft_load_state_logs(), -1);
 	ck_assert_ptr_eq(raft_state.log_head, NULL);
 	ck_assert_int_eq(commit_called, 0);
 

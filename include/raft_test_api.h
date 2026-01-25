@@ -17,8 +17,10 @@ struct raft_test_api {
     long (*rnd)(int from, int to);
     int64_t (*timems)(void);
 
-    int (*raft_save_state)(bool);
-    int (*raft_load_state)(void);
+    int (*raft_save_state_vars)(void);
+    int (*raft_save_state_log)(void);
+    int (*raft_load_state_vars)(void);
+    int (*raft_load_state_logs)(void);
     void (*raft_reset_read_state)(struct raft_host_entry *client);
     bool (*raft_has_pending_write)(struct raft_host_entry *client);
     int (*raft_clear_active_write)(struct raft_host_entry *client);

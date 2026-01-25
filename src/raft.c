@@ -3838,8 +3838,10 @@ static struct raft_client_state *raft_test_client_state_ptr(void)
 const struct raft_test_api raft_test_api = {
     .rnd = rnd,
     .timems = timems,
-    .raft_save_state = raft_save_state,
-    .raft_load_state = raft_load_state,
+    .raft_save_state_vars = raft_save_state_vars,
+    .raft_save_state_log = raft_save_state_log,
+    .raft_load_state_vars = raft_load_state_vars,
+    .raft_load_state_logs = raft_load_state_logs,
     .raft_reset_read_state = raft_reset_read_state,
     .raft_has_pending_write = raft_has_pending_write,
     .raft_clear_active_write = raft_clear_active_write,
