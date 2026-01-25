@@ -777,17 +777,96 @@ START_TEST(test_reset_write_state_frees_buffer)
 	{
 		const uint8_t *buf = (const uint8_t *)malloc(32);
 		ck_assert_ptr_nonnull(buf);
-		__atomic_store_n(&entry.wr_packet_buffer, buf, __ATOMIC_SEQ_CST);
+		atomic_store_explicit(&entry.wr_packet_buffer,
+				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
 	}
-	ck_assert_ptr_nonnull(__atomic_load_n(&entry.wr_packet_buffer, __ATOMIC_SEQ_CST));
+	ck_assert_ptr_nonnull(atomic_load_explicit(&entry.wr_packet_buffer,
+				memory_order_seq_cst));
 
 	ck_assert_int_eq(raft_test_api.raft_reset_write_state(&entry, true), 0);
 
 	ck_assert_int_eq(entry.wr_offset, 0);
 	ck_assert_int_eq(entry.wr_need, 0);
 	ck_assert_int_eq(entry.wr_packet_length, 0);
-	ck_assert_ptr_eq(__atomic_load_n(&entry.wr_packet_buffer, __ATOMIC_SEQ_CST), NULL);
+	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
+				memory_order_seq_cst), NULL);
 	destroy_entry_locks(&entry);
+}
+END_TEST
+
+START_TEST(test_clear_active_write_resets_fields)
+{
+	struct raft_host_entry entry;
+	struct io_buf *active;
+
+	memset(&entry, 0, sizeof(entry));
+	init_entry_locks(&entry);
+
+	active = calloc(1, sizeof(*active));
+	ck_assert_ptr_nonnull(active);
+	active->buf = (uint8_t *)malloc(8);
+	ck_assert_ptr_nonnull(active->buf);
+	active->size = 8;
+
+	entry.wr_need = 3;
+	entry.wr_packet_length = 8;
+	atomic_store_explicit(&entry.wr_packet_buffer,
+			(_Atomic const uint8_t *)active->buf, memory_order_seq_cst);
+	entry.wr_offset = 2;
+	entry.wr_active = active;
+
+	ck_assert_int_eq(raft_test_api.raft_clear_active_write(&entry), 0);
+	ck_assert_int_eq(entry.wr_need, 0);
+	ck_assert_int_eq(entry.wr_packet_length, 0);
+	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
+				memory_order_seq_cst), NULL);
+	ck_assert_int_eq(entry.wr_offset, 0);
+	ck_assert_ptr_eq(entry.wr_active, NULL);
+
+	free(active->buf);
+	free(active);
+	destroy_entry_locks(&entry);
+}
+END_TEST
+
+START_TEST(test_iobuf_append_and_remove)
+{
+	struct io_buf *head = NULL;
+	struct io_buf *tail = NULL;
+	struct io_buf *first;
+	struct io_buf *second;
+	unsigned len = 0;
+
+	first = calloc(1, sizeof(*first));
+	second = calloc(1, sizeof(*second));
+	ck_assert_ptr_nonnull(first);
+	ck_assert_ptr_nonnull(second);
+
+	ck_assert_int_eq(raft_test_api.raft_append_iobuf(first, &head, &tail, &len), 0);
+	ck_assert_ptr_eq(head, first);
+	ck_assert_ptr_eq(tail, first);
+	ck_assert_int_eq(len, 1);
+
+	ck_assert_int_eq(raft_test_api.raft_append_iobuf(second, &head, &tail, &len), 0);
+	ck_assert_ptr_eq(head, first);
+	ck_assert_ptr_eq(tail, second);
+	ck_assert_ptr_eq(first->next, second);
+	ck_assert_int_eq(len, 2);
+
+	ck_assert_int_eq(raft_test_api.raft_remove_iobuf(first, &head, &tail, &len), 0);
+	ck_assert_ptr_eq(head, second);
+	ck_assert_ptr_eq(tail, second);
+	ck_assert_ptr_eq(first->next, NULL);
+	ck_assert_int_eq(len, 1);
+
+	ck_assert_int_eq(raft_test_api.raft_remove_iobuf(second, &head, &tail, &len), 0);
+	ck_assert_ptr_eq(head, NULL);
+	ck_assert_ptr_eq(tail, NULL);
+	ck_assert_ptr_eq(second->next, NULL);
+	ck_assert_int_eq(len, 0);
+
+	free(first);
+	free(second);
 }
 END_TEST
 
@@ -807,13 +886,16 @@ START_TEST(test_reset_ss_state_frees_buffer)
 	{
 		const uint8_t *buf = (const uint8_t *)malloc(8);
 		ck_assert_ptr_nonnull(buf);
-		__atomic_store_n(&entry.ss_data, buf, __ATOMIC_SEQ_CST);
+		atomic_store_explicit(&entry.ss_data,
+				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
 	}
-	ck_assert_ptr_nonnull(__atomic_load_n(&entry.ss_data, __ATOMIC_SEQ_CST));
+	ck_assert_ptr_nonnull(atomic_load_explicit(&entry.ss_data,
+				memory_order_seq_cst));
 
 	ck_assert_int_eq(raft_test_api.raft_reset_ss_state(&entry, true), 0);
 
-	ck_assert_ptr_eq(__atomic_load_n(&entry.ss_data, __ATOMIC_SEQ_CST), NULL);
+	ck_assert_ptr_eq(atomic_load_explicit(&entry.ss_data,
+				memory_order_seq_cst), NULL);
 	ck_assert_int_eq(entry.ss_last_index, 0);
 	ck_assert_int_eq(entry.ss_last_term, 0);
 	ck_assert_int_eq(entry.ss_need, 0);
@@ -842,7 +924,8 @@ START_TEST(test_add_write_and_try_write_success)
 	ck_assert_int_eq(raft_test_api.raft_add_write(&entry, (uint8_t *)strdup((char *)payload),
 				sizeof(payload) - 1), 0);
 	ck_assert_int_eq(raft_test_api.raft_try_write(&entry), 0);
-	ck_assert_ptr_eq(__atomic_load_n(&entry.wr_packet_buffer, __ATOMIC_SEQ_CST), NULL);
+	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
+				memory_order_seq_cst), NULL);
 
 	rc = read(fds[0], read_buf, sizeof(read_buf));
 	ck_assert_int_eq(rc, (ssize_t)(sizeof(payload) - 1));
@@ -854,17 +937,15 @@ START_TEST(test_add_write_and_try_write_success)
 }
 END_TEST
 
-START_TEST(test_add_write_rejects_existing_buffer)
+START_TEST(test_add_write_rejects_full_queue)
 {
 	struct raft_host_entry entry;
-	const uint8_t *buf;
 	uint8_t *new_buf;
 
 	memset(&entry, 0, sizeof(entry));
 	init_entry_locks(&entry);
-	buf = (const uint8_t *)malloc(4);
-	ck_assert_ptr_nonnull(buf);
-	__atomic_store_n(&entry.wr_packet_buffer, buf, __ATOMIC_SEQ_CST);
+	entry.peer_fd = 1;
+	entry.wr_queue = 11;
 
 	new_buf = malloc(4);
 	ck_assert_ptr_nonnull(new_buf);
@@ -881,18 +962,23 @@ END_TEST
 START_TEST(test_try_write_invalid)
 {
 	struct raft_host_entry entry;
-	const uint8_t *buf;
+	struct io_buf *io_buf;
 
 	memset(&entry, 0, sizeof(entry));
 	init_entry_locks(&entry);
 	entry.peer_fd = -1;
-	buf = (const uint8_t *)malloc(4);
-	ck_assert_ptr_nonnull(buf);
-	__atomic_store_n(&entry.wr_packet_buffer, buf, __ATOMIC_SEQ_CST);
+	io_buf = calloc(1, sizeof(*io_buf));
+	ck_assert_ptr_nonnull(io_buf);
+	io_buf->buf = (uint8_t *)malloc(4);
+	ck_assert_ptr_nonnull(io_buf->buf);
+	io_buf->size = 4;
+	entry.wr_head = io_buf;
+	entry.wr_tail = io_buf;
+	entry.wr_queue = 1;
 
 	errno = 0;
 	ck_assert_int_eq(raft_test_api.raft_try_write(&entry), -1);
-	ck_assert_int_eq(errno, EINVAL);
+	ck_assert_int_eq(errno, EBADF);
 
 	raft_test_api.raft_reset_write_state(&entry, true);
 	destroy_entry_locks(&entry);
@@ -916,8 +1002,10 @@ START_TEST(test_remove_and_free_unknown_host)
 	first->unknown_next = second;
 	client_state->unknown_clients = first;
 
-	__atomic_store_n(&second->wr_packet_buffer, (const uint8_t *)malloc(8), __ATOMIC_SEQ_CST);
-	__atomic_store_n(&second->ss_data, (const uint8_t *)malloc(8), __ATOMIC_SEQ_CST);
+	atomic_store_explicit(&second->wr_packet_buffer,
+			(_Atomic const uint8_t *)malloc(8), memory_order_seq_cst);
+	atomic_store_explicit(&second->ss_data,
+			(_Atomic const uint8_t *)malloc(8), memory_order_seq_cst);
 	second->rd_packet_buffer = malloc(8);
 
 	raft_test_api.raft_remove_and_free_unknown_host(second);
@@ -2216,19 +2304,23 @@ START_TEST(test_close_resets_state)
 	{
 		const uint8_t *buf = (const uint8_t *)malloc(16);
 		ck_assert_ptr_nonnull(buf);
-		__atomic_store_n(&entry.wr_packet_buffer, buf, __ATOMIC_SEQ_CST);
+		atomic_store_explicit(&entry.wr_packet_buffer,
+				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
 	}
 	{
 		const uint8_t *buf = (const uint8_t *)malloc(8);
 		ck_assert_ptr_nonnull(buf);
-		__atomic_store_n(&entry.ss_data, buf, __ATOMIC_SEQ_CST);
+		atomic_store_explicit(&entry.ss_data,
+				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
 	}
 	entry.ss_last_index = 4;
 	entry.ss_last_term = 2;
 
 	ck_assert_ptr_nonnull(entry.rd_packet_buffer);
-	ck_assert_ptr_nonnull(__atomic_load_n(&entry.wr_packet_buffer, __ATOMIC_SEQ_CST));
-	ck_assert_ptr_nonnull(__atomic_load_n(&entry.ss_data, __ATOMIC_SEQ_CST));
+	ck_assert_ptr_nonnull(atomic_load_explicit(&entry.wr_packet_buffer,
+				memory_order_seq_cst));
+	ck_assert_ptr_nonnull(atomic_load_explicit(&entry.ss_data,
+				memory_order_seq_cst));
 
 	raft_state.self_id = 1;
 	raft_state.log_tail = make_log(10, 1);
@@ -2243,8 +2335,10 @@ START_TEST(test_close_resets_state)
 	ck_assert_int_eq(entry.wr_offset, 0);
 	ck_assert_int_eq(entry.wr_need, 0);
 	ck_assert_int_eq(entry.wr_packet_length, 0);
-	ck_assert_ptr_eq(__atomic_load_n(&entry.wr_packet_buffer, __ATOMIC_SEQ_CST), NULL);
-	ck_assert_ptr_eq(__atomic_load_n(&entry.ss_data, __ATOMIC_SEQ_CST), NULL);
+	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
+				memory_order_seq_cst), NULL);
+	ck_assert_ptr_eq(atomic_load_explicit(&entry.ss_data,
+				memory_order_seq_cst), NULL);
 	ck_assert_int_eq(entry.ss_last_index, 0);
 	ck_assert_int_eq(entry.ss_last_term, 0);
 
@@ -2735,10 +2829,12 @@ static Suite *raft_suite(void)
 	tcase_add_test(tc, test_tick_connection_check_skips_unready);
 	tcase_add_test(tc, test_reset_read_state_frees_buffer);
 	tcase_add_test(tc, test_reset_write_state_frees_buffer);
+	tcase_add_test(tc, test_clear_active_write_resets_fields);
 	tcase_add_test(tc, test_reset_ss_state_frees_buffer);
 	tcase_add_test(tc, test_add_write_and_try_write_success);
-	tcase_add_test(tc, test_add_write_rejects_existing_buffer);
+	tcase_add_test(tc, test_add_write_rejects_full_queue);
 	tcase_add_test(tc, test_try_write_invalid);
+	tcase_add_test(tc, test_iobuf_append_and_remove);
 	tcase_add_test(tc, test_remove_and_free_unknown_host);
 	tcase_add_test(tc, test_new_conn_success);
 	tcase_add_test(tc, test_new_conn_invalid_role);

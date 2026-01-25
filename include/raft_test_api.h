@@ -20,6 +20,7 @@ struct raft_test_api {
     int (*raft_save_state)(bool);
     int (*raft_load_state)(void);
     void (*raft_reset_read_state)(struct raft_host_entry *client);
+    int (*raft_clear_active_write)(struct raft_host_entry *client);
     int (*raft_reset_write_state)(struct raft_host_entry *client, bool need_lock);
     int (*raft_reset_ss_state)(struct raft_host_entry *client, bool need_lock);
     int (*raft_update_leader_id)(uint32_t leader_id, bool need_lock);
@@ -45,6 +46,10 @@ struct raft_test_api {
             const struct sockaddr_in *sin, socklen_t sin_len);
     int (*raft_add_write)(struct raft_host_entry *client, uint8_t *buffer, ssize_t size);
     int (*raft_try_write)(struct raft_host_entry *client);
+    int (*raft_append_iobuf)(struct io_buf *entry, struct io_buf **head,
+            struct io_buf **tail, unsigned *iobuf_len);
+    int (*raft_remove_iobuf)(struct io_buf *entry, struct io_buf **head,
+            struct io_buf **tail, unsigned *iobuf_len);
     int (*raft_reset_election_timer)(void);
     int (*raft_reset_next_ping)(void);
     int (*raft_change_to)(raft_state_t mode);
