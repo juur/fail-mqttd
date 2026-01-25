@@ -3678,6 +3678,7 @@ const struct raft_test_api raft_test_api = {
     .raft_save_state = raft_save_state,
     .raft_load_state = raft_load_state,
     .raft_reset_read_state = raft_reset_read_state,
+    .raft_has_pending_write = raft_has_pending_write,
     .raft_clear_active_write = raft_clear_active_write,
     .raft_reset_write_state = raft_reset_write_state,
     .raft_reset_ss_state = raft_reset_ss_state,

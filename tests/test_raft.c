@@ -870,6 +870,33 @@ START_TEST(test_iobuf_append_and_remove)
 }
 END_TEST
 
+START_TEST(test_remove_iobuf_missing)
+{
+	struct io_buf *head = NULL;
+	struct io_buf *tail = NULL;
+	struct io_buf *first;
+	struct io_buf *missing;
+	unsigned len = 0;
+
+	first = calloc(1, sizeof(*first));
+	missing = calloc(1, sizeof(*missing));
+	ck_assert_ptr_nonnull(first);
+	ck_assert_ptr_nonnull(missing);
+
+	ck_assert_int_eq(raft_test_api.raft_append_iobuf(first, &head, &tail, &len), 0);
+
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_remove_iobuf(missing, &head, &tail, &len), -1);
+	ck_assert_int_eq(errno, ENOENT);
+	ck_assert_ptr_eq(head, first);
+	ck_assert_ptr_eq(tail, first);
+	ck_assert_int_eq(len, 1);
+
+	free(missing);
+	free(first);
+}
+END_TEST
+
 START_TEST(test_reset_ss_state_frees_buffer)
 {
 	struct raft_host_entry entry;
@@ -937,6 +964,48 @@ START_TEST(test_add_write_and_try_write_success)
 }
 END_TEST
 
+START_TEST(test_add_write_rejects_invalid_size)
+{
+	struct raft_host_entry entry;
+	uint8_t *new_buf;
+
+	memset(&entry, 0, sizeof(entry));
+	init_entry_locks(&entry);
+	entry.peer_fd = 1;
+
+	new_buf = malloc(4);
+	ck_assert_ptr_nonnull(new_buf);
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_add_write(&entry, new_buf, 0), -1);
+	ck_assert_int_eq(errno, EINVAL);
+	free(new_buf);
+
+	raft_test_api.raft_reset_write_state(&entry, true);
+	destroy_entry_locks(&entry);
+}
+END_TEST
+
+START_TEST(test_add_write_rejects_bad_fd)
+{
+	struct raft_host_entry entry;
+	uint8_t *new_buf;
+
+	memset(&entry, 0, sizeof(entry));
+	init_entry_locks(&entry);
+	entry.peer_fd = -1;
+
+	new_buf = malloc(4);
+	ck_assert_ptr_nonnull(new_buf);
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_add_write(&entry, new_buf, 4), -1);
+	ck_assert_int_eq(errno, EBADF);
+	free(new_buf);
+
+	raft_test_api.raft_reset_write_state(&entry, true);
+	destroy_entry_locks(&entry);
+}
+END_TEST
+
 START_TEST(test_add_write_rejects_full_queue)
 {
 	struct raft_host_entry entry;
@@ -955,6 +1024,64 @@ START_TEST(test_add_write_rejects_full_queue)
 	free(new_buf);
 
 	raft_test_api.raft_reset_write_state(&entry, true);
+	destroy_entry_locks(&entry);
+}
+END_TEST
+
+static ssize_t fill_pipe_nonblocking(int fd, uint8_t *buf, size_t buf_len)
+{
+	ssize_t total = 0;
+	ssize_t rc;
+
+	for (;;) {
+		rc = write(fd, buf, buf_len);
+		if (rc > 0) {
+			total += rc;
+			continue;
+		}
+		if (rc == -1 && errno == EAGAIN)
+			break;
+		return -1;
+	}
+
+	return total;
+}
+
+START_TEST(test_try_write_partial_progress)
+{
+	struct raft_host_entry entry;
+	int fds[2];
+	uint8_t payload[PIPE_BUF * 2];
+	uint8_t scratch[PIPE_BUF];
+	ssize_t filled;
+	ssize_t rc;
+
+	ck_assert_int_eq(pipe(fds), 0);
+	ck_assert_int_eq(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+
+	memset(payload, 'A', sizeof(payload));
+	filled = fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
+	ck_assert_int_ge(filled, 0);
+
+	rc = read(fds[0], scratch, sizeof(scratch));
+	ck_assert_int_eq(rc, (ssize_t)sizeof(scratch));
+
+	memset(&entry, 0, sizeof(entry));
+	init_entry_locks(&entry);
+	entry.peer_fd = fds[1];
+
+	ck_assert_int_eq(raft_test_api.raft_add_write(&entry,
+				(uint8_t *)malloc(sizeof(payload)), sizeof(payload)), 0);
+	memcpy((void *)entry.wr_head->buf, payload, sizeof(payload));
+
+	ck_assert_int_eq(raft_test_api.raft_try_write(&entry), 0);
+	ck_assert_int_gt(entry.wr_need, 0);
+	ck_assert_int_lt(entry.wr_need, (ssize_t)sizeof(payload));
+	ck_assert_ptr_nonnull(entry.wr_active);
+
+	raft_test_api.raft_reset_write_state(&entry, true);
+	close(fds[0]);
+	close(fds[1]);
 	destroy_entry_locks(&entry);
 }
 END_TEST
@@ -981,6 +1108,83 @@ START_TEST(test_try_write_invalid)
 	ck_assert_int_eq(errno, EBADF);
 
 	raft_test_api.raft_reset_write_state(&entry, true);
+	destroy_entry_locks(&entry);
+}
+END_TEST
+
+START_TEST(test_has_pending_write)
+{
+	struct raft_host_entry entry;
+	struct io_buf *io_buf;
+
+	memset(&entry, 0, sizeof(entry));
+	init_entry_locks(&entry);
+
+	ck_assert(!raft_test_api.raft_has_pending_write(&entry));
+
+	io_buf = calloc(1, sizeof(*io_buf));
+	ck_assert_ptr_nonnull(io_buf);
+	io_buf->buf = (uint8_t *)malloc(4);
+	ck_assert_ptr_nonnull(io_buf->buf);
+	io_buf->size = 4;
+	entry.wr_head = io_buf;
+	entry.wr_tail = io_buf;
+	entry.wr_queue = 1;
+
+	ck_assert(raft_test_api.raft_has_pending_write(&entry));
+
+	raft_test_api.raft_reset_write_state(&entry, true);
+	destroy_entry_locks(&entry);
+}
+END_TEST
+
+START_TEST(test_reset_write_state_clears_queue)
+{
+	struct raft_host_entry entry;
+	struct io_buf *first;
+	struct io_buf *second;
+	struct io_buf *active;
+
+	memset(&entry, 0, sizeof(entry));
+	init_entry_locks(&entry);
+
+	first = calloc(1, sizeof(*first));
+	second = calloc(1, sizeof(*second));
+	active = calloc(1, sizeof(*active));
+	ck_assert_ptr_nonnull(first);
+	ck_assert_ptr_nonnull(second);
+	ck_assert_ptr_nonnull(active);
+
+	first->buf = (uint8_t *)malloc(4);
+	second->buf = (uint8_t *)malloc(4);
+	active->buf = (uint8_t *)malloc(4);
+	ck_assert_ptr_nonnull(first->buf);
+	ck_assert_ptr_nonnull(second->buf);
+	ck_assert_ptr_nonnull(active->buf);
+	first->size = 4;
+	second->size = 4;
+	active->size = 4;
+	first->next = second;
+
+	entry.wr_head = first;
+	entry.wr_tail = second;
+	entry.wr_active = active;
+	entry.wr_queue = 2;
+	entry.wr_need = 4;
+	entry.wr_packet_length = 4;
+	atomic_store_explicit(&entry.wr_packet_buffer,
+			(_Atomic const uint8_t *)active->buf, memory_order_seq_cst);
+
+	ck_assert_int_eq(raft_test_api.raft_reset_write_state(&entry, true), 0);
+	ck_assert_ptr_eq(entry.wr_head, NULL);
+	ck_assert_ptr_eq(entry.wr_tail, NULL);
+	ck_assert_ptr_eq(entry.wr_active, NULL);
+	ck_assert_int_eq(entry.wr_queue, 0);
+	ck_assert_int_eq(entry.wr_need, 0);
+	ck_assert_int_eq(entry.wr_packet_length, 0);
+	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
+				memory_order_seq_cst), NULL);
+
 	destroy_entry_locks(&entry);
 }
 END_TEST
@@ -2830,11 +3034,17 @@ static Suite *raft_suite(void)
 	tcase_add_test(tc, test_reset_read_state_frees_buffer);
 	tcase_add_test(tc, test_reset_write_state_frees_buffer);
 	tcase_add_test(tc, test_clear_active_write_resets_fields);
+	tcase_add_test(tc, test_reset_write_state_clears_queue);
 	tcase_add_test(tc, test_reset_ss_state_frees_buffer);
 	tcase_add_test(tc, test_add_write_and_try_write_success);
+	tcase_add_test(tc, test_add_write_rejects_invalid_size);
+	tcase_add_test(tc, test_add_write_rejects_bad_fd);
 	tcase_add_test(tc, test_add_write_rejects_full_queue);
+	tcase_add_test(tc, test_try_write_partial_progress);
 	tcase_add_test(tc, test_try_write_invalid);
+	tcase_add_test(tc, test_has_pending_write);
 	tcase_add_test(tc, test_iobuf_append_and_remove);
+	tcase_add_test(tc, test_remove_iobuf_missing);
 	tcase_add_test(tc, test_remove_and_free_unknown_host);
 	tcase_add_test(tc, test_new_conn_success);
 	tcase_add_test(tc, test_new_conn_invalid_role);

@@ -19,6 +19,10 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <errno.h>
 
 #include "raft.h"
 #include "raft_test_api.h"
@@ -219,6 +223,44 @@ static void teardown(void)
 	reset_raft_state();
 	teardown_cluster();
 	destroy_client_state();
+}
+
+static int enter_temp_dir(char *path, size_t path_len, int *saved_cwd_fd)
+{
+	const char *tmpdir = getenv("TMPDIR");
+
+	if (!tmpdir)
+		tmpdir = "/tmp";
+
+	if (snprintf(path, path_len, "%s/raft-tla-XXXXXX", tmpdir) >= (int)path_len)
+		return -1;
+
+	if (mkdtemp(path) == NULL)
+		return -1;
+
+	*saved_cwd_fd = open(".", O_RDONLY);
+	if (*saved_cwd_fd == -1)
+		return -1;
+
+	if (chdir(path) == -1)
+		return -1;
+
+	return 0;
+}
+
+static void leave_temp_dir(const char *path, int saved_cwd_fd)
+{
+	if (saved_cwd_fd != -1) {
+		if (fchdir(saved_cwd_fd) == -1)
+			(void)0;
+		close(saved_cwd_fd);
+	}
+
+	if (path) {
+		unlink("save_state.1");
+		unlink("save_state.1.new");
+		rmdir(path);
+	}
 }
 
 static struct raft_log *make_log(uint32_t index, uint32_t term)
@@ -2698,6 +2740,187 @@ START_TEST(test_conformance_restart_keeps_voted_for)
 }
 END_TEST
 
+START_TEST(test_conformance_durable_state_round_trip)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	struct raft_log *log1;
+	struct raft_log *log2;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	raft_state.current_term = 7;
+	raft_state.voted_for = 2;
+
+	log1 = make_log(1, 7);
+	log2 = make_log(2, 7);
+
+	ck_assert_int_eq(raft_test_api.raft_append_log(log1, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	ck_assert_int_eq(raft_test_api.raft_append_log(log2, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+	raft_state.log_index = raft_state.log_tail->index;
+
+	ck_assert_int_eq(raft_test_api.raft_save_state(false), 0);
+
+	reset_raft_state();
+	raft_state.self_id = 1;
+	commit_called = 0;
+
+	ck_assert_int_eq(raft_test_api.raft_load_state(), 0);
+
+	ck_assert_uint_eq(raft_state.current_term, 7);
+	ck_assert_uint_eq(raft_state.voted_for, 2);
+	ck_assert_ptr_nonnull(raft_state.log_head);
+	ck_assert_ptr_nonnull(raft_state.log_tail);
+	ck_assert_uint_eq(raft_state.log_tail->index, 2);
+	ck_assert_int_eq(atomic_load(&raft_state.log_length), 2);
+	ck_assert_int_eq(commit_called, 2);
+	ck_assert_uint_eq(raft_state.commit_index, 2);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_conformance_durable_state_truncated_log)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	int fd;
+	uint32_t header[4] = { 1, 0, 1, 1 };
+	uint32_t log_word = 1;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	fd = open("save_state.1", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	ck_assert_int_ne(fd, -1);
+	ck_assert_int_eq(write(fd, header, sizeof(header)), (int)sizeof(header));
+	ck_assert_int_eq(write(fd, &log_word, sizeof(log_word)), (int)sizeof(log_word));
+	close(fd);
+
+	raft_state.self_id = 1;
+	commit_called = 0;
+	errno = 0;
+
+	ck_assert_int_eq(raft_test_api.raft_load_state(), -1);
+	ck_assert_ptr_eq(raft_state.log_head, NULL);
+	ck_assert_int_eq(commit_called, 0);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_conformance_restart_clears_volatile_state)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry *peers;
+	struct io_buf *head;
+	struct io_buf *active;
+
+	setup_cluster(2);
+	peers = *peers_ptr;
+
+	raft_state.state = RAFT_STATE_LEADER;
+	raft_state.commit_index = 3;
+	raft_state.last_applied = 2;
+	raft_state.election = true;
+	raft_state.election_timer = 123;
+	raft_state.next_ping = 456;
+	raft_state.next_request_vote = 789;
+
+	client_state->current_leader_id = raft_state.self_id;
+	client_state->current_leader = &peers[0];
+
+	peers[0].vote_responded = true;
+	peers[0].vote_granted = peers[0].server_id;
+	peers[0].next_index = 5;
+	peers[0].match_index = 4;
+
+	peers[0].rd_state = RAFT_PCK_PACKET;
+	peers[0].rd_offset = 7;
+	peers[0].rd_need = 9;
+	peers[0].rd_packet_length = 22;
+	peers[0].rd_packet_buffer = malloc(16);
+	ck_assert_ptr_nonnull(peers[0].rd_packet_buffer);
+
+	head = calloc(1, sizeof(*head));
+	active = calloc(1, sizeof(*active));
+	ck_assert_ptr_nonnull(head);
+	ck_assert_ptr_nonnull(active);
+	head->buf = (uint8_t *)malloc(8);
+	active->buf = (uint8_t *)malloc(4);
+	ck_assert_ptr_nonnull(head->buf);
+	ck_assert_ptr_nonnull(active->buf);
+	head->size = 8;
+	active->size = 4;
+	peers[0].wr_head = head;
+	peers[0].wr_tail = head;
+	peers[0].wr_active = active;
+	peers[0].wr_queue = 1;
+	peers[0].wr_need = 4;
+	peers[0].wr_packet_length = 4;
+	peers[0].wr_offset = 1;
+	atomic_store_explicit(&peers[0].wr_packet_buffer,
+			(_Atomic const uint8_t *)active->buf, memory_order_seq_cst);
+
+	peers[0].ss_need = 12;
+	peers[0].ss_offset = 5;
+	peers[0].ss_tried_offset = 3;
+	peers[0].ss_tried_length = 7;
+	peers[0].ss_tried_status = RAFT_OK;
+	peers[0].ss_last_index = 9;
+	peers[0].ss_last_term = 3;
+	atomic_store_explicit(&peers[0].ss_data,
+			(_Atomic const uint8_t *)malloc(10), memory_order_seq_cst);
+
+	simulate_restart();
+
+	ck_assert_int_eq(raft_state.state, RAFT_STATE_FOLLOWER);
+	ck_assert_uint_eq(raft_state.commit_index, 0);
+	ck_assert_uint_eq(raft_state.last_applied, 0);
+	ck_assert(!raft_state.election);
+	ck_assert_int_eq(raft_state.election_timer, 0);
+	ck_assert_int_eq(raft_state.next_ping, 0);
+	ck_assert_int_eq(raft_state.next_request_vote, 0);
+
+	ck_assert_uint_eq(client_state->current_leader_id, NULL_ID);
+	ck_assert_ptr_eq(client_state->current_leader, NULL);
+
+	ck_assert_uint_eq(peers[0].next_index, 1);
+	ck_assert_uint_eq(peers[0].match_index, 0);
+	ck_assert(!peers[0].vote_responded);
+	ck_assert_uint_eq(peers[0].vote_granted, NULL_ID);
+
+	ck_assert_int_eq(peers[0].rd_state, RAFT_PCK_NEW);
+	ck_assert_int_eq(peers[0].rd_offset, 0);
+	ck_assert_int_eq(peers[0].rd_need, 0);
+	ck_assert_int_eq(peers[0].rd_packet_length, 0);
+	ck_assert_ptr_eq(peers[0].rd_packet_buffer, NULL);
+
+	ck_assert_int_eq(peers[0].wr_offset, 0);
+	ck_assert_int_eq(peers[0].wr_need, 0);
+	ck_assert_int_eq(peers[0].wr_packet_length, 0);
+	ck_assert_ptr_eq(atomic_load_explicit(&peers[0].wr_packet_buffer,
+				memory_order_seq_cst), NULL);
+	ck_assert_ptr_eq(peers[0].wr_head, NULL);
+	ck_assert_ptr_eq(peers[0].wr_tail, NULL);
+	ck_assert_ptr_eq(peers[0].wr_active, NULL);
+	ck_assert_int_eq(peers[0].wr_queue, 0);
+
+	ck_assert_int_eq(peers[0].ss_need, 0);
+	ck_assert_int_eq(peers[0].ss_offset, 0);
+	ck_assert_int_eq(peers[0].ss_tried_offset, 0);
+	ck_assert_int_eq(peers[0].ss_tried_length, 0);
+	ck_assert_int_eq(peers[0].ss_tried_status, RAFT_ERR);
+	ck_assert_int_eq(peers[0].ss_last_index, 0);
+	ck_assert_int_eq(peers[0].ss_last_term, 0);
+	ck_assert_ptr_eq(atomic_load_explicit(&peers[0].ss_data,
+				memory_order_seq_cst), NULL);
+}
+END_TEST
+
 static Suite *raft_conformance_suite(void)
 {
 	Suite *s = suite_create("raft_conformance");
@@ -2729,6 +2952,9 @@ static Suite *raft_conformance_suite(void)
 	tcase_add_test(tc, test_conformance_follower_catch_up_after_restart);
 	tcase_add_test(tc, test_conformance_restart_preserves_stable_state);
 	tcase_add_test(tc, test_conformance_restart_keeps_voted_for);
+	tcase_add_test(tc, test_conformance_durable_state_round_trip);
+	tcase_add_test(tc, test_conformance_durable_state_truncated_log);
+	tcase_add_test(tc, test_conformance_restart_clears_volatile_state);
 	tcase_add_test(tc, test_conformance_client_request_appends_log);
 	tcase_add_test(tc, test_conformance_client_request_rejected_when_not_leader);
 	tcase_add_test(tc, test_conformance_client_request_commit_applies_with_quorum);
