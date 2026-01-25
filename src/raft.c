@@ -109,9 +109,7 @@ static int64_t timems(void)
 enum {
     RSS_CURRENT_TERM = 0,
     RSS_VOTED_FOR,
-    RSS_TAIL_TERM,
-    RSS_TAIL_INDEX,
-    RSS_SIZE
+    RSS_SIZE,
 };
 
 enum {
@@ -122,55 +120,71 @@ enum {
     RSS_HDR_SIZE
 };
 
-static int raft_save_state(bool header_only)
+static int raft_save_state_vars(void)
 {
     int state_fd = -1;
-    uint8_t *event_buf = NULL;
-    char file_name[BUFSIZ], new_file_name[BUFSIZ];
 
+    const char *fn = raft_state.fn_vars_new;
     const uint32_t save_current_term = raft_state.current_term;
     const uint32_t save_voted_for    = raft_state.voted_for;
-    const uint32_t save_tail_term    = raft_state.log_tail ? raft_state.log_tail->term : 0;
-    const uint32_t save_tail_index   = raft_state.log_tail ? raft_state.log_tail->index : 0;
 
     const uint32_t save_block[RSS_SIZE] = {
         save_current_term,
         save_voted_for,
-        save_tail_term,
-        save_tail_index,
     };
-
-    int open_flags = O_WRONLY|O_CREAT;
 
     if (raft_state.self_id == 0) {
         errno = EALREADY;
         return -1;
     }
 
-    /* TODO predefine both file and file.new in raft_state to avoid constant regeneration */
-    snprintf(file_name, sizeof(file_name), "save_state.%u%s", raft_state.self_id, header_only ? "" : ".new");
-
-    if (header_only == false)
-        open_flags |= O_TRUNC;
-
-    if ((state_fd = open(file_name, open_flags, 0600)) == -1) {
-        warn("raft_save_state: open");
+    if ((state_fd = open(fn, O_WRONLY|O_CREAT|O_TRUNC, 0600)) == -1) {
+        warn("raft_save_state: open(%s)", fn);
         goto fail;
     }
 
     for (unsigned idx = 0; idx < RSS_SIZE; idx++)
         if (write(state_fd, &save_block[idx], sizeof(uint32_t)) == -1) {
-            warn("raft_save_state: write");
+            warn("raft_save_state: write(%s)", fn);
             goto fail;
         }
 
-    if (header_only)
-        goto skip_log;
+    fdatasync(state_fd);
+    close(state_fd);
+    state_fd = -1;
+
+    if (rename(raft_state.fn_vars_new, raft_state.fn_vars) == -1)
+        goto fail;
+
+    return 0;
+
+fail:
+    if (state_fd != -1)
+        close(state_fd);
+
+    unlink(fn);
+    rdbg_printf("RAFT raft_save_state_meta: FAIL\n");
+    return -1;
+}
+
+static int raft_save_state_log(void)
+{
+    int log_fd = -1;
+    uint8_t *event_buf = NULL;
+    const char *fn = raft_state.fn_log;
+
+    /*rdbg_printf("RAFT raft_save_state_log: last_saved_index=%d\n",
+            raft_state.last_saved_index);*/
+
+    if ((log_fd = open(fn, O_WRONLY|O_CREAT|O_APPEND, 0600)) == -1) {
+        warn("raft_save_state_log: open(%s)", fn);
+        goto fail;
+    }
 
     for (struct raft_log *p = raft_state.log_head; p; p = p->next)
     {
-        if (p->index > save_tail_index) /* WTF is this for ? */
-            break;
+        if (p->index <= raft_state.last_saved_index) /* skip already saved logs */
+            continue;
 
         if (p->event > raft_impl->num_log_types)
             abort();
@@ -178,12 +192,12 @@ static int raft_save_state(bool header_only)
         int event_buf_len;
 
         if ((event_buf_len = raft_impl->handlers[p->event].save_log(p, &event_buf)) == -1) {
-            warn("raft_save_state: save_log");
+            warn("raft_save_state_log: save_log");
             goto fail;
         }
 
         if (event_buf_len < 0 || (size_t)event_buf_len > USHRT_MAX) {
-            warnx("raft_save_state: event_buf_len is %d", event_buf_len);
+            warnx("raft_save_state_log: event_buf_len is %d", event_buf_len);
             errno = EOVERFLOW;
             goto fail;
         }
@@ -195,26 +209,35 @@ static int raft_save_state(bool header_only)
             event_buf_len,
             };
 
-        for (unsigned idx = 0; idx < RSS_SIZE; idx++) {
-            if (write(state_fd, &save_hdr[idx], sizeof(uint32_t)) != sizeof(uint32_t)) {
-                warn("raft_save_state: write");
+        /*rdbg_printf("RAFT savr_hdr[%u,%u,%u,%u]\n",
+                save_hdr[0],
+                save_hdr[1],
+                save_hdr[2],
+                save_hdr[3]
+                )*/
+
+        for (unsigned idx = 0; idx < RSS_HDR_SIZE; idx++) {
+            if (write(log_fd, &save_hdr[idx], sizeof(uint32_t)) != sizeof(uint32_t)) {
+                warn("raft_save_state_log: write(hdr,%s)", fn);
                 goto fail;
             }
         }
 
         if (event_buf) {
-            if (write(state_fd, event_buf, event_buf_len) != event_buf_len) {
-                warn("raft_save_state: write(event_buf)");
+            if (write(log_fd, event_buf, event_buf_len) != event_buf_len) {
+                warn("raft_save_state: write(event_buf,%s)", fn);
                 goto fail;
             }
             free(event_buf);
             event_buf = NULL;
         }
 
+        raft_state.last_saved_index = p->index;
+
 #ifdef FEATURE_RAFT_DEBUG
 #if 0
         rdbg_printf("RAFT raft_save_state: [t:%02u-i:%02u/s:%02u vs ci:%02u|la:%02x]: %s:",
-                p->term, p->index, save_tail_index, raft_state.commit_index,
+                p->term, p->index, p->index, raft_state.commit_index,
                 raft_state.last_applied, raft_log_str[p->event]);
         switch(p->event)
         {
@@ -232,53 +255,38 @@ static int raft_save_state(bool header_only)
 #endif
     }
 
-skip_log:
-
-    //fdatasync(state_fd);
-    close(state_fd);
-
-    if (header_only == false) {
-        snprintf(new_file_name, sizeof(new_file_name), "save_state.%u", raft_state.self_id);
-        if (rename(file_name, new_file_name) == -1) {
-            warn("raft_save_state: rename");
-            goto fail;
-        }
-    }
-
-    //rdbg_printf("RAFT raft_save_state: done\n");
+    fdatasync(log_fd);
+    close(log_fd);
+    
     return 0;
 
 fail:
-    rdbg_printf("RAFT raft_save_state: FAIL\n");
-    if (header_only == false)
-        unlink(file_name);
-    if (state_fd != -1)
-        close(state_fd);
+    rdbg_printf("RAFT raft_save_state_log: fail on %s\n", fn);
     if (event_buf)
         free(event_buf);
+    if (log_fd != -1)
+        close(log_fd);
 
     return -1;
 }
 
-static int raft_load_state(void)
+static int raft_load_state_vars(void)
 {
+    const char *fn = raft_state.fn_vars;
     int state_fd = -1;
-    uint8_t *event_buf = NULL;
-    struct raft_log *tmp_log = NULL;
 
-    char file_name[BUFSIZ];
-
-    rdbg_printf("RAFT raft_load_state: start\n");
+    //rdbg_printf("RAFT raft_load_state_vars: start\n");
 
     if (raft_state.self_id == 0) {
         errno = EALREADY;
         return -1;
     }
 
-    snprintf(file_name, BUFSIZ, "save_state.%u", raft_state.self_id);
+    if ((state_fd = open(fn, O_RDONLY)) == -1) {
+        warn("raft_load_state_vars: open(%s)", fn);
+        if (errno == ENOENT)
+            return 0;
 
-    if ((state_fd = open(file_name, O_RDONLY)) == -1) {
-        warn("raft_load_state: open");
         goto fail;
     }
 
@@ -286,92 +294,124 @@ static int raft_load_state(void)
 
     for (unsigned idx = 0; idx < RSS_SIZE; idx++)
         if (read(state_fd, &read_block[idx], sizeof(uint32_t)) == -1) {
-            warn("raft_load_state: read");
+            warn("raft_load_state_vars: read(%s)", fn);
             goto fail;
         }
 
-    raft_state.log_index = 0;
-
-    if (read_block[RSS_INDEX] > 0) {
-        int rc;
-        unsigned logs_read = 0;
-
-        while (1)
-        {
-            uint32_t read_hdr[RSS_HDR_SIZE];
-
-            for (unsigned idx = 0; idx < RSS_HDR_SIZE; idx++) {
-                if ((rc = read(state_fd, &read_hdr[idx], sizeof(uint32_t))) != sizeof(uint32_t)) {
-                    /* EOF on the first read means we've reached the end of the logs,
-                     * otherwise it's an error */
-                    if (rc == 0 && idx == 0)
-                        goto logs_done;
-                    warn("raft_load_state: read(log)");
-                    goto fail;
-                }
-            }
-
-            if ((tmp_log = raft_alloc_log(RAFT_PEER, read_hdr[2])) == NULL)
-                goto fail;
-
-            tmp_log->index = read_hdr[RSS_INDEX];
-            tmp_log->term = read_hdr[RSS_TERM];
-
-            if (read_hdr[RSS_EVENT_BUF_LEN]) {
-                if ((event_buf = malloc(read_hdr[RSS_EVENT_BUF_LEN])) == NULL)
-                    goto fail;
-
-                if (read(state_fd, event_buf, read_hdr[RSS_EVENT_BUF_LEN]) != read_hdr[RSS_EVENT_BUF_LEN])
-                    goto fail;
-
-                if (raft_impl->handlers[read_hdr[RSS_EVENT]].read_log(tmp_log,
-                            event_buf, read_hdr[RSS_EVENT_BUF_LEN]) == -1) {
-                    warn("raft_load_state: read_log");
-                    goto fail;
-                }
-
-                free(event_buf);
-                event_buf = NULL;
-            }
-
-            if (raft_append_log(tmp_log, &raft_state.log_head,
-                        &raft_state.log_tail, &raft_state.log_length) == -1) {
-                warn("raft_load_state: raft_append_log");
-                goto fail;
-            }
-
-            if (raft_commit_and_advance() == -1) {
-                warn("raft_load_state: raft_commit_and_advance");
-                goto fail;
-            }
-
-            logs_read++;
-        }
-logs_done:
-
-        if (logs_read) {
-            assert(raft_state.log_tail);
-            rdbg_printf("RAFT raft_load_state: tail=[%d/%d] hdr=[%d/%d]\n",
-                    raft_state.log_tail->term,
-                    raft_state.log_tail->index,
-                    read_block[RSS_TAIL_TERM],
-                    read_block[RSS_TAIL_INDEX]);
-            assert(raft_state.log_tail->term == read_block[RSS_TAIL_TERM]);
-            assert(raft_state.log_tail->index == read_block[RSS_TAIL_INDEX]);
-            raft_state.log_index = raft_state.log_tail->index;
-        }
-    } else
-        warnx("raft_load_state: no logs in state_save");
+    close(state_fd);
 
     raft_state.current_term = read_block[RSS_CURRENT_TERM];
     raft_state.voted_for = read_block[RSS_VOTED_FOR];
-
-    close(state_fd);
     return 0;
 
 fail:
     if (state_fd != -1)
         close(state_fd);
+    return -1;
+}
+
+static int raft_load_state_logs(void)
+{
+    int log_fd = -1;
+    uint8_t *event_buf = NULL;
+    struct raft_log *tmp_log = NULL;
+    int rc;
+    unsigned logs_read = 0;
+    const char *fn = raft_state.fn_log;
+
+    if ((log_fd = open(fn, O_RDONLY)) == -1) {
+        warn("raft_load_state_logs: open(%s)", fn);
+        if (errno != ENOENT)
+            goto fail;
+        return -1;
+    }
+
+    raft_state.log_index = 0;
+
+    while (1)
+    {
+        uint32_t read_hdr[RSS_HDR_SIZE];
+
+        for (unsigned idx = 0; idx < RSS_HDR_SIZE; idx++) {
+            if ((rc = read(log_fd, &read_hdr[idx], sizeof(uint32_t))) != sizeof(uint32_t)) {
+                /* EOF on the first read means we've reached the end of the logs,
+                 * otherwise it's an error */
+                if (rc == 0 && idx == 0)
+                    goto logs_done;
+                warn("raft_load_state: read(log)");
+                goto fail;
+            }
+        }
+
+        /*rdbg_printf("RAFT raft_load_state_logs: [%u,%u,%u,%u]\n",
+                read_hdr[0],
+                read_hdr[1],
+                read_hdr[2],
+                read_hdr[3]
+                );*/
+
+        if ((tmp_log = raft_alloc_log(RAFT_PEER, read_hdr[RSS_EVENT])) == NULL)
+            goto fail;
+
+        tmp_log->index = read_hdr[RSS_INDEX];
+        tmp_log->term = read_hdr[RSS_TERM];
+
+        if (read_hdr[RSS_EVENT_BUF_LEN]) {
+            if ((event_buf = malloc(read_hdr[RSS_EVENT_BUF_LEN])) == NULL)
+                goto fail;
+
+            if ((size_t)(rc = read(log_fd, event_buf, read_hdr[RSS_EVENT_BUF_LEN])) != read_hdr[RSS_EVENT_BUF_LEN]) {
+                if (rc == 0) {
+                    errno = EPIPE;
+                } else if (rc > 0) {
+                    warnx("raft_load_state_logs: short read on log %d: %u/%u",
+                            logs_read, rc, read_hdr[RSS_EVENT_BUF_LEN]);
+                }
+                goto fail;
+            }
+
+            if (raft_impl->handlers[read_hdr[RSS_EVENT]].read_log(tmp_log,
+                        event_buf, read_hdr[RSS_EVENT_BUF_LEN]) == -1) {
+                warn("raft_load_state: read_log");
+                goto fail;
+            }
+
+            free(event_buf);
+            event_buf = NULL;
+        }
+
+        if (raft_append_log(tmp_log, &raft_state.log_head,
+                    &raft_state.log_tail, &raft_state.log_length) == -1) {
+            warn("raft_load_state: raft_append_log");
+            goto fail;
+        }
+
+        if (raft_commit_and_advance() == -1) {
+            warn("raft_load_state: raft_commit_and_advance");
+            goto fail;
+        }
+
+        logs_read++;
+        if (tmp_log->index > raft_state.last_saved_index)
+            raft_state.last_saved_index = tmp_log->index;
+    }
+logs_done:
+    close(log_fd);
+
+    if (logs_read) {
+        assert(raft_state.log_tail);
+        rdbg_printf("RAFT raft_load_state: tail=[%d/%d]\n",
+                raft_state.log_tail->term,
+                raft_state.log_tail->index);
+        raft_state.log_index = raft_state.log_tail->index;
+    }
+
+    return 0;
+
+fail:
+    rdbg_printf("RAFT raft_load_state_logs: failed on %s\n", fn);
+    if (log_fd != -1)
+        close(log_fd);
     if (event_buf)
         free(event_buf);
     if (tmp_log)
@@ -618,14 +658,14 @@ static int raft_update_term(uint32_t new_term)
     raft_state.current_term = new_term;
     raft_state.voted_for = NULL_ID;
 
-    return raft_save_state(true);
+    return raft_save_state_vars();
 }
 
 static int raft_update_voted_for(uint32_t new_votee)
 {
     raft_state.voted_for = new_votee;
 
-    return raft_save_state(true);
+    return raft_save_state_vars();
 }
 
 static struct raft_log *raft_log_at(uint32_t index)
@@ -1000,7 +1040,7 @@ static int raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_
     if (raft_append_log(new_log, &raft_state.log_head, &raft_state.log_tail, &raft_state.log_length) == -1)
         goto fail;
 
-    raft_save_state(false);
+    raft_save_state_log();
 
     for (unsigned idx = 1; idx < raft_num_peers; idx++)
     {
@@ -1252,7 +1292,7 @@ static int raft_client_log_append_single(struct raft_log *raft_log, uint32_t lea
     raft_append_log(raft_log, &raft_state.log_head, &raft_state.log_tail, &raft_state.log_length);
     if (raft_state.log_tail)
         raft_state.log_index = raft_state.log_tail->index;
-    raft_save_state(false);
+    raft_save_state_log();
 
     /* 5. If leaderCommit > commitIndex, set commitIndex =
      * min(leaderCommit, index of last new entry */
@@ -3403,6 +3443,7 @@ static int raft_init(void)
     raft_state.log_head = NULL;            /* /\ log         = [i \in Server |-> << >>]    */
     raft_state.log_tail = NULL;            /* /\ log         = [i \in Server |-> << >>]    */
     raft_state.log_length = 0;
+    raft_state.last_saved_index = 0;
     raft_state.commit_index = 0;           /* /\ commitIndex = [i \in Server |-> 0]        */
 
     raft_client_state.current_leader_id = NULL_ID;
@@ -3440,7 +3481,6 @@ static int raft_init(void)
                 ntohl(raft_peers[idx].address.s_addr), ntohs(raft_peers[idx].port));
 # endif
 
-    //atexit(raft_clean);
     raft_reset_election_timer();
 
     if (pthread_mutex_init(&raft_state.lock, NULL) != 0)
@@ -3454,8 +3494,21 @@ static int raft_init(void)
 
     rdbg_printf("RAFT init: raft_num_peers=%u\n", raft_num_peers);
 
-    if (raft_load_state() == -1) {
-        warnx("raft_init: raft_load_state");
+    assert(raft_state.self_id > 0);
+
+    snprintf((void *)raft_state.fn_prefix       , NAME_MAX/2      , "save_state_%u_" , raft_state.self_id);
+    snprintf((void *)raft_state.fn_vars         , NAME_MAX-8      , "%svars.bin"    , raft_state.fn_prefix);
+    snprintf((void *)raft_state.fn_log          , NAME_MAX-8      , "%slog.bin"     , raft_state.fn_prefix);
+    snprintf((void *)raft_state.fn_vars_new     , NAME_MAX        , "%s.new"         , raft_state.fn_vars);
+
+    if (raft_load_state_vars() == -1) {
+        warn("raft_init: raft_load_state_vars");
+        if (errno != ENOENT)
+            return -1;
+    }
+
+    if (raft_load_state_logs() == -1) {
+        warn("raft_init: raft_load_state_logs");
         if (errno != ENOENT)
             return -1;
     }

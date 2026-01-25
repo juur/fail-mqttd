@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <limits.h>
 
 #ifndef UUID_SIZE
 # define UUID_SIZE 16
@@ -231,6 +232,12 @@ struct raft_state {
     bool     election;
     timems_t next_ping;
     timems_t next_request_vote;
+
+    const char fn_prefix[NAME_MAX/2];
+    const char fn_vars[NAME_MAX-8];
+    const char fn_log[NAME_MAX-8];
+    const char fn_vars_new[NAME_MAX];
+    uint32_t last_saved_index;
 
     /* this is a 'global mutex' for which thread owns raft operations
      * typically this will be the raft thread, except for when the
