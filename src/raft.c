@@ -443,12 +443,7 @@ again2:
             goto fail;
         }
 
-        /*if (raft_commit_and_advance() == -1) {
-            warn("raft_load_state: raft_commit_and_advance");
-            raft_remove_log(tmp_log, &raft_state.log_head,
-                    &raft_state.log_tail, NULL, &raft_state.log_length);
-            goto fail;
-        }*/
+        /* We do not commit here, as we do not have a majority of peers */
 
         logs_read++;
         if (tmp_log->index > raft_state.last_saved_index)
