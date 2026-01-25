@@ -44,5 +44,6 @@ const char *const raft_conn_str[RAFT_MAX_CONN] = {
 };
 
 const char *const raft_log_str[RAFT_MAX_LOG] = {
+    [RAFT_LOG_NOOP]           = "NOOP",
     [RAFT_LOG_REGISTER_TOPIC] = "REGISTER_TOPIC",
 };

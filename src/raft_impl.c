@@ -351,6 +351,9 @@ static int save_log(const struct raft_log *l, uint8_t **event_buf)
 
     switch (l->event)
     {
+        case RAFT_LOG_NOOP:
+            break;
+
         case RAFT_LOG_REGISTER_TOPIC:
             assert(l->register_topic.length > 0);
 
@@ -400,6 +403,9 @@ static int read_log(struct raft_log *l, const uint8_t *event_buf, int len)
 
     switch (l->event)
     {
+        case RAFT_LOG_NOOP:
+            break;
+
         case RAFT_LOG_REGISTER_TOPIC:
             if (bytes_remaining < sizeof(uint32_t) + sizeof(uint16_t) + UUID_SIZE)
                 goto fail;
@@ -448,6 +454,17 @@ const struct raft_impl mqtt_raft_impl = {
     .name = "fail-mqttd",
     .num_log_types = RAFT_MAX_LOG,
     .handlers = {
+        [RAFT_LOG_NOOP] = {
+            .free_log           = NULL,
+            .commit_and_advance = NULL,
+            .leader_append      = NULL,
+            .client_append      = NULL,
+            .pre_send           = NULL,
+            .fill_send          = NULL,
+            .process_packet     = NULL,
+            .save_log           = save_log,
+            .read_log           = read_log,
+        },
         [RAFT_LOG_REGISTER_TOPIC] = {
             .free_log           = free_log,
             .commit_and_advance = commit_and_advance,

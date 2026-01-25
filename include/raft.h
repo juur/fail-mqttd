@@ -98,7 +98,8 @@ typedef enum {
  */
 
 typedef enum {
-    RAFT_LOG_REGISTER_TOPIC = 0,
+    RAFT_LOG_NOOP = 0,          /* Mandatory for all implementations */
+    RAFT_LOG_REGISTER_TOPIC,
     RAFT_MAX_LOG,
 } raft_log_t;
 
@@ -233,10 +234,10 @@ struct raft_state {
     timems_t next_ping;
     timems_t next_request_vote;
 
-    const char fn_prefix[NAME_MAX/2];
-    const char fn_vars[NAME_MAX-8];
-    const char fn_log[NAME_MAX-8];
-    const char fn_vars_new[NAME_MAX];
+    char fn_prefix[NAME_MAX/2];
+    char fn_vars[NAME_MAX-8];
+    char fn_log[NAME_MAX-8];
+    char fn_vars_new[NAME_MAX];
     uint32_t last_saved_index;
 
     /* this is a 'global mutex' for which thread owns raft operations
