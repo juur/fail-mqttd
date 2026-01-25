@@ -20,6 +20,13 @@ jobs:
     - name: make
       run: make
   test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: prep
+      run: sudo apt-get install -y libgdbm-dev libgdbm-compat-dev check
+    - name: configure
+      run: ./configure --enable-raft --enable-openmetrics
     - name: make check
       run: make check
 #    - name: make distcheck
