@@ -1596,6 +1596,7 @@ done:
 
     if (rc == -1 && (errno == EWOULDBLOCK || errno == EINTR || errno == EAGAIN)) {
         pthread_rwlock_unlock(&client->wr_lock);
+        errno = EAGAIN;
         return -1;
     }
 
@@ -1991,7 +1992,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                 tmp_packet_buffer = NULL;
                 raft_close(&raft_peers[idx]);
             } else if (raft_try_write(&raft_peers[idx]) == -1) {
-                if (!(errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR))
+                if (errno != EAGAIN)
                     warn("raft_send: bcast raft_try_write(%u)", idx);
             } else {
                 sent++;
@@ -2036,7 +2037,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
         packet_buffer = NULL;
 
         if (raft_try_write(client) == -1) {
-            if (!(errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)) {
+            if (errno != EAGAIN) {
                 warn("raft_send: raft_try_write(%u)", client->server_id);
                 goto fail;
             }
@@ -3545,7 +3546,7 @@ void *raft_loop(void *start_args)
                 if (raft_has_pending_write(&raft_peers[idx]) &&
                         FD_ISSET(raft_peers[idx].peer_fd, &fds_out)) {
                     if (raft_try_write(&raft_peers[idx]) == -1)
-                        if (!(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                        if (errno != EAGAIN) {
                             rdbg_printf("RAFT main_loop: raft_try_write: %s\n", strerror(errno));
                             continue;
                         }
@@ -3677,6 +3678,7 @@ const struct raft_test_api raft_test_api = {
     .raft_save_state = raft_save_state,
     .raft_load_state = raft_load_state,
     .raft_reset_read_state = raft_reset_read_state,
+    .raft_clear_active_write = raft_clear_active_write,
     .raft_reset_write_state = raft_reset_write_state,
     .raft_reset_ss_state = raft_reset_ss_state,
     .raft_update_leader_id = raft_update_leader_id,
@@ -3698,6 +3700,8 @@ const struct raft_test_api raft_test_api = {
     .raft_new_conn = raft_new_conn,
     .raft_add_write = raft_add_write,
     .raft_try_write = raft_try_write,
+    .raft_append_iobuf = raft_append_iobuf,
+    .raft_remove_iobuf = raft_remove_iobuf,
     .raft_reset_election_timer = raft_reset_election_timer,
     .raft_reset_next_ping = raft_reset_next_ping,
     .raft_change_to = raft_change_to,
