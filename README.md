@@ -1,5 +1,9 @@
 # fail-mqttd
 
+[![C/C++ CI](https://github.com/juur/fail-mqttd/actions/workflows/c-cpp.yml/badge.svg?branch=master)](https://github.com/juur/fail-mqttd/actions/workflows/c-cpp.yml)
+
+[![CodeQL](https://github.com/juur/fail-mqttd/actions/workflows/github-code-scanning/codeql/badge.svg?branch=master)](https://github.com/juur/fail-mqttd/actions/workflows/github-code-scanning/codeql)
+
 ## About
 
 [fail-mqttd](https://github.com/juur/fail-mqttd) is a terrible implementation of [MQTT Version 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html). Plus, for extra fail, [The Raft Algorithm](https://raft.github.io/) is also half-done.
@@ -17,7 +21,7 @@ There are various things it might do, hopefully:
 - Property parsing
 - Topic Filters and topic 'hierarchy'
 - Non-shared Subscriptions
-- A basic Raft algorthim
+- A basic Raft algorthim with some persistence
 
 ## TODO
 
