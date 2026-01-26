@@ -406,7 +406,6 @@ START_TEST(test_save_and_load_state_round_trip)
 				&raft_state.log_tail, &raft_state.log_length), 0);
 	ck_assert_int_eq(raft_test_api.raft_append_log(log2, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = raft_state.log_tail->index;
 
 	ck_assert_int_eq(raft_test_api.raft_save_state_vars(), 0);
 	ck_assert_int_eq(raft_test_api.raft_save_state_log(), 0);
@@ -463,7 +462,6 @@ START_TEST(test_save_state_header_only_preserves_log)
 				&raft_state.log_tail, &raft_state.log_length), 0);
 	ck_assert_int_eq(raft_test_api.raft_append_log(log2, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = raft_state.log_tail->index;
 
 	ck_assert_int_eq(raft_test_api.raft_save_state_vars(), 0);
 	ck_assert_int_eq(raft_test_api.raft_save_state_log(), 0);

@@ -228,7 +228,7 @@ struct raft_state {
     uint32_t last_applied;
 
     uint32_t self_id;
-    uint32_t log_index;
+    //uint32_t log_index;
     timems_t election_timer;
     bool     election;
     timems_t next_ping;

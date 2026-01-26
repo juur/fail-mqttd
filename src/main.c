@@ -41,6 +41,8 @@
 #include <endian.h>
 #include <locale.h>
 
+static int64_t timems(void);
+
 #include "debug.h"
 #include "mqtt.h"
 #include "raft.h"
