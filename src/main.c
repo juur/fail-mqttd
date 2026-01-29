@@ -1598,13 +1598,15 @@ static int free_delivery_states(pthread_rwlock_t *lock, unsigned *num,
     }
 
     pthread_rwlock_wrlock(lock);
-    while (*num)
+    while (*msgs && *num && **msgs)
         if (mds_detach_and_free(**msgs, false, false) == -1) {
             warn("free_delivery_states: mds_detach_and_free");
             rc = -1;
+            break;
         }
 
-    free(*msgs);
+    if (*msgs)
+        free(*msgs);
     *msgs = NULL;
     *num = 0;
     pthread_rwlock_unlock(lock);

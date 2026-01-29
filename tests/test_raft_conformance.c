@@ -651,7 +651,6 @@ static void append_local_log(uint32_t index, uint32_t term)
 
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = raft_state.log_tail->index;
 }
 
 static void catch_up_follower(uint32_t leader_term, uint32_t leader_id,
@@ -2147,7 +2146,6 @@ START_TEST(test_impl_three_node_leader_replication)
 	entry->term = leader->state.current_term;
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = entry->index;
 	impl_save_node(leader);
 
 	if (noop_index > 0) {
@@ -2228,7 +2226,6 @@ START_TEST(test_impl_log_matching_after_replication)
 	entry->term = leader->state.current_term;
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = entry->index;
 	impl_save_node(leader);
 
 	if (noop_index > 0) {
@@ -2285,7 +2282,6 @@ START_TEST(test_impl_leader_completeness_after_leader_change)
 	entry->term = leader->state.current_term;
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = entry->index;
 	impl_save_node(leader);
 
 	if (noop_index > 0)
@@ -2753,7 +2749,6 @@ START_TEST(test_conformance_restart_preserves_stable_state)
 	entry = make_log(2, 5);
 	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = 2;
 
 	peers[1].next_index = 3;
 	peers[1].match_index = 2;
@@ -2825,10 +2820,9 @@ START_TEST(test_conformance_durable_state_round_trip)
 				&raft_state.log_tail, &raft_state.log_length), 0);
 	ck_assert_int_eq(raft_test_api.raft_append_log(log2, &raft_state.log_head,
 				&raft_state.log_tail, &raft_state.log_length), 0);
-	raft_state.log_index = raft_state.log_tail->index;
 
 	ck_assert_int_eq(raft_test_api.raft_save_state_vars(), 0);
-	ck_assert_int_eq(raft_test_api.raft_save_state_log(), 0);
+	ck_assert_int_eq(raft_test_api.raft_save_state_log(false), 0);
 
 	reset_raft_state();
 	raft_state.self_id = 1;
