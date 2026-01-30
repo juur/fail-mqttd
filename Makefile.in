@@ -69,6 +69,8 @@ test_CORE_OBJS    := $(addprefix $(objdir)/,$(notdir $(test_CORE_SRCS:.c=.test.o
 test_SUPPORT_OBJS := $(addprefix $(objdir)/tests/,$(notdir $(test_SUPPORT_SRCS:.c=.o)))
 
 test_BINS         := $(addprefix $(objdir)/,$(notdir $(test_SRCS:.c=)))
+package_BIN       := $(objdir)/$(progprefix)$(PACKAGE)
+package_MAN       := $(objdir)/doc/$(progprefix)$(PACKAGE).8
 
 ifeq ($(DEPS),1)
 CPPFLAGS += -MMD -MP
@@ -78,12 +80,7 @@ CPPFLAGS += -I$(srcdir)/include
 
 .PHONY: all check test coverage coverage-run
 
-all: $(objdir)/.d $(objdir)/$(progprefix)$(PACKAGE) man
-
-var:
-	@printf \
-		"test_BINS: %s\ntest_OBJS: %s\ntest_CORE_OBJS: %s\ntest_SUPPORT_OBJS: %s\n" \
-		"$(test_BINS)" "$(package_OBJS)" "$(test_CORE_OBJS)" "$(test_SUPPORT_OBJS)"
+all: $(objdir)/.d $(package_BINS) man
 
 check: $(objdir)/tests $(objdir)/.d/tests $(test_BINS)
 	@set -e; for t in $(test_BINS); do \
@@ -120,10 +117,10 @@ $(objdir)/.d/tests:
 
 man: $(objdir)/doc/$(PACKAGE).8
 
-$(objdir)/doc/$(PACKAGE).8: $(objdir)/$(progprefix)$(PACKAGE) | $(objdir)/doc
+$(objdir)/doc/$(PACKAGE).8: $(package_BIN) | $(objdir)/doc
 	-$(HELP2MAN) -N -s 8 -S 'ZeroDay Linux' --help-option=-h --version-option=-V -o $@ $<
 
-$(objdir)/$(progprefix)$(PACKAGE): $(package_OBJS)
+$(package_BIN): $(package_OBJS)
 	$(CC) $^ $(LDFLAGS) -o $@
 
 $(objdir)/test_%: $(objdir)/tests/test_%.o $(test_CORE_OBJS) $(test_SUPPORT_OBJS)
@@ -131,15 +128,15 @@ $(objdir)/test_%: $(objdir)/tests/test_%.o $(test_CORE_OBJS) $(test_SUPPORT_OBJS
 
 .PHONY: install uninstall
 
-install: $(PACKAGE)
+install: $(package_BIN) man
 	$(MKDIR) $(DESTDIR)$(sbindir)
 	$(MKDIR) $(DESTDIR)$(localstatedir)/fail-mqttd
 	-$(MKDIR) $(DESTDIR)$(mandir)/man8
-	$(CP) $(objdir)/$(progprefix)$(PACKAGE) $(DESTDIR)$(sbindir)/
-	-$(CP) $(objdir)/$(PACKAGE).8 $(DESTDIR)$(mandir)/man8/
+	$(CP) $(package_BIN) $(DESTDIR)$(sbindir)/
+	-$(CP) $(package_MAN) $(DESTDIR)$(mandir)/man8/
 
 uninstall:
-	$(RM) $(DESTDIR)$(sbindir)/$(PACKAGE)
+	$(RM) $(DESTDIR)$(sbindir)/$(progprefix)$(PACKAGE)
 	-$(RM) $(DESTDIR)$(mandir)/man8/$(PACKAGE).8
 
 .PHONY: mostlyclean clean distclean maintainer-clean
@@ -152,20 +149,20 @@ distclean: clean
 		$(objdir)/fail-mqttd.service
 
 mostlyclean:
-	-$(RM) $(package_OBJS) $(objdir)/$(PACKAGE) $(test_OBJS) $(test_CORE_OBJS) \
+	-$(RM) $(package_OBJS) $(package_BIN) $(test_OBJS) $(test_CORE_OBJS) \
 		$(test_SUPPORT_OBJS) $(test_BINS)
 	-$(RM) -f $(objdir)/*.gcda $(objdir)/*.gcno
 	-$(RM) -f $(objdir)/tests/*.gcda $(objdir)/tests/*.gcno
 
 clean: mostlyclean
-	-$(RM) $(objdir)/$(PACKAGE).8
+	-$(RM) $(objdir)/$(doc)/$(PACKAGE).8
 	-$(RM) -rf $(objdir)/.d/*
 	-$(RMDIR) $(objdir)/.d
 
 .PHONY: dist
 
 dist: all
-	pushd $(srcdir) >/dev/null ; \
+	( cd $(srcdir) >/dev/null ; \
 	$(TAR) -Pacf $(objdir)/$(PACKAGE)-$(VERSION).tar.xz \
 		--transform="s,$(objdir)/,,;s,^./,,;s,^,$(PACKAGE)-$(VERSION)/," \
 		README.md COPYING src/*.c \
@@ -173,8 +170,7 @@ dist: all
 		include/*.h SECURITY.md \
 		$(PACKAGE).spec.in $(PACKAGE).service.in \
 		$(objdir)/$(PACKAGE).spec $(objdir)/$(PACKAGE).service $(objdir)/doc/*.[0-9] \
-		; \
-	popd >/dev/null
+	) >/dev/null
 
 $(objdir)/%.o: $(srcdir)/src/%.c
 ifeq ($(DEPS),1)
@@ -199,7 +195,7 @@ endif
 
 ifeq ($(DEPS),1)
 -include $(all_SRCS:$(srcdir)/src/%.c=$(objdir)/.d/%.d)
--include $(test_CORE_SRCS:$(srcdir)/tests/%c=$(objdir)/.d/tests/%.d)
--include $(test_SUPPORT_SRCS:$(srcdir)/tests/%c=$(objdir)/.d/tests/%.d)
+-include $(test_CORE_SRCS:$(srcdir)/%.c=$(objdir)/.d/tests/%.d)
+-include $(test_SUPPORT_SRCS:$(srcdir)/tests/%.c=$(objdir)/.d/tests/%.d)
 endif
 # :vim se noexpandtab
