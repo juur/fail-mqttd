@@ -69,7 +69,7 @@ FEATURE_RAFT_DEBUG=0
 FEATURE_RAFT_IMPL_DEBUG=0
 FEATURE_RAFT=0
 FEATURE_OM=0
-SAVED_ARGS="$*"
+SAVED_ARGS=$(printf '%q ' "$@")
 
 while :; do
 	case ${1:-} in
@@ -224,16 +224,18 @@ check_header()
 
 check_lib()
 {
-	local F=/tmp/$$.c
+	local F
+	F="$(mktemp).c"
 
-	echo "#define _XOPEN_SOURCE 700" >${F}
-	echo 'void main(void){}' >>${F}
+	echo "#define _XOPEN_SOURCE 700" >"${F}"
+	echo 'int main(void){}' >>"${F}"
 	echo -n "Checking for -l${1} ... "
+	cat "${F}" >>config.log
 	# shellcheck disable=SC2086
 	"${CC}" ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} -l"${1}" "${F}" -o /dev/null 2>>config.log
 	local RT=$?
 	ok ${RT}
-	rm -f ${F}
+	rm -f "${F}"
 	return ${RT}
 }
 
@@ -244,24 +246,29 @@ ok()
 
 check_func()
 {
-	local F=/tmp/$$.c
+	local F
+	F="$(mktemp).c"
+	# shellcheck disable=SC2064
+	trap "{ rm -f \"${F}\"; }" EXIT
 	local FUNC
 	FUNC="$(echo "${1}" | cut -d: -f1)"
 	local ARGS
 	ARGS="$(echo "${1}" | cut -d: -f2-)"
 
-	echo "#define _XOPEN_SOURCE 700" >${F}
+	echo "#define _XOPEN_SOURCE 700" >"${F}"
 	for i in ${H_FILES} ; do
-		echo "#include <${i}>" >>${F}
+		echo "#include <${i}>" >>"${F}"
 	done
-	echo "void main() { ${FUNC}(${ARGS}); }" >>${F}
+	echo "int main() { ${FUNC}(${ARGS}); }" >>"${F}"
+	cat "${F}" >>config.log
 	echo -n "Checking for ${FUNC}() ... "
+	echo "${CC} ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} ${F} -o /dev/null" >>config.log
 	# shellcheck disable=SC2086
 	"${CC}" ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} "${F}" -o /dev/null 2>>config.log
 	local RT=$?
 
 	ok ${RT}
-	rm -f ${F}
+	rm -f "${F}"
 	return ${RT}
 }
 
@@ -300,15 +307,15 @@ check_lex()
 # Check for a c compiler (mandatory)
 
 echo -n "Checking for a C compiler ... "
-if [[ ! -x "$(which "${CC}")" ]]; then
+if [[ -z "$(command -v "${CC}")" ]]; then
 	fail "Error: CC not valid"
 else
 	export CC
-	which "${CC}" | tee -a config.log
+	command -v "${CC}" | tee -a config.log
 fi
 
 echo -n "Checking $(basename "${CC}") can produce executables ... "
-echo -e '#include <stdlib.h>\nvoid main(void) {exit(0);}' | \
+echo -e '#include <stdlib.h>\nint main(void) {exit(0);}' | \
 	if "${CC}" -xc -o /dev/null - 2>>config.log; then
 		echo "ok"
 	else
@@ -350,7 +357,7 @@ CHECK_LIBS=
 # Check for pkg-config (mandatory)
 
 echo -n "Checking for pkg-config ... "
-if [[ ! -x "$(which "${PKG_CONFIG}")" ]]; then
+if [[ -z "$(command -v "${PKG_CONFIG}")" ]]; then
 	fail "Error: PKG_CONFIG not valid"
 fi
 
@@ -393,7 +400,7 @@ fi
 # library checks
 
 for f in ${LIB_CHECK} ; do
-	if check_lib "${f}"; then LDFLAGS="${LDFLAGS} -l${f}" ; fi
+	if check_lib "${f}"; then LDFLAGS="${LDFLAGS} -l${f}" ; else exit $? ; fi
 done
 
 # Perform checks for system headers and functions
@@ -410,6 +417,8 @@ for f in ${FUNC_CHECK}; do
 	def=$(echo "${f}" | cut -d: -f1 | tr "[:lower:]" "[:upper:]")
 	if check_func "${f}"; then
 		echo "#define HAVE_${def} 1" >> "${OBJDIR}"/config.h
+	else
+		exit $?
 	fi
 done
 
@@ -443,7 +452,8 @@ fi
 
 EXTRASRCS=
 if [[ "${FEATURE_RAFT}" -eq 1 ]]; then
-	EXTRASRCS='$(raft_SRCS)' ${EXTRASRCS}
+	# shellcheck disable=SC2016
+	EXTRASRCS="${EXTRASRCS:+${EXTRASRCS} }"'$(raft_SRCS)'
 fi
 
 # Finish config.h
@@ -477,44 +487,48 @@ printf "\n#endif\n" >> "${OBJDIR}"/config.h
 
 echo "Writing Makefile"
 
+sed_escape()
+{
+	printf '%s' "${1}" | sed 's/[#&\\]/\\&/g'
+}
 
 ARGS=$(cat <<- __END
-	s#@@DEPS@@#${DEPS}#;
-	s#@@BINDIR@@#${BINDIR}#;
-	s#@@DOCDIR@@#${DOCDIR}#;
-	s#@@CC@@#${CC}#;
-	s#@@CFLAGS@@#${CFLAGS}#;
-	s#@@CPPFLAGS@@#${CPPFLAGS}#;
-	s#@@CXX@@#${CXX}#;
-	s#@@AR@@#${AR}#;
-	s#@@RANLIB@@#${RANLIB}#;
-	s#@@LFLAGS@@#${LFLAGS}#;
-	s#@@YFLAGS@@#${YFLAGS}#;
-	s#@@RUNSTATEDIR@@#${RUNSTATEDIR}#;
-	s#@@DATADIR@@#${DATADIR}#;
-	s#@@DATAROOTDIR@@#${DATAROOTDIR}#;
-	s#@@EXECPREFIX@@#${EXECPREFIX}#;
-	s#@@INFODIR@@#${INFODIR}#;
-	s#@@LDFLAGS@@#${LDFLAGS}#;
-	s#@@LIBDIR@@#${LIBDIR}#;
-	s#@@LIBEXECDIR@@#${LIBEXECDIR}#;
-	s#@@LOCALEDIR@@#${LOCALEDIR}#;
-	s#@@LOCALSTATEDIR@@#${LOCALSTATEDIR}#;
-	s#@@MANDIR@@#${MANDIR}#;
-    s#@@PREFIX@@#${PREFIX}#;
-	s#@@OBJDIR@@#${OBJDIR}#;
-	s#@@SBINDIR@@#${SBINDIR}#;
-	s#@@SHAREDSTATEDIR@@#${SHAREDSTATEDIR}#;
-	s#@@SRCDIR@@#${SRCDIR}#;
-	s#@@SYSCONFDIR@@#${SYSCONFDIR}#;
-	s#@@YACC@@#${YACC}#;
-	s#@@LEX@@#${LEX}#;
-	s#@@VERSION@@#${VERSION}#;
-	s#@@PACKAGE@@#${PACKAGE}#;
-	s#@@PROGPREFIX@@#${PROGPREFIX}#;
-	s#@@EXTRASRCS@@#${EXTRASRCS}#;
-	s#@@CHECK_CFLAGS@@#${CHECK_CFLAGS}#;
-	s#@@CHECK_LIBS@@#${CHECK_LIBS}#;
+	s#@@DEPS@@#$(sed_escape "${DEPS}")#;
+	s#@@BINDIR@@#$(sed_escape "${BINDIR}")#;
+	s#@@DOCDIR@@#$(sed_escape "${DOCDIR}")#;
+	s#@@CC@@#$(sed_escape "${CC}")#;
+	s#@@CFLAGS@@#$(sed_escape "${CFLAGS}")#;
+	s#@@CPPFLAGS@@#$(sed_escape "${CPPFLAGS}")#;
+	s#@@CXX@@#$(sed_escape "${CXX}")#;
+	s#@@AR@@#$(sed_escape "${AR}")#;
+	s#@@RANLIB@@#$(sed_escape "${RANLIB}")#;
+	s#@@LFLAGS@@#$(sed_escape "${LFLAGS}")#;
+	s#@@YFLAGS@@#$(sed_escape "${YFLAGS}")#;
+	s#@@RUNSTATEDIR@@#$(sed_escape "${RUNSTATEDIR}")#;
+	s#@@DATADIR@@#$(sed_escape "${DATADIR}")#;
+	s#@@DATAROOTDIR@@#$(sed_escape "${DATAROOTDIR}")#;
+	s#@@EXECPREFIX@@#$(sed_escape "${EXECPREFIX}")#;
+	s#@@INFODIR@@#$(sed_escape "${INFODIR}")#;
+	s#@@LDFLAGS@@#$(sed_escape "${LDFLAGS}")#;
+	s#@@LIBDIR@@#$(sed_escape "${LIBDIR}")#;
+	s#@@LIBEXECDIR@@#$(sed_escape "${LIBEXECDIR}")#;
+	s#@@LOCALEDIR@@#$(sed_escape "${LOCALEDIR}")#;
+	s#@@LOCALSTATEDIR@@#$(sed_escape "${LOCALSTATEDIR}")#;
+	s#@@MANDIR@@#$(sed_escape "${MANDIR}")#;
+    s#@@PREFIX@@#$(sed_escape "${PREFIX}")#;
+	s#@@OBJDIR@@#$(sed_escape "${OBJDIR}")#;
+	s#@@SBINDIR@@#$(sed_escape "${SBINDIR}")#;
+	s#@@SHAREDSTATEDIR@@#$(sed_escape "${SHAREDSTATEDIR}")#;
+	s#@@SRCDIR@@#$(sed_escape "${SRCDIR}")#;
+	s#@@SYSCONFDIR@@#$(sed_escape "${SYSCONFDIR}")#;
+	s#@@YACC@@#$(sed_escape "${YACC}")#;
+	s#@@LEX@@#$(sed_escape "${LEX}")#;
+	s#@@VERSION@@#$(sed_escape "${VERSION}")#;
+	s#@@PACKAGE@@#$(sed_escape "${PACKAGE}")#;
+	s#@@PROGPREFIX@@#$(sed_escape "${PROGPREFIX}")#;
+	s#@@EXTRASRCS@@#$(sed_escape "${EXTRASRCS}")#;
+	s#@@CHECK_CFLAGS@@#$(sed_escape "${CHECK_CFLAGS}")#;
+	s#@@CHECK_LIBS@@#$(sed_escape "${CHECK_LIBS}")#;
 __END
 )
 
