@@ -262,9 +262,8 @@ check_func()
 	echo "int main() { ${FUNC}(${ARGS}); }" >>"${F}"
 	cat "${F}" >>config.log
 	echo -n "Checking for ${FUNC}() ... "
-	echo "${CC} ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} ${F} -o /dev/null" >>config.log
 	# shellcheck disable=SC2086
-	"${CC}" ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} "${F}" -o /dev/null 2>>config.log
+	"${CC}" "${F}" ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} -o /dev/null 2>>config.log
 	local RT=$?
 
 	ok ${RT}
@@ -282,27 +281,29 @@ check_yacc()
 	# shellcheck disable=SC2086
 	echo -e '%%\nstart: ;\n%%\n' | \
 		"${YACC}" ${YFLAGS} -o "${F}" -
-			local RT=$?
+			
+	local RT=$?
 
-			rm -f "${F}"
-			return ${RT}
-		}
+	rm -f "${F}"
+	return ${RT}
+}
 
-	check_lex()
-	{
-		local F
-		F=$(mktemp)
-		# shellcheck disable=SC2064
-		trap "{ rm -f \"${F}\"; }" EXIT
+check_lex()
+{
+	local F
+	F=$(mktemp)
+	# shellcheck disable=SC2064
+	trap "{ rm -f \"${F}\"; }" EXIT
 
 	# shellcheck disable=SC2086
 	echo -e '%x TEMP\n%option stack bison-bridge reentrant\n%%\n. { ECHO; }\n%%\n' | \
 		"${LEX}" ${LFLAGS} -o "${F}" -
-			local RT=$?
 
-			rm -f "${F}"
-			return ${RT}
-		}
+	local RT=$?
+
+	rm -f "${F}"
+	return ${RT}
+}
 
 # Check for a c compiler (mandatory)
 
@@ -322,12 +323,13 @@ echo -e '#include <stdlib.h>\nint main(void) {exit(0);}' | \
 		fail "${CC} cannot produce executables"
 	fi
 
-	HOST_MACHINE=$(${CC} -dumpmachine)
 
-	echo -n "Configuring ${PACKAGE} ${VERSION} on ${HOST_MACHINE}"
-	[[ -n "${TARGET}" ]] &&	echo " for target ${TARGET}" || echo ""
+HOST_MACHINE=$(${CC} -dumpmachine)
 
-	echo "objdir = ${OBJDIR}; srcdir = ${SRCDIR};"
+echo -n "Configuring ${PACKAGE} ${VERSION} on ${HOST_MACHINE}"
+[[ -n "${TARGET}" ]] &&	echo " for target ${TARGET}" || echo ""
+
+echo "objdir = ${OBJDIR}; srcdir = ${SRCDIR};"
 
 # List of system headers we need to check for
 
