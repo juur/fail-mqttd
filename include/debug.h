@@ -11,14 +11,14 @@
 # define dbg_printf(...) { }
 # define dbg_cprintf(...) { }
 #else
-# define dbg_printf(...) { long dbg_now = timems(); printf("%lu.%04lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
+# define dbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
 # define dbg_cprintf(...) { printf(__VA_ARGS__); }
 #endif
 #ifndef FEATURE_RAFT_DEBUG
 # define rdbg_printf(...) { }
 # define rdbg_cprintf(...) { }
 #else
-# define rdbg_printf(...) { long dbg_now = timems(); printf("%lu.%04lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
+# define rdbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
 # define rdbg_cprintf(...) { printf(__VA_ARGS__); }
 #endif
 

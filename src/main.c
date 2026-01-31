@@ -1232,14 +1232,24 @@ static int find_str(const char *const *lookup, const char *value, int max)
 static int mds_detach_and_free(struct message_delivery_state *mds,
         bool session_lock, bool message_lock)
 {
+    errno = 0;
     int rc = 0;
 
+    dbg_printf(BGRN "     mds_detach_and_free: called on mds %d (message %d, session %d)" CRESET "\n",
+            mds->id,
+            mds->message ? mds->message->id : -1U,
+            mds->session ? mds->session->id : -1U
+            );
+
     if (mds->message) {
+        dbg_printf(BGRN "     mds_detach_and_free: processing mds->message" CRESET "\n");
 
         if (message_lock)
             pthread_rwlock_wrlock(&mds->message->delivery_states_lock);
 
         if (mds->message->num_message_delivery_states) {
+            dbg_printf(BGRN "     mds_detach_and_free: %u delivery_states" CRESET "\n",
+                    mds->message->num_message_delivery_states);
             if (remove_delivery_state(&mds->message->delivery_states,
                         &mds->message->num_message_delivery_states, mds) == -1) {
                 warn("mds_detach_and_free: remove_delivery_state(message)");
@@ -1249,7 +1259,7 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
 
         if (GET_REFCNT(&mds->message->refcnt) > 0) {
             DEC_REFCNT(&mds->message->refcnt); /* alloc_message_delivery_state */
-            dbg_printf("     mds_detach_and_free: DEC_REFCNT on message.id=%d refcnt=%u\n",
+            dbg_printf(BGRN "     mds_detach_and_free: DEC_REFCNT on message.id=%d refcnt=%u" CRESET "\n",
                     mds->message->id, mds->message->refcnt);
         }
 
@@ -1259,11 +1269,14 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
     }
 
     if (mds->session) {
+        dbg_printf(BGRN "     mds_detach_and_free: processing mds->session" CRESET "\n");
 
         if (session_lock)
             pthread_rwlock_wrlock(&mds->session->delivery_states_lock);
 
         if (mds->session->num_message_delivery_states) {
+            dbg_printf(BGRN "     mds_detach_and_free: %u delivery_states" CRESET "\n",
+                    mds->session->num_message_delivery_states);
             if (remove_delivery_state(&mds->session->delivery_states,
                         &mds->session->num_message_delivery_states, mds) == -1) {
                 warn("mds_detach_and_free: remove_delivery_state(session)");
@@ -1280,10 +1293,16 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
         mds->session = NULL;
     }
 
-    if (free_message_delivery_state(mds) == -1)
-        rc = -1;
-    mds = NULL;
+    if (rc == 0)
+        if (free_message_delivery_state(mds) == -1)
+            rc = -1;
 
+    mds = NULL;
+    dbg_printf("%s     mds_detach_and_free: returning %d%s%s" CRESET "\n",
+            rc == -1 ? BRED : BGRN,
+            rc,
+            rc == -1 ? ": " : "",
+            rc == -1 ? strerror(errno) : "")
     return rc;
 }
 
@@ -1304,7 +1323,7 @@ static void free_subscription(struct subscription *sub)
 {
     struct subscription *tmp;
 
-    dbg_printf(NYEL "     free_subscription:  id=%d type=%s filter=<%s>"CRESET"\n",
+    dbg_printf("     free_subscription:  id=%d type=%s filter=<%s>"CRESET"\n",
             sub->id,
             subscription_type_str[sub->type],
             (const char *)sub->topic_filter);
@@ -1708,7 +1727,7 @@ static void free_message(struct message *msg, bool need_lock)
             GET_REFCNT(&msg->refcnt)
             );
 
-    dbg_printf(" topic=%d <%s>\n",
+    dbg_cprintf(" topic=%d <%s>\n",
             msg->topic ? msg->topic->id : (id_t)-1,
             msg->topic ? (char *)msg->topic->name : ""
             );
@@ -2170,7 +2189,7 @@ static struct subscription *alloc_subscription(struct session *session,
             goto fail;
     }
 
-    dbg_printf(NYEL "     alloc_subscription: %s id=%d session=%d <%s> filter=%s"CRESET"\n",
+    dbg_printf("     alloc_subscription: %s id=%d session=%d <%s> filter=%s"CRESET"\n",
             subscription_type_str[type],
             ret->id, session->id, (char *)session->client_id, topic_filter);
 
@@ -4767,9 +4786,11 @@ static int send_cp_publish(struct packet *pkt)
     set_outbound(pkt->owner, packet, length);
     handle_outbound(pkt->owner);
     pthread_rwlock_unlock(&pkt->owner->po_lock);
+    dbg_printf("     send_cp_publish: <" NRED "PUBLISH" CRESET "> done\n");
     return 0;
 
 skip_write:
+    dbg_printf("      send_cp_publish: <" NRED "PUBLISH" CRESET "> done\n");
     free(packet);
     return 0;
 
@@ -4822,11 +4843,12 @@ static int send_cp_disconnect(struct client *client, reason_code_t reason_code)
         return log_io_error(NULL, wr_len, length, false, client);
     }
 
-    dbg_printf("[%2d] send_cp_disconnect: sent code was %u\n",
+    dbg_printf("[%2d] send_cp_disconnect: <"NRED"DISCONNECT"CRESET"> sent code was %u\n",
             client->session ? client->session->id : (id_t)-1, reason_code);
 
     free(packet);
     client->send_disconnect = false;
+    close_socket(&client->fd);
 #if 0
     client->state = CS_CLOSING;
     client->disconnect_reason = 0;
@@ -4866,6 +4888,8 @@ static int send_cp_pingresp(struct client *client)
      * any successful control packets */
     free(packet);
 
+    dbg_printf("[%2d] send_cp_pingack: <" NRED "PINGACK" CRESET "> done\n",
+            client->session->id);
     return 0;
 }
 
@@ -5002,6 +5026,8 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     }
 #endif
 
+    dbg_printf("[%2d] send_cp_connack: <" NRED "CONNACK" CRESET "> done\n",
+            client->session->id);
     return 0;
 
 fail:
@@ -5027,6 +5053,9 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
     uint8_t remlen[4]; int remlen_len;
 
     errno = 0;
+
+    dbg_printf("[%2d] send_cp_pubrec: packet_id=%u reason=%s\n",
+            client->session->id, packet_id, reason_codes_str[reason_code]);
 
     length = 0;
     length += 3; /* Packet Identifier + Reason Code */
@@ -5063,6 +5092,9 @@ static int send_cp_pubrec(struct client *client, uint16_t packet_id,
     }
 
     free(packet);
+
+    dbg_printf("[%2d] send_cp_pubrec: <" NRED "PUBREC" CRESET "> done\n",
+            client->session->id);
 
     return 0;
 }
@@ -5121,6 +5153,8 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
         return log_io_error(NULL, wr_len, length, false, client);
     }
 
+    const time_t now = time(NULL);
+
     pthread_rwlock_wrlock(&client->session->delivery_states_lock);
     for (unsigned idx = 0; idx < client->session->num_message_delivery_states; idx++)
     {
@@ -5133,7 +5167,7 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
             continue;
 
         if (mds->packet_identifier == packet_id) {
-            mds->completed_at = time(0);
+            mds->completed_at = now;
             break;
         }
 
@@ -5145,9 +5179,29 @@ static int send_cp_pubcomp(struct client *client, uint16_t packet_id,
             mds->message->sender = NULL;
         }
     }
+
+    pthread_rwlock_wrlock(&global_messages_lock);
+    for (struct message *msg = global_message_list; msg; msg = msg->next)
+    {
+        if (msg->state != MSG_ACTIVE)
+            continue;
+
+        if (msg->sender_status.packet_identifier != packet_id)
+            continue;
+
+        if (msg->sender == NULL || msg->sender != client->session)
+            continue;
+
+        msg->sender_status.completed_at = now;
+        break;
+    }
+    pthread_rwlock_unlock(&global_messages_lock);
     pthread_rwlock_unlock(&client->session->delivery_states_lock);
 
     free(packet);
+
+    dbg_printf("[%2d] send_cp_pubcomp: <" NRED "PUBCOMP" CRESET "> done\n",
+            client->session->id);
     return 0;
 }
 
@@ -5208,6 +5262,8 @@ static int send_cp_pubrel(struct client *client, uint16_t packet_id,
     /* TODO update status thing */
 
     free(packet);
+    dbg_printf("[%2d] send_cp_pubrel: <" NRED "PUBREL" CRESET "> done\n",
+            client->session->id);
     return 0;
 }
 
@@ -5258,6 +5314,8 @@ static int send_cp_puback(struct client *client, uint16_t packet_id,
 
     free(packet);
 
+    dbg_printf("[%2d] send_cp_puback: <" NRED "PUBACK" CRESET "> done\n",
+            client->session->id);
     return 0;
 }
 
@@ -5511,9 +5569,11 @@ skip_props:
         goto fail;
     }
 
+    dbg_printf("[%2d] handle_cp_pubrel: done: %s\n", client->session->id, reason_codes_str[reason_code]);
     return 0;
 
 fail:
+    dbg_printf("[%2d] handle_cp_pubrel: fail: %s\n", client->session->id, reason_codes_str[reason_code]);
     return disconnect_if_malformed(client, reason_code);
 }
 
@@ -5878,12 +5938,15 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     msg->sender_status.accepted_at = now;
     total_messages_sender_accepted_at++;
 
+    dbg_printf("[%2d] handle_cp_publish: QoS %d specifics\n", client->session->id, qos);
+
     if (qos == 0) {
         msg->sender_status.acknowledged_at = now;
         msg->sender_status.released_at = now;
         msg->sender_status.completed_at = now;
     } if (qos == 1) {
-        if (send_cp_puback(client, packet_identifier, MQTT_SUCCESS) == -1) {
+        if (send_cp_puback(client, packet_identifier,
+                    msg->delivery_states ? MQTT_SUCCESS : MQTT_NO_MATCHING_SUBSCRIBERS) == -1) {
             reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
         }
@@ -5895,20 +5958,24 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         msg->sender_status.released_at = now;
         msg->sender_status.completed_at = now;
     } else if (qos == 2) {
-        if (send_cp_pubrec(client, packet_identifier, MQTT_SUCCESS) == -1) {
+        if (send_cp_pubrec(client, packet_identifier,
+                    msg->delivery_states ? MQTT_SUCCESS : MQTT_NO_MATCHING_SUBSCRIBERS) == -1) {
             reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
         }
         msg->sender_status.acknowledged_at = now;
     }
 
+    reason_code = MQTT_SUCCESS;
+
+    dbg_printf("[%2d] handle_cp_publish: ok with %s\n",
+            client->session->id, reason_codes_str[reason_code]);
+
     return 0;
 
 fail:
-    dbg_printf("\n");
-
-    dbg_printf("      handle_cp_publish: fail with reason code %s\n",
-            (const char *)reason_codes_str[reason_code]);
+    dbg_printf("[%2d] handle_cp_publish: fail with reason code %s\n",
+            client->session->id, reason_codes_str[reason_code]);
 
     if (topic_name) {
         free(topic_name);
@@ -6293,6 +6360,7 @@ skip:
     }
 
     close_client(client, disconnect_reason, true); /* TODO check */
+    close_socket(&client->fd);
     //client->state = CS_DISCONNECTED;
     return 0;
 
@@ -6300,6 +6368,7 @@ fail:
     //warnx("handle_cp_disconnect: packet malformed");
     //client->state = CS_CLOSING;
     close_client(client, MQTT_MALFORMED_PACKET, false);
+    close_socket(&client->fd);
     return -1;
 }
 
@@ -7293,9 +7362,11 @@ static void tick_msg(struct message *msg)
     unsigned num_sent = 0, num_to_send = 0;
     struct packet *packet;
     struct message_delivery_state *mds;
+    const time_t now = time(NULL);
 
     /* This handles the case the message has no target */
-    if (msg->delivery_states == NULL) {
+    if (msg->delivery_states == NULL && (msg->qos != 2 || msg->sender_status.completed_at)) {
+        dbg_printf("     tick_msg: dequeue_message due to no delivery states %d\n", msg->id);
         if (msg->topic) {
             if (dequeue_message(msg) == -1)
                 warn("tick_msg: dequeue_message failed");
@@ -7304,9 +7375,13 @@ static void tick_msg(struct message *msg)
                 msg->state = MSG_DEAD;
         }
         return;
+    } else if (msg->delivery_states == NULL) {
+        dbg_printf("     tick_msg: no delivery_states %d (qos=%d, completed_at=%lu)\n",
+                msg->id,
+                msg->qos,
+                msg->sender_status.completed_at);
+        return;
     }
-
-    const time_t now = time(NULL);
 
     pthread_rwlock_wrlock(&msg->delivery_states_lock);
     for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
@@ -7341,7 +7416,7 @@ static void tick_msg(struct message *msg)
         if (mds->session->client->state != CS_ACTIVE)
             continue;
 
-        dbg_printf(BGRN
+        dbg_printf(
                 "     tick_msg: sending message: id=%d subscriber.id=%d <%s> ackat=%lu lastsent=%lu"
                 CRESET"\n",
                 mds->id, mds->session->id, (char *)mds->session->client_id,
@@ -7433,7 +7508,7 @@ again:
             if (mds->completed_at == 0)
                 goto again;
 
-            dbg_printf(NGRN
+            dbg_printf(
                     "     tick_msg: mds.idx=%u unlink mds.id=%d from session %u[%u] and message %u[%u]"
                     CRESET"\n",
                     idx - 1,
@@ -7594,7 +7669,7 @@ static void session_tick(void)
 
         if (session->state == SESSION_DELETE) {
             if (GET_REFCNT(&session->refcnt) > 0) {
-                if (++session->kill_attempts > 1)
+                if (++session->kill_attempts > 20)
                     dbg_printf("[%2d] session_tick: can't kill session refcnt is %u (attempts %u)\n",
                             session->id, GET_REFCNT(&session->refcnt),
                             session->kill_attempts);
@@ -7833,13 +7908,14 @@ static RETURN_TYPE main_loop(void *start_args)
         tv.tv_sec = 0;
 
         if (has_clients == false) {
+            dbg_printf("     main: no clients\n");
             tv.tv_usec = 1000000;
             rc = select(max_fd + 1, &fds_in, NULL, NULL, &tv);
             tv.tv_sec = 0;
-            tv.tv_usec = 1000;
+            tv.tv_usec = 500;
             select(max_fd + 1, NULL, &fds_out, &fds_exc, &tv);
         } else {
-            tv.tv_usec = 10000;
+            tv.tv_usec = 1000;
             rc = select(max_fd + 1, &fds_in, NULL, &fds_exc, &tv);
 
             /* this is a kludge but not sure how else a) get a hint at blocked
@@ -7847,7 +7923,7 @@ static RETURN_TYPE main_loop(void *start_args)
              * non-blocking writable fd seems to terminate the select,
              * i.e. all of them */
             tv.tv_sec = 0;
-            tv.tv_usec = 1000;
+            tv.tv_usec = 100;
             select(max_fd + 1, NULL, &fds_out, NULL, &tv);
         }
 
@@ -8390,6 +8466,7 @@ int main(int argc, char *argv[])
     sin.sin_addr.s_addr = opt_listen.s_addr;
     inet_ntop(AF_INET, &sin.sin_addr, bind_addr, sizeof(bind_addr));
     logger(LOG_NOTICE, NULL, "main: binding to %s:%u", bind_addr, opt_port);
+    dbg_printf("     main: binding to %s:%u\n", bind_addr, opt_port);
 
     if (bind(global_mother_fd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
         logger(LOG_EMERG, NULL, "bind(mother): %s", strerror(errno));
