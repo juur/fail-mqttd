@@ -188,16 +188,16 @@ static DBM *message_dbm = NULL;
 
 static FILE       *opt_logfile       = NULL;
 static bool        opt_logstdout     = true;
-in_port_t   opt_port          = 1883;
 static int         opt_backlog       = 50;
 static int         opt_loglevel      = LOG_INFO;
 static bool        opt_logsyslog     = false;
 static bool        opt_logfileappend = false;
 static bool        opt_logfilesync   = false;
 static bool        opt_background    = false;
-bool        opt_database      = true;
 static const char *opt_statepath     = NULL;
 
+in_port_t      opt_port     = 1883;
+bool           opt_database = true;
 struct in_addr opt_listen;
 
 static char *logfile_name = NULL;
