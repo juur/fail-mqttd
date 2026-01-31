@@ -89,24 +89,19 @@ typedef enum {
     RAFT_MAX_PCK,
 } raft_rd_state_t;
 
-/* wire-format used for client to send & log[] for server
- *
- * u8   type   (raft_log_t)
- * u8   flags
- * u16  length
- * 0..n payload[length]
- */
-
-typedef enum {
-    RAFT_LOG_NOOP = 0,          /* Mandatory for all implementations */
-    RAFT_LOG_REGISTER_TOPIC,
-    RAFT_MAX_LOG,
-} raft_log_t;
-
 enum {
     NULL_ID = -1U,
     BROADCAST_ID = -1,
 };
+
+/* this must define a typedef enum {} raft_log_t
+ * this must include RAFT_LOG_NOOP = 0 as the fast entry
+ * this must include RAFT_LOG_MAX as the final entry
+ *
+ * this must define a union raft_log_options {}
+ * this may include multiple named struct {} for each RAFT_LOG_* that has data
+ */
+#include "raft_impl.h"
 
 struct raft_log {
     struct raft_log *next;
@@ -119,17 +114,7 @@ struct raft_log {
     pthread_mutex_t mutex;
     pthread_cond_t cv;
     bool done;
-
-    union {
-        struct {
-            uint16_t length;
-            uint8_t *name;
-            uint8_t uuid[UUID_SIZE];
-            bool retained;
-            uint8_t msg_uuid[UUID_SIZE];
-            uint32_t flags;
-        } register_topic;
-    };
+    union raft_log_options opt;
 };
 
 struct raft_packet {
@@ -411,8 +396,6 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  */
 #define RAFT_INSTALL_SNAPSHOT_FIXED_SIZE (4+4+4+4+4+8)
 
-
-
 /**
  * RAFT_LOG_*
  *
@@ -423,19 +406,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * 0..n  (depends on type)
  * u16   entry length
  *
- * RAFT_LOG_REGISTER_TOPIC
- *
- * u32    flags (1 = retained)
- * u16    string_length
- * 1..n   u8[n] (0 terminated uint8_t string)
- * u8[16] uuid
- * u8[16] uuid retained message (OPTIONAL)
- *
- */
-
-#define RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED    (1<<0)
-
-#define RAFT_LOG_FIXED_SIZE (1+1+4+4+2)
+*/
 
 extern int   raft_client_log_send(raft_log_t event, ...);
 extern int   raft_leader_log_append(raft_log_t event, ...);

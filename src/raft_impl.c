@@ -70,18 +70,21 @@ extern struct raft_state raft_state;
     return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
 }
 
-static int free_log(struct raft_log *entry)
+static int free_log(struct raft_log *lg)
 {
+    union raft_log_options *entry = &lg->opt;
+
     if (entry->register_topic.name)
         free(entry->register_topic.name);
 
     return 0;
 }
 
-static int commit_and_advance(struct raft_log *log_entry)
+static int commit_and_advance(struct raft_log *lg)
 {
     struct topic *topic = NULL;
     struct message *message = NULL;
+    union raft_log_options *log_entry = &lg->opt;
 
     if (log_entry->register_topic.retained)
         if ((message = find_message_by_uuid(log_entry->register_topic.msg_uuid)) == NULL) {
@@ -128,9 +131,10 @@ fail:
     return -1;
 }
 
-static int leader_append(struct raft_log *new_log, va_list ap)
+static int leader_append(struct raft_log *lg, va_list ap)
 {
     size_t name_len;
+    union raft_log_options *new_log = &lg->opt;
 
     new_log->register_topic.name = (void *)strdup((void *)va_arg(ap, uint8_t *));
     if (new_log->register_topic.name == NULL)
@@ -156,10 +160,11 @@ fail:
     return -1;
 }
 
-static int client_append(struct raft_log *new_client_event, raft_log_t /* event */, va_list ap)
+static int client_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
 {
     int rc = 0;
     size_t name_len;
+    union raft_log_options *new_client_event = &lg->opt;
 
     uint8_t *str      = va_arg(ap, uint8_t *);
     uint8_t *uuid     = va_arg(ap, void *);
@@ -192,8 +197,9 @@ fail:
     return -1;
 }
 
-static int pre_send(struct raft_log *arg_event, struct send_state *out)
+static int pre_send(struct raft_log *lg, struct send_state *out)
 {
+    union raft_log_options *arg_event = &lg->opt;
     out->arg_req_len = 0;
     out->arg_str = arg_event->register_topic.name;
     out->arg_uuid = arg_event->register_topic.uuid;
@@ -213,8 +219,9 @@ static int pre_send(struct raft_log *arg_event, struct send_state *out)
     return 0;
 }
 
-static int fill_send(struct send_state *out, const struct raft_log *tmp)
+static int fill_send(struct send_state *out, const struct raft_log *lg)
 {
+    const union raft_log_options *tmp = &lg->opt;
     uint16_t entry_length = 0;
 
     const size_t tmp_len     = strlen((void *)out->arg_str);
@@ -248,8 +255,9 @@ static int fill_send(struct send_state *out, const struct raft_log *tmp)
 }
 
 static raft_status_t process_packet(size_t *bytes_remaining, const uint8_t **ptr,
-        [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *out)
+        [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *lg)
 {
+    union raft_log_options *out = &lg->opt;
     uint8_t *temp_string = NULL;
     uint32_t flags;
     uint16_t tmp_len;
@@ -340,7 +348,7 @@ fail:
     return -1;
 }
 
-static int save_log(const struct raft_log *l, uint8_t **event_buf)
+static int save_log(const struct raft_log *lg, uint8_t **event_buf)
 {
     int rc = 0;
     errno = EINVAL;
@@ -349,7 +357,9 @@ static int save_log(const struct raft_log *l, uint8_t **event_buf)
     if (event_buf == NULL)
         goto fail;
 
-    switch (l->event)
+    const union raft_log_options *l = &lg->opt;
+
+    switch (lg->event)
     {
         case RAFT_LOG_NOOP:
             break;
@@ -376,7 +386,7 @@ static int save_log(const struct raft_log *l, uint8_t **event_buf)
             break;
 
         default:
-            warnx("save_log: unknown event %d", l->event);
+            warnx("save_log: unknown event %d", lg->event);
             goto fail;
     }
 
@@ -390,9 +400,10 @@ fail:
     return -1;
 }
 
-static int read_log(struct raft_log *l, const uint8_t *event_buf, int len)
+static int read_log(struct raft_log *lg, const uint8_t *event_buf, int len)
 {
     const uint8_t *ptr = event_buf;
+    union raft_log_options *l = &lg->opt;
     errno = EINVAL;
     size_t bytes_remaining = len;
 
@@ -401,7 +412,7 @@ static int read_log(struct raft_log *l, const uint8_t *event_buf, int len)
     if (event_buf == NULL || len == 0)
         goto fail;
 
-    switch (l->event)
+    switch (lg->event)
     {
         case RAFT_LOG_NOOP:
             break;
@@ -436,7 +447,7 @@ static int read_log(struct raft_log *l, const uint8_t *event_buf, int len)
             break;
 
         default:
-            warnx("read_log: unknown event %d", l->event);
+            warnx("read_log: unknown event %d", lg->event);
             goto fail;
     }
 

@@ -1236,19 +1236,15 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
 
     if (mds->message) {
 
-        if (session_lock)
+        if (message_lock)
             pthread_rwlock_wrlock(&mds->message->delivery_states_lock);
 
         if (mds->message->num_message_delivery_states) {
-            //unsigned old_len = mds->message->num_message_delivery_states;
             if (remove_delivery_state(&mds->message->delivery_states,
                         &mds->message->num_message_delivery_states, mds) == -1) {
-                //if (errno != ENOENT) {
-                    warn("mds_detach_and_free: remove_delivery_state(message)");
-                    rc = -1;
-                //}
+                warn("mds_detach_and_free: remove_delivery_state(message)");
+                rc = -1;
             }
-            //assert(mds->message->num_message_delivery_states == old_len -1);
         }
 
         if (GET_REFCNT(&mds->message->refcnt) > 0) {
@@ -1268,15 +1264,11 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
             pthread_rwlock_wrlock(&mds->session->delivery_states_lock);
 
         if (mds->session->num_message_delivery_states) {
-            //unsigned old_len = mds->session->num_message_delivery_states;
             if (remove_delivery_state(&mds->session->delivery_states,
                         &mds->session->num_message_delivery_states, mds) == -1) {
-                //if (errno != ENOENT) {
-                    warn("mds_detach_and_free: remove_delivery_state(session)");
-                    rc = -1;
-                //}
+                warn("mds_detach_and_free: remove_delivery_state(session)");
+                rc = -1;
             }
-            //assert(mds->session->num_message_delivery_states == old_len -1);
         }
 
         if (GET_REFCNT(&mds->session->refcnt) > 0)
@@ -3780,8 +3772,6 @@ static int remove_delivery_state(
 
     for (; new_idx <= new_length && old_idx < old_length; old_idx++)
     {
-        //dbg_printf("     remove_delivery_state: new_idx=%u old_idx=%u\n", new_idx, old_idx);
-
         if ((*state_array)[old_idx] == rem) {
             found = true;
             continue;
@@ -3804,7 +3794,6 @@ static int remove_delivery_state(
         return 0;
     }
 
-    //dbg_printf(BYEL"     remove_delivery_state: ENOENT"CRESET"\n");
     errno = ENOENT;
 
 fail:
@@ -8456,7 +8445,7 @@ int main(int argc, char *argv[])
     running = true;
 
 #ifdef FEATURE_RAFT
-    pthread_t raft_thread;
+    pthread_t raft_thread = 0;
     extern const struct raft_impl mqtt_raft_impl;
 
     if (opt_raft &&
