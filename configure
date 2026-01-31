@@ -77,7 +77,7 @@ while :; do
 		--quiet) QUIET=1 ;;
 		--version|-v) show_version; exit ;;
 		--target=?*) TARGET=${1#*=} ;;
-# Paths
+		# Paths
 		--bindir=?*) BINDIR=${1#*=} ;;
 		--datadir=?*) DATADIR=${1#*=} ;;
 		--datarootdir=?*) DATAROOTDIR=${1#*=} ;;
@@ -95,7 +95,7 @@ while :; do
 		--sbindir=?*) SBINDIR=${1#*=} ;;
 		--sharedstatedir=?*) SHAREDSTATEDIR=${1#*=} ;;
 		--sysconfdir=?*) SYSCONFDIR=${1#*=} ;;
-# These are added to keep RPM %configure error free
+		# These are added to keep RPM %configure error free
 		--build=?*) ;; # BUILD=${1#*=} ;;
 		--host=?*) ;; # HOST=${1#*=} ;;
 		--program-prefix=?*) PROGPREFIX=${1#*=} ;;
@@ -217,27 +217,27 @@ check_header()
 	# shellcheck disable=SC2086
 	echo "#include <${1}>" | \
 		"${CC}" ${CFLAGS} ${CPPFLAGS} ${LDFLAGS} -E - -o /dev/null 2>>config.log
-	local RT=$?
-	ok $?
-	return ${RT}
-}
+			local RT=$?
+			ok $?
+			return ${RT}
+		}
 
-check_lib()
-{
-	local F
-	F="$(mktemp).c"
+	check_lib()
+	{
+		local F
+		F="$(mktemp).c"
 
-	echo "#define _XOPEN_SOURCE 700" >"${F}"
-	echo 'int main(void){}' >>"${F}"
-	echo -n "Checking for -l${1} ... "
-	cat "${F}" >>config.log
-	# shellcheck disable=SC2086
-	"${CC}" ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} -l"${1}" "${F}" -o /dev/null 2>>config.log
-	local RT=$?
-	ok ${RT}
-	rm -f "${F}"
-	return ${RT}
-}
+		echo "#define _XOPEN_SOURCE 700" >"${F}"
+		echo 'int main(void){}' >>"${F}"
+		echo -n "Checking for -l${1} ... "
+		cat "${F}" >>config.log
+		# shellcheck disable=SC2086
+		"${CC}" ${LDFLAGS} ${CPPFLAGS} ${CFLAGS} -l"${1}" "${F}" -o /dev/null 2>>config.log
+		local RT=$?
+		ok ${RT}
+		rm -f "${F}"
+		return ${RT}
+	}
 
 ok()
 {
@@ -282,27 +282,27 @@ check_yacc()
 	# shellcheck disable=SC2086
 	echo -e '%%\nstart: ;\n%%\n' | \
 		"${YACC}" ${YFLAGS} -o "${F}" -
-	local RT=$?
+			local RT=$?
 
-	rm -f "${F}"
-	return ${RT}
-}
+			rm -f "${F}"
+			return ${RT}
+		}
 
-check_lex()
-{
-	local F
-	F=$(mktemp)
-	# shellcheck disable=SC2064
-	trap "{ rm -f \"${F}\"; }" EXIT
+	check_lex()
+	{
+		local F
+		F=$(mktemp)
+		# shellcheck disable=SC2064
+		trap "{ rm -f \"${F}\"; }" EXIT
 
 	# shellcheck disable=SC2086
 	echo -e '%x TEMP\n%option stack bison-bridge reentrant\n%%\n. { ECHO; }\n%%\n' | \
 		"${LEX}" ${LFLAGS} -o "${F}" -
-	local RT=$?
+			local RT=$?
 
-	rm -f "${F}"
-	return ${RT}
-}
+			rm -f "${F}"
+			return ${RT}
+		}
 
 # Check for a c compiler (mandatory)
 
@@ -322,12 +322,12 @@ echo -e '#include <stdlib.h>\nint main(void) {exit(0);}' | \
 		fail "${CC} cannot produce executables"
 	fi
 
-HOST_MACHINE=$(${CC} -dumpmachine)
+	HOST_MACHINE=$(${CC} -dumpmachine)
 
-echo -n "Configuring ${PACKAGE} ${VERSION} on ${HOST_MACHINE}"
-[[ -n "${TARGET}" ]] &&	echo " for target ${TARGET}" || echo ""
+	echo -n "Configuring ${PACKAGE} ${VERSION} on ${HOST_MACHINE}"
+	[[ -n "${TARGET}" ]] &&	echo " for target ${TARGET}" || echo ""
 
-echo "objdir = ${OBJDIR}; srcdir = ${SRCDIR};"
+	echo "objdir = ${OBJDIR}; srcdir = ${SRCDIR};"
 
 # List of system headers we need to check for
 
@@ -362,7 +362,7 @@ if [[ -z "$(command -v "${PKG_CONFIG}")" ]]; then
 fi
 
 export PKG_CONFIG
-which "${PKG_CONFIG}"
+command -v "${PKG_CONFIG}"
 
 # start a new configuration file
 if [[ -e ${OBJDIR}/config.h ]]; then
@@ -400,7 +400,11 @@ fi
 # library checks
 
 for f in ${LIB_CHECK} ; do
-	if check_lib "${f}"; then LDFLAGS="${LDFLAGS} -l${f}" ; else exit $? ; fi
+	if check_lib "${f}"; then
+		LDFLAGS="${LDFLAGS} -l${f}"
+	else
+		fail "Error: ${f} not found"
+	fi
 done
 
 # Perform checks for system headers and functions
@@ -408,8 +412,10 @@ done
 
 for f in ${H_FILES} ; do
 	def=$(echo "${f}" | sed "s#/#_#;s#\.#_#;s#/#_#;" | tr "[:lower:]" "[:upper:]")
-    if check_header "${f}"; then
+	if check_header "${f}"; then
 		echo "#define HAVE_${def} 1" >> "${OBJDIR}"/config.h
+	else
+		fail "Error: ${f} not found"
 	fi
 done
 
@@ -423,7 +429,7 @@ for f in ${FUNC_CHECK}; do
 done
 
 for f in ${TOOL_CHECK}; do
-	if ! which "${f}" >/dev/null 2>&1; then
+	if ! command -v "${f}" >/dev/null 2>&1; then
 		fail "Error: ${f} not found"
 	fi
 done
@@ -460,7 +466,7 @@ fi
 {
 	echo "#define SYSCONFDIR \"${SYSCONFDIR}\""
 	echo "#define RUNSTATEDIR \"${RUNSTATEDIR}\""
-	echo "#define LOCALSTATEDIR \"${LOCALSTATEDIR}\"" 
+	echo "#define LOCALSTATEDIR \"${LOCALSTATEDIR}\""
 	if [[ "${FEATURE_THREADS}" -eq 1 ]]; then
 		echo "#define FEATURE_THREADS 1"
 	fi
@@ -515,7 +521,7 @@ ARGS=$(cat <<- __END
 	s#@@LOCALEDIR@@#$(sed_escape "${LOCALEDIR}")#;
 	s#@@LOCALSTATEDIR@@#$(sed_escape "${LOCALSTATEDIR}")#;
 	s#@@MANDIR@@#$(sed_escape "${MANDIR}")#;
-    s#@@PREFIX@@#$(sed_escape "${PREFIX}")#;
+	s#@@PREFIX@@#$(sed_escape "${PREFIX}")#;
 	s#@@OBJDIR@@#$(sed_escape "${OBJDIR}")#;
 	s#@@SBINDIR@@#$(sed_escape "${SBINDIR}")#;
 	s#@@SHAREDSTATEDIR@@#$(sed_escape "${SHAREDSTATEDIR}")#;
@@ -532,15 +538,11 @@ ARGS=$(cat <<- __END
 __END
 )
 
-sed "${ARGS}" <"${SRCDIR}"/Makefile.in >"${OBJDIR}"/Makefile
+for dst_file in Makefile "${PACKAGE}.spec" "${PACKAGE}.service" ; do
+	echo "Creating ${dst_file}"
+	sed "${ARGS}" <"${SRCDIR}/${dst_file}.in" >"${OBJDIR}/${dst_file}"
+done
 
-echo "Creating ${PACKAGE}.spec"
-
-sed "${ARGS}" <"${SRCDIR}"/"${PACKAGE}".spec.in > "${OBJDIR}"/"${PACKAGE}".spec
-
-echo "Creating ${PACKAGE}.service"
-
-sed "${ARGS}" <"${SRCDIR}"/"${PACKAGE}".service.in > "${OBJDIR}"/"${PACKAGE}".service
 
 echo "Creating config.status"
 

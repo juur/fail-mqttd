@@ -50,7 +50,6 @@ static int64_t timems(void);
 #define MAX(a,b) (((a)>(b)) ? (a) : (b))
 #define MIN(a,b) (((a)<(b)) ? (a) : (b))
 
-
 #ifdef HAVE_STDATOMIC_H
 # define GET_REFCNT(x) atomic_load_explicit(x, memory_order_relaxed)
 # define IF_DEC_REFCNT(x) atomic_fetch_sub_explicit(x, 1, memory_order_acq_rel)
