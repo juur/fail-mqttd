@@ -7908,14 +7908,13 @@ static RETURN_TYPE main_loop(void *start_args)
         tv.tv_sec = 0;
 
         if (has_clients == false) {
-            dbg_printf("     main: no clients\n");
             tv.tv_usec = 1000000;
             rc = select(max_fd + 1, &fds_in, NULL, NULL, &tv);
             tv.tv_sec = 0;
             tv.tv_usec = 500;
             select(max_fd + 1, NULL, &fds_out, &fds_exc, &tv);
         } else {
-            tv.tv_usec = 1000;
+            tv.tv_usec = 5000;
             rc = select(max_fd + 1, &fds_in, NULL, &fds_exc, &tv);
 
             /* this is a kludge but not sure how else a) get a hint at blocked
@@ -7923,7 +7922,7 @@ static RETURN_TYPE main_loop(void *start_args)
              * non-blocking writable fd seems to terminate the select,
              * i.e. all of them */
             tv.tv_sec = 0;
-            tv.tv_usec = 100;
+            tv.tv_usec = 500;
             select(max_fd + 1, NULL, &fds_out, NULL, &tv);
         }
 
