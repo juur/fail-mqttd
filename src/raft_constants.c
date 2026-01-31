@@ -1,14 +1,16 @@
-#define _XOPEN_SOURCE 800
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 800
+#endif
 
 #include "raft.h"
 
 const char *const raft_status_str[RAFT_MAX_STATUS] = {
-    [RAFT_OK] = "OK",
-    [RAFT_TRUE] = "TRUE",
-    [RAFT_FALSE] = "FALSE",
-    [RAFT_NOT_LEADER] = "NOT_LEADER",
+    [RAFT_OK]              = "OK",
+    [RAFT_TRUE]            = "TRUE",
+    [RAFT_FALSE]           = "FALSE",
+    [RAFT_NOT_LEADER]      = "NOT_LEADER",
     [RAFT_SESSION_EXPIRED] = "SESSION_EXPIRED",
-    [RAFT_TIMEOUT] = "TIMEOUT",
+    [RAFT_TIMEOUT]         = "TIMEOUT",
 };
 
 const char *const raft_rpc_str[RAFT_MAX_RPC] = {
@@ -31,19 +33,20 @@ const char *const raft_rpc_str[RAFT_MAX_RPC] = {
 };
 
 const char *const raft_mode_str[RAFT_MAX_STATES] = {
-    [RAFT_STATE_NONE] = "NONE",
-    [RAFT_STATE_FOLLOWER] = "FOLLOWER",
+    [RAFT_STATE_NONE]      = "NONE",
+    [RAFT_STATE_FOLLOWER]  = "FOLLOWER",
     [RAFT_STATE_CANDIDATE] = "CANDIDATE",
-    [RAFT_STATE_LEADER] = "LEADER",
+    [RAFT_STATE_LEADER]    = "LEADER",
 };
 
 const char *const raft_conn_str[RAFT_MAX_CONN] = {
-    [RAFT_PEER] = "PEER",
+    [RAFT_PEER]   = "PEER",
     [RAFT_CLIENT] = "CLIENT",
     [RAFT_SERVER] = "SERVER",
 };
 
 const char *const raft_log_str[RAFT_MAX_LOG] = {
-    [RAFT_LOG_NOOP]           = "NOOP",
-    [RAFT_LOG_REGISTER_TOPIC] = "REGISTER_TOPIC",
+    [RAFT_LOG_NOOP]             = "NOOP",
+    [RAFT_LOG_REGISTER_TOPIC]   = "REGISTER_TOPIC",
+    [RAFT_LOG_UNREGISTER_TOPIC] = "UNREGISTER_TOPIC",
 };

@@ -281,14 +281,23 @@ static void show_usage(FILE *fp, const char *name)
 {
     char buf[BUFSIZ];
     char *ptr = buf;
+    int rc;
 
     setlocale(LC_ALL, "C");
 
     for (unsigned idx = 0; database_init[idx].filename; idx++)
     {
-        ptr += snprintf(ptr, sizeof(buf) - (ptr - buf), "%s%s",
+        const size_t expected = sizeof(buf) - (ptr - buf);
+        rc = snprintf(ptr, expected, "%s%s",
                 database_init[idx].filename,
                 database_init[idx+1].filename ? ", " : "");
+
+        if (rc < 0)
+            break;
+        if ((size_t)rc > expected)
+            break;
+
+        ptr += rc;
     }
 
     fprintf(fp, "fail-mqttd -- a terrible implementation of MQTT\n"
@@ -3573,6 +3582,22 @@ struct message *find_message_by_uuid(const uint8_t uuid[static const UUID_SIZE])
     pthread_rwlock_unlock(&global_messages_lock);
 
     errno = ENOENT;
+    return NULL;
+}
+
+struct topic *find_topic_by_uuid(const uint8_t uuid[static const UUID_SIZE])
+{
+    errno = 0;
+
+    pthread_rwlock_rdlock(&global_topics_lock);
+    for (struct topic *topic = global_topic_list; topic; topic = topic->next)
+    {
+        if (!memcmp(topic->uuid, uuid, UUID_SIZE)) {
+            pthread_rwlock_unlock(&global_topics_lock);
+            return topic;
+        }
+    }
+    pthread_rwlock_unlock(&global_topics_lock);
     return NULL;
 }
 

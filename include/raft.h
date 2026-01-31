@@ -408,6 +408,8 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  *
 */
 
+# define RAFT_LOG_FIXED_SIZE (1+1+4+4+2)
+
 extern int   raft_client_log_send(raft_log_t event, ...);
 extern int   raft_leader_log_append(raft_log_t event, ...);
 extern int   raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...);

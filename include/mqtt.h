@@ -2,7 +2,7 @@
 #define _FAIL_MQTT_H
 
 #ifndef _XOPEN_SOURCE
-# define _XOPEN_SOURCE 700
+# define _XOPEN_SOURCE 800
 #endif
 
 #include <sys/types.h>

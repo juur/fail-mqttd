@@ -22,6 +22,7 @@
 typedef enum {
     RAFT_LOG_NOOP = 0,          /* Mandatory for all implementations */
     RAFT_LOG_REGISTER_TOPIC,
+    RAFT_LOG_UNREGISTER_TOPIC,
     RAFT_MAX_LOG,
 } raft_log_t;
 
@@ -34,6 +35,9 @@ union raft_log_options {
         uint8_t msg_uuid[UUID_SIZE];
         uint32_t flags;
     } register_topic;
+    struct {
+        uint8_t uuid[UUID_SIZE];
+    } unregister_topic;
 };
 
 /*
@@ -48,6 +52,10 @@ union raft_log_options {
 */
 
 # define RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED    (1<<0)
-# define RAFT_LOG_FIXED_SIZE (1+1+4+4+2)
+
+/* RAFT_LOG_UNREGISTER_TOPIC
+ *
+ * u8[16] uuid
+ */
 
 #endif
