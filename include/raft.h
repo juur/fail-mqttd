@@ -103,6 +103,11 @@ enum {
  */
 #include "raft_impl.h"
 
+struct raft_reply {
+    raft_log_t event;
+    union raft_reply_options opt;
+};
+
 struct raft_log {
     struct raft_log *next;
     raft_conn_t role;
@@ -115,6 +120,7 @@ struct raft_log {
     pthread_cond_t cv;
     bool done;
     union raft_log_options opt;
+    struct raft_reply reply;
 };
 
 struct raft_packet {
@@ -350,9 +356,11 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u8    log_type?
  * u32   client_id
  * u32   sequence_num
+ * //u16   result_length
+ * //u8[]  result[result_length]
  */
 
-#define RAFT_CLIENT_REQUEST_REPLY_SIZE (1+1+4+4)
+#define RAFT_CLIENT_REQUEST_REPLY_SIZE (1+1+4+4/*+2*/)
 
 /** RAFT_REQUEST_VOTE
  *

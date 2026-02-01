@@ -51,6 +51,8 @@ Optional features:
   --disable-raft                  disable Raft clustering (default)
   --enable-openmetrics            enable Openmetrics HTTP service
   --disable-openmetrics           disable Openmetrics HTTP service (default)
+  --enable-multi-master           enable multi-master operation
+  --disable-multi-master          disable multi-master operation (default)
 EOF
 }
 
@@ -67,6 +69,7 @@ FEATURE_DEBUG=0
 FEATURE_THREADS=0
 FEATURE_RAFT_DEBUG=0
 FEATURE_RAFT_IMPL_DEBUG=0
+FEATURE_MULTI_MASTER=0
 FEATURE_RAFT=0
 FEATURE_OM=0
 SAVED_ARGS=$(printf '%q ' "$@")
@@ -114,6 +117,8 @@ while :; do
 		--disable-openmetrics) FEATURE_OM=0 ;;
 		--enable-threads) FEATURE_THREADS=1 ;;
 		--disable-threads) FEATURE_THREADS=0 ;;
+		--enable-multi-master) FEATURE_MULTI_MASTER=1 ;;
+		--disable-multi-master) FEATURE_MULTI_MASTER=0 ;;
 		*) [[ -n "${1-}" ]] && { echo "Unknown argument ${1-}" >&2; exit 1; } ;;
 	esac
 	shift || break
@@ -486,6 +491,9 @@ fi
 	fi
 	if [[ "${FEATURE_OM}" -eq 1 ]]; then
 		echo "#define FEATURE_OM 1"
+	fi
+	if [[ "${FEATURE_MULTI_MASTER}" -eq 1 ]]; then
+		echo "#define FEATURE_MULTI_MASTER 1"
 	fi
 } >> "${OBJDIR}"/config.h
 

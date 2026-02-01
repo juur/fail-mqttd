@@ -23,6 +23,8 @@ typedef enum {
     RAFT_LOG_NOOP = 0,          /* Mandatory for all implementations */
     RAFT_LOG_REGISTER_TOPIC,
     RAFT_LOG_UNREGISTER_TOPIC,
+    RAFT_LOG_REGISTER_SESSION,
+    RAFT_LOG_UNREGISTER_SESSION,
     RAFT_MAX_LOG,
 } raft_log_t;
 
@@ -38,7 +40,39 @@ union raft_log_options {
     struct {
         uint8_t uuid[UUID_SIZE];
     } unregister_topic;
+    struct {
+        uint16_t flags;
+        uint32_t expiry_interval;
+        uint8_t uuid[UUID_SIZE];
+        uint32_t last_connected;
+        uint16_t client_id_length;
+        uint8_t *client_id;
+    } register_session;
+    struct {
+        uint8_t uuid[UUID_SIZE];
+    } unregister_session;
 };
+
+union raft_reply_options {
+};
+
+/*
+ * RAFT_LOG_UNREGISTER_SESSION
+ * u8[16] uuid
+ */
+
+/*
+ * RAFT_LOG_REGISTER_SESSION
+ * u16    flags
+ * u32    expiry_interval
+ * u8[16] uuid
+ * u32    last_connected (time_t)
+ * u16    client_id_length
+ * 1..n   u8[client_id_length] (0 terminated uint8_t string)
+ */
+
+#define RAFT_LOG_REGISTER_SESSION_REQ_RESP_INFO (1<<0)
+#define RAFT_LOG_REGISTER_SESSION_REQ_PROB_INFO (1<<1)
 
 /*
  * RAFT_LOG_REGISTER_TOPIC

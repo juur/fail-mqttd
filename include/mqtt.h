@@ -424,6 +424,7 @@ struct subscription {
 struct session {
     struct session *next;
     id_t id;
+    uint8_t uuid[UUID_SIZE];
     struct client *client;
 
     pthread_rwlock_t subscriptions_lock;

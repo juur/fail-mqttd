@@ -1,10 +1,11 @@
-#define _XOPEN_SOURCE 800
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 800
+#endif
 
 #include <stdlib.h>
 #include <syslog.h>
 
 #include "mqtt.h"
-#include "config.h"
 
 const payload_required_t packet_to_payload[MQTT_CP_MAX] = {
     [MQTT_CP_CONNECT]     = MQTT_PAYLOAD_REQUIRED,

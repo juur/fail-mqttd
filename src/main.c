@@ -235,7 +235,11 @@ static const struct {
 
 [[gnu::nonnull]] static void handle_outbound(struct client *client);
 [[gnu::nonnull]] static void set_outbound(struct client *client, const uint8_t *buf, unsigned len);
-[[gnu::nonnull]] static void close_session(struct session *session);
+[[gnu::nonnull]] static void close_session(struct session *session
+#ifdef FEATURE_RAFT
+        , bool source_self
+#endif
+        );
 [[gnu::nonnull]] static void close_client(struct client *client, reason_code_t reason, bool disconnect);
 [[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe(struct subscription *sub, struct session *session);
 [[gnu::nonnull, gnu::warn_unused_result]] static int dequeue_message(struct message *msg);
@@ -2224,7 +2228,7 @@ fail:
 }
 
 [[gnu::malloc, gnu::warn_unused_result]]
-static struct session *alloc_session(struct client *client)
+static struct session *alloc_session(struct client *client, const uint8_t uuid[UUID_SIZE])
 {
     struct session *ret;
 
@@ -2237,6 +2241,11 @@ static struct session *alloc_session(struct client *client)
 
     if ((ret = calloc(1, sizeof(struct session))) == NULL)
         return NULL;
+
+    if (uuid == NULL && generate_uuid(global_hwaddr, ret->uuid) == -1)
+        goto fail;
+    else if (uuid != NULL)
+        memcpy(ret->uuid, uuid, UUID_SIZE);
 
     if (pthread_rwlock_init(&ret->subscriptions_lock, NULL) != 0)
         goto fail;
@@ -2274,7 +2283,7 @@ fail:
 }
 
 [[gnu::nonnull(1), gnu::malloc, gnu::warn_unused_result]]
-static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE])
+static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[UUID_SIZE])
 {
     struct topic *ret = NULL;
 
@@ -2582,6 +2591,38 @@ int save_topic(const struct topic *topic)
 
 fail:
     pthread_rwlock_unlock(&global_topics_lock);
+    return -1;
+}
+
+static int register_session(struct session *session
+#ifdef FEATURE_RAFT
+        , bool source_self
+#endif
+        )
+{
+    pthread_rwlock_wrlock(&global_sessions_lock);
+    if (session->state != SESSION_NEW) {
+        errno = EINVAL;
+        goto fail;
+    }
+
+    dbg_printf("[%2d] register_session: session %d registered\n",
+            session->id, session->id);
+#ifdef FEATURE_RAFT
+    if (source_self) {
+        /* TODO raft_client_log_send(RAFT_LOG_REGISTER_SESSION, ...); */
+        session->state = SESSION_ACTIVE;
+    } else {
+        session->state = SESSION_ACTIVE;
+    }
+#else
+    session->state = SESSION_ACTIVE;
+#endif
+    pthread_rwlock_unlock(&global_sessions_lock);
+    return 0;
+
+fail:
+    pthread_rwlock_unlock(&global_sessions_lock);
     return -1;
 }
 
@@ -6630,7 +6671,7 @@ version_fail:
     client->protocol_version = protocol_version;
     client->keep_alive = keep_alive;
 
-#ifdef FEATURE_RAFT
+#if defined(FEATURE_RAFT) && !defined(FEATURE_MULTI_MASTER)
     if (opt_raft && !raft_is_leader()) {
         reason_code = MQTT_USE_ANOTHER_SERVER;
         goto fail;
@@ -6642,7 +6683,7 @@ version_fail:
         dbg_printf(BWHT"     handle_cp_connect: no existing session"CRESET"\n");
 
 create_new_session:
-        if ((client->session = alloc_session(client)) == NULL) {
+        if ((client->session = alloc_session(client, NULL)) == NULL) {
             warn("handle_cp_connect: alloc_session failed");
             reason_code = MQTT_UNSPECIFIED_ERROR;
             goto fail;
@@ -6677,7 +6718,11 @@ create_new_session:
             /* ... we don't want to re-use it */
             dbg_printf(BWHT"[  ] handle_cp_connect: clean existing session [%d]"CRESET"\n",
                     client->session->id);
+#ifdef FEATURE_RAFT
+            close_session(client->session, true);
+#else
             close_session(client->session);
+#endif
             client->session = NULL;
             goto create_new_session;
         }
@@ -6781,14 +6826,18 @@ create_new_session:
         warn("handle_cp_connect: send_cp_connack failed");
         goto fail;
     }
+    pthread_rwlock_unlock(&global_sessions_lock);
 
-    client->session->state = SESSION_ACTIVE;
+#ifdef FEATURE_RAFT
+    register_session(client->session, true);
+#else
+    register_session(client->session);
+#endif
 
     logger(LOG_DEBUG, client, "handle_cp_connect: session established%s%s%s",
             reconnect ? " (reconnect)" : "",
             clean ? " (clean_start)" : "",
             (connect_flags & MQTT_CONNECT_FLAG_WILL_FLAG) ? " (will)" : "");
-    pthread_rwlock_unlock(&global_sessions_lock);
 
     return 0;
 
@@ -6815,7 +6864,7 @@ fail:
     if (will_payload)
         free(will_payload);
     if (client->session && client->session->state == SESSION_NEW)
-        close_session(client->session);
+        close_session(client->session, false);
 
     if (errno == 0)
         errno = EINVAL;
@@ -7324,7 +7373,7 @@ static void client_tick(void)
                     if (clnt->session->expiry_interval == 0) {
                         dbg_printf("[%2d] client_tick: expiring session instantly\n",
                                 clnt->session->id);
-                        close_session(clnt->session);
+                        close_session(clnt->session, true);
                     } else if (clnt->session->expiry_interval == UINT_MAX) {
                         clnt->session->expires_at = LONG_MAX; /* "does not expire" */
                     } else {
@@ -7637,7 +7686,11 @@ static void message_tick(void)
 
 /* Sessions */
 
-static void close_session(struct session *session)
+static void close_session(struct session *session
+#ifdef FEATURE_RAFT
+        , bool source_self
+#endif
+        )
 {
     dbg_printf(BMAG "     close_session: id=%d state=%s client=%d client_id=<%s>" CRESET "\n",
             session->id, session_state_str[session->state],
@@ -7659,15 +7712,20 @@ static void close_session(struct session *session)
         if (mds->completed_at == 0) mds->completed_at = now;
         if (mds->released_at == 0) mds->released_at = now;
         if (mds->accepted_at == 0) mds->accepted_at = now;
-
-        //mds->session = NULL;
-        //DEC_REFCNT(&session->refcnt);
     }
 
     unsubscribe_session_from_all(session);
 
+#ifdef FEATURE_RAFT
+    if (source_self && session->state == SESSION_ACTIVE && session->expiry_interval) {
+        /* TODO raft_client_log_send(RAFT_LOG_UNREGISTER_SESSION, ...); */
+        session->state = SESSION_DELETE;
+    } else {
+        session->state = SESSION_DELETE;
+    }
+#else
     session->state = SESSION_DELETE;
-    //free_session(session, false);
+#endif
 }
 
 #ifdef FEATURE_RAFT
@@ -7719,7 +7777,7 @@ static void session_tick(void)
                     goto force_will;
                 }
 
-                close_session(session);
+                close_session(session, true);
                 session = NULL;
                 continue;
             }
