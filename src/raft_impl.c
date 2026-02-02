@@ -267,6 +267,8 @@ static int register_topic_append(struct raft_log *lg, raft_log_t /* event */, va
     else
         memset(&new_client_event->register_topic.msg_uuid, 0, UUID_SIZE);
 
+    rdbg_printf("IMPL register_topic_append: returning %u\n", rc);
+
     return rc;
 fail:
     return -1;
@@ -300,6 +302,8 @@ static int register_topic_size_send(struct raft_log *lg, struct send_state *out,
     } else
         out->arg_msg_uuid = NULL;
 
+    rdbg_printf("IMPL register_topic_size_send: length now %u\n", out->arg_req_len);
+
     return 0;
 }
 
@@ -318,58 +322,43 @@ static int register_session_fill_send(struct send_state * /* out */, const struc
     return entry_length;
 }
 
-static inline void write_u32(uint8_t **ptr, const uint32_t val)
+static inline void write_u32(struct send_state *out, const uint32_t val)
 {
-    memcpy(*ptr, &val, sizeof(val));
-    (*ptr) += sizeof(val);
+    memcpy(out->ptr, &val, sizeof(val));
+    out->ptr += sizeof(val);
 }
 
-static inline void write_u16(uint8_t **ptr, const uint16_t val)
+static inline void write_u16(struct send_state *out, const uint16_t val)
 {
-    memcpy(*ptr, &val, sizeof(val));
-    (*ptr) += sizeof(val);
+    memcpy(out->ptr, &val, sizeof(val));
+    out->ptr += sizeof(val);
 }
 
-static inline void write_str(uint8_t **ptr, const void *src, size_t len)
+static inline void write_str(struct send_state *out, const void *src, size_t len)
 {
-    memcpy(*ptr, src, len);
-    *ptr[len] = '\0';
-    (*ptr) += len;
+    memcpy(out->ptr, src, len);
+    out->ptr += len;
+    *(out->ptr++) = '\0';
 }
 
-static inline void write_uuid(uint8_t **ptr, const uint8_t *src)
+static inline void write_uuid(struct send_state *out, const uint8_t *src)
 {
-    memcpy(*ptr, src, UUID_SIZE);
-    (*ptr) += UUID_SIZE;
+    memcpy(out->ptr, src, UUID_SIZE);
+    out->ptr += UUID_SIZE;
 }
 
 static int register_topic_fill_send(struct send_state *out, const struct raft_log *lg, raft_log_t /*event*/)
 {
     const union raft_log_options *tmp = &lg->opt;
-    uint16_t entry_length = 0;
     const bool retained_uuid = (out->arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
+    uint16_t entry_length = 0;
 
-    write_u32(&out->ptr, htons(out->arg_flags));
-    write_u16(&out->ptr, htons(strlen((void *)out->arg_str)));
-    write_str(&out->ptr, out->arg_str, strlen((void *)out->arg_str));
+    write_u32(out, htons(out->arg_flags));
+    write_u16(out, htons(strlen((void *)out->arg_str)));
+    write_str(out, out->arg_str, strlen((void *)out->arg_str));
+    write_uuid(out, out->arg_uuid);
     if (retained_uuid)
-        write_uuid(&out->ptr, out->arg_msg_uuid);
-
-    const size_t tmp_len     = strlen((void *)out->arg_str);
-    const uint16_t len       = htons(tmp_len);
-    out->arg_flags                = htonl(out->arg_flags);
-
-    memcpy(out->ptr, &out->arg_flags, sizeof(uint32_t)) ; out->ptr += sizeof(uint32_t) ;
-    memcpy(out->ptr, &len, sizeof(uint16_t))       ; out->ptr += sizeof(uint16_t) ;
-    memcpy(out->ptr, out->arg_str, tmp_len)             ; out->ptr += tmp_len          ;
-    *(out->ptr++) = '\0';
-    memcpy(out->ptr, out->arg_uuid, UUID_SIZE)          ; out->ptr += UUID_SIZE        ;
-    if (retained_uuid) {
-        memcpy(out->ptr, out->arg_msg_uuid, UUID_SIZE)  ; out->ptr += UUID_SIZE        ;
-    }
-
-    //rdbg_printf(BGRN "IMPL fill_send: CLIENT_REQUEST: REGISTER_TOPIC <%s, %ld, %s>" CRESET "\n",
-    //        out->arg_str, tmp_len, uuid_to_string(out->arg_uuid));
+        write_uuid(out, out->arg_msg_uuid);
 
     entry_length += sizeof(uint32_t);
     entry_length += sizeof(uint16_t);
@@ -378,6 +367,8 @@ static int register_topic_fill_send(struct send_state *out, const struct raft_lo
     entry_length += UUID_SIZE;
     if (tmp->register_topic.retained)
         entry_length += UUID_SIZE;
+
+    rdbg_printf("IMPL register_topic_fill_send: returning %u\n", entry_length);
 
     return entry_length;
 }

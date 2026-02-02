@@ -1934,7 +1934,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
             if (ent->size_send)
                 if (ent->size_send(arg_event, &send_state, arg_event->log_type) == -1)
                     goto fail;
-            
+
             if (send_state.arg_req_len > raft_impl->limits[arg_req_type].max_size) {
                 errno = EMSGSIZE;
                 goto fail;
@@ -1990,7 +1990,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                         goto fail;
                     }
 
-                    send_states[idx].arg_req_len = raft_impl->limits[arg_req_type].min_size;
+                    send_states[idx].arg_req_len = raft_impl->limits[tmp->log_type].min_size;
 
                     const struct raft_impl_entry *ent = &raft_impl->handlers[tmp->log_type];
 
@@ -1998,7 +1998,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                         if (ent->size_send(tmp, &send_states[idx], tmp->log_type) == -1)
                             goto fail;
 
-                    if (send_states[idx].arg_req_len > raft_impl->limits[arg_req_type].max_size) {
+                    if (send_states[idx].arg_req_len > raft_impl->limits[tmp->log_type].max_size) {
                         errno = EMSGSIZE;
                         goto fail;
                     }
@@ -2187,6 +2187,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                     }
 
                     tmp = tmp->next;
+                    assert(entry_length == send_states[idx].arg_req_len);
                     entry_length = htons(entry_length);
                     memcpy(entry_length_ptr, &entry_length, sizeof(uint16_t));
                 }
@@ -2291,6 +2292,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
     return sent;
 
 fail:
+    rdbg_printf("RAFT raft_send: failed: %s\n", strerror(errno));
     if (send_states)
         free(send_states);
     if (packet_buffer)
@@ -2574,9 +2576,9 @@ static int raft_tick(void)
                     name = "--";
 
                 rdbg_printf("RAFT raft_tick: [%2s] [%s] idx=%u/%u",
-                        name, raft_log_str[ent->event], ent->index, ent->term);
+                        name, raft_log_str[ent->log_type], ent->index, ent->term);
 
-                switch(ent->event)
+                switch(ent->log_type)
                 {
                     case RAFT_LOG_REGISTER_TOPIC:
                         rdbg_cprintf(" <%s>", ent->opt.register_topic.name);
