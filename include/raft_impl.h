@@ -61,6 +61,8 @@ union raft_reply_options {
  * u8[16] uuid
  */
 
+#define RAFT_LOG_UNREGISTER_SESSION_SIZE (16)
+
 /*
  * RAFT_LOG_REGISTER_SESSION
  * u16    flags
@@ -73,6 +75,7 @@ union raft_reply_options {
 
 #define RAFT_LOG_REGISTER_SESSION_REQ_RESP_INFO (1<<0)
 #define RAFT_LOG_REGISTER_SESSION_REQ_PROB_INFO (1<<1)
+#define RAFT_LOG_REGISTER_SESSION_SIZE (2+4+16+4+2)
 
 /*
  * RAFT_LOG_REGISTER_TOPIC
@@ -85,11 +88,14 @@ union raft_reply_options {
  *
 */
 
-# define RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED    (1<<0)
+#define RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED    (1<<0)
+#define RAFT_LOG_REGISTER_TOPIC_SIZE (4+2+16)
 
 /* RAFT_LOG_UNREGISTER_TOPIC
  *
  * u8[16] uuid
  */
+
+#define RAFT_LOG_UNREGISTER_TOPIC_SIZE (16)
 
 #endif

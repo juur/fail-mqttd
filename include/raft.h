@@ -104,14 +104,14 @@ enum {
 #include "raft_impl.h"
 
 struct raft_reply {
-    raft_log_t event;
+    raft_log_t log_type;
     union raft_reply_options opt;
 };
 
 struct raft_log {
     struct raft_log *next;
     raft_conn_t role;
-    raft_log_t event;
+    raft_log_t log_type;
     uint8_t flags;
     uint32_t index;
     uint32_t term;
@@ -242,7 +242,7 @@ struct raft_state {
 
 struct raft_local_append {
     struct raft_local_append *next;
-    raft_log_t event;
+    raft_log_t log_type;
     va_list ap;
 };
 
@@ -276,20 +276,26 @@ struct send_state {
 };
 
 struct raft_impl_entry {
-    int (*free_log)(struct raft_log *);
-    int (*commit_and_advance)(struct raft_log *);
-    int (*leader_append)(struct raft_log *, va_list);
+    int (*free_log)(struct raft_log *, raft_log_t);
+    int (*apply)(struct raft_log *, raft_log_t);
+    int (*leader_append)(struct raft_log *, raft_log_t, va_list);
     int (*client_append)(struct raft_log *, raft_log_t, va_list);
-    int (*pre_send)(struct raft_log *, struct send_state *);
-    int (*fill_send)(struct send_state *, const struct raft_log *);
+    int (*size_send)(struct raft_log *, struct send_state *, raft_log_t);
+    int (*fill_send)(struct send_state *, const struct raft_log *, raft_log_t);
     raft_status_t (*process_packet)(size_t *, const uint8_t **, raft_rpc_t rpc, raft_log_t, struct raft_log *);
-    int (*save_log)(const struct raft_log *, uint8_t **);
-    int (*read_log)(struct raft_log *, const uint8_t *, int);
+    int (*save_log)(const struct raft_log *, uint8_t **, raft_log_t);
+    int (*read_log)(struct raft_log *, const uint8_t *, int, raft_log_t);
+};
+
+struct raft_impl_limits {
+    const size_t min_size;
+    const size_t max_size;
 };
 
 struct raft_impl {
     const char *const name;
     const unsigned num_log_types;
+    const struct raft_impl_limits *limits;
     const struct raft_impl_entry handlers[] __attribute__((counted_by(num_log_types)));
 };
 

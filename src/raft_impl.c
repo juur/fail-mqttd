@@ -61,8 +61,18 @@ extern pthread_rwlock_t global_topics_lock;
 extern bool opt_database;
 extern struct raft_state raft_state;
 
+#define RAFT_LOG_MAX_PAYLOAD_SIZE   0x100000
 
-[[maybe_unused]] inline static int64_t timems(void)
+static const struct raft_impl_limits raft_log_settings[RAFT_MAX_LOG] ={
+    [RAFT_LOG_NOOP]               = { 0, 0 },
+    [RAFT_LOG_REGISTER_TOPIC]     = { RAFT_LOG_REGISTER_TOPIC_SIZE     , RAFT_LOG_MAX_PAYLOAD_SIZE        } ,
+    [RAFT_LOG_UNREGISTER_TOPIC]   = { RAFT_LOG_UNREGISTER_TOPIC_SIZE   , RAFT_LOG_UNREGISTER_TOPIC_SIZE   } ,
+    [RAFT_LOG_REGISTER_SESSION]   = { RAFT_LOG_REGISTER_SESSION_SIZE   , RAFT_LOG_MAX_PAYLOAD_SIZE        } ,
+    [RAFT_LOG_UNREGISTER_SESSION] = { RAFT_LOG_UNREGISTER_SESSION_SIZE , RAFT_LOG_UNREGISTER_SESSION_SIZE } ,
+};
+
+
+[[maybe_unused]] static int64_t timems(void)
 {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
@@ -71,11 +81,11 @@ extern struct raft_state raft_state;
     return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
 }
 
-static int free_log(struct raft_log *lg)
+static int free_log(struct raft_log *lg, raft_log_t event)
 {
     union raft_log_options *entry = &lg->opt;
 
-    switch(lg->event)
+    switch(event)
     {
         case RAFT_LOG_REGISTER_TOPIC:
             if (entry->register_topic.name)
@@ -94,18 +104,18 @@ static int free_log(struct raft_log *lg)
     return 0;
 }
 
-static int unregister_topic_commit_and_advance(struct raft_log *lg/*, struct raft_reply *reply */)
+static int unregister_topic_apply(struct raft_log *lg/*, struct raft_reply *reply */, raft_log_t /*event*/)
 {
     struct topic *topic = NULL;
     union raft_log_options *log_entry = &lg->opt;
 
     if ((topic = find_topic_by_uuid(log_entry->unregister_topic.uuid)) == NULL) {
         errno = ENOENT;
-        warn("raft_commit_and_advance: can't find topic for UUID");
+        warn("raft_apply: can't find topic for UUID");
         goto fail;
     }
 
-    rdbg_printf("IMPL unregister_topic_commit_and_advance: dunno how to unregstier a topic\n");
+    rdbg_printf("IMPL unregister_topic_apply: dunno how to unregstier a topic\n");
 
     return 0;
 
@@ -113,7 +123,7 @@ fail:
     return -1;
 }
 
-static int register_topic_commit_and_advance(struct raft_log *lg /*, struct raft_reply *reply*/)
+static int register_topic_apply(struct raft_log *lg /*, struct raft_reply *reply*/, raft_log_t /*event*/)
 {
     struct topic *topic = NULL;
     struct message *message = NULL;
@@ -122,7 +132,7 @@ static int register_topic_commit_and_advance(struct raft_log *lg /*, struct raft
     if (log_entry->register_topic.retained)
         if ((message = find_message_by_uuid(log_entry->register_topic.msg_uuid)) == NULL) {
             errno = ENOENT;
-            warn("raft_commit_and_advance: can't find retained message for UUID");
+            warn("raft_apply: can't find retained message for UUID");
             goto fail;
         }
 
@@ -134,20 +144,20 @@ static int register_topic_commit_and_advance(struct raft_log *lg /*, struct raft
         }
         topic->state = TOPIC_ACTIVE;
         pthread_rwlock_unlock(&global_topics_lock);
-        rdbg_printf("IMPL raft_commit_and_advance: activated topic <%s>\n", log_entry->register_topic.name);
+        rdbg_printf("IMPL raft_apply: activated topic <%s>\n", log_entry->register_topic.name);
     } else {
         pthread_rwlock_unlock(&global_topics_lock);
 
         if ((topic = register_topic(log_entry->register_topic.name, log_entry->register_topic.uuid, false)) == NULL) {
-            warn("raft_commit_and_advance: register_topic");
+            warn("raft_apply: register_topic");
             goto fail;
         } else {
-            rdbg_printf("IMPL raft_commit_and_advance: registered new topic <%s>\n", log_entry->register_topic.name);
+            rdbg_printf("IMPL raft_apply: registered new topic <%s>\n", log_entry->register_topic.name);
         }
     }
 
     if (message && topic->retained_message == message) {
-        warn("raft_commit_and_advance: somehow the topic already has the message");
+        warn("raft_apply: somehow the topic already has the message");
         goto fail;
     }
 
@@ -166,7 +176,7 @@ fail:
     return -1;
 }
 
-static int unregister_topic_leader_append(struct raft_log *lg, va_list ap)
+static int unregister_topic_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
 {
     union raft_log_options *new_log = &lg->opt;
 
@@ -175,7 +185,8 @@ static int unregister_topic_leader_append(struct raft_log *lg, va_list ap)
     return 0;
 }
 
-static int register_topic_leader_append(struct raft_log *lg, va_list ap)
+#if 0
+static int register_topic_leader_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
 {
     size_t name_len;
     union raft_log_options *new_log = &lg->opt;
@@ -203,19 +214,28 @@ static int register_topic_leader_append(struct raft_log *lg, va_list ap)
 fail:
     return -1;
 }
+#endif
 
-static int unregister_topic_client_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
+static int register_session_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
 {
-    union raft_log_options *new_client_event = &lg->opt;
+    union raft_log_options *new_event = &lg->opt;
 
-    uint8_t *uuid = va_arg(ap, void *);
+    struct session *session = va_arg(ap, void *);
 
-    memcpy(&new_client_event->unregister_topic.uuid, uuid, UUID_SIZE);
-
+    new_event->register_session.flags = 0;
+    if (session->request_problem_information)
+        new_event->register_session.flags |= RAFT_LOG_REGISTER_SESSION_REQ_PROB_INFO;
+    if (session->request_response_information)
+        new_event->register_session.flags |= RAFT_LOG_REGISTER_SESSION_REQ_RESP_INFO;
+    memcpy(&new_event->register_session.uuid, &session->uuid, UUID_SIZE);
+    new_event->register_session.client_id = (void *)strdup((const void *)session->client_id);
+    new_event->register_session.client_id_length = strlen((const void *)session->client_id);
+    new_event->register_session.expiry_interval = session->expiry_interval;
+    new_event->register_session.last_connected = session->last_connected;
     return 0;
 }
 
-static int register_topic_client_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
+static int register_topic_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
 {
     int rc = 0;
     size_t name_len;
@@ -252,30 +272,27 @@ fail:
     return -1;
 }
 
-static int unregister_topic_pre_send(struct raft_log *lg, struct send_state *out)
+static int unregister_topic_size_send(struct raft_log *lg, struct send_state *out, raft_log_t /*event*/)
 {
     union raft_log_options *arg_event = &lg->opt;
-
-    out->arg_req_len = 0;
-
     out->arg_uuid = arg_event->unregister_topic.uuid;
-    out->arg_req_len += UUID_SIZE;
-
     return 0;
 }
 
-static int register_topic_pre_send(struct raft_log *lg, struct send_state *out)
+static int register_session_size_send(struct raft_log *lg, struct send_state * /* out */, raft_log_t /*event*/)
+{
+    [[maybe_unused]] union raft_log_options *arg_event = &lg->opt;
+    return 0;
+}
+
+static int register_topic_size_send(struct raft_log *lg, struct send_state *out, raft_log_t /*event*/)
 {
     union raft_log_options *arg_event = &lg->opt;
-    out->arg_req_len = 0;
     out->arg_str = arg_event->register_topic.name;
     out->arg_uuid = arg_event->register_topic.uuid;
     out->arg_flags = arg_event->register_topic.flags;
 
-    out->arg_req_len += sizeof(uint16_t); /* strlen */
     out->arg_req_len += strlen((const void *)out->arg_str) + 1;
-    out->arg_req_len += UUID_SIZE;
-    out->arg_req_len += sizeof(uint32_t); /* flags */
 
     if (out->arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
         out->arg_msg_uuid = arg_event->register_topic.msg_uuid;
@@ -286,21 +303,60 @@ static int register_topic_pre_send(struct raft_log *lg, struct send_state *out)
     return 0;
 }
 
-static int unregister_topic_fill_send(struct send_state *out, const struct raft_log * /* lg */)
+static int unregister_topic_fill_send(struct send_state *out, const struct raft_log * /* lg */, raft_log_t /*event*/)
 {
     memcpy(out->ptr, out->arg_uuid, UUID_SIZE) ; out->ptr += UUID_SIZE ;
 
     return UUID_SIZE;
 }
 
-static int register_topic_fill_send(struct send_state *out, const struct raft_log *lg)
+static int register_session_fill_send(struct send_state * /* out */, const struct raft_log *lg, raft_log_t /*event*/)
+{
+    [[maybe_unused]] const union raft_log_options *tmp = &lg->opt;
+    int entry_length = 0;
+
+    return entry_length;
+}
+
+static inline void write_u32(uint8_t **ptr, const uint32_t val)
+{
+    memcpy(*ptr, &val, sizeof(val));
+    (*ptr) += sizeof(val);
+}
+
+static inline void write_u16(uint8_t **ptr, const uint16_t val)
+{
+    memcpy(*ptr, &val, sizeof(val));
+    (*ptr) += sizeof(val);
+}
+
+static inline void write_str(uint8_t **ptr, const void *src, size_t len)
+{
+    memcpy(*ptr, src, len);
+    *ptr[len] = '\0';
+    (*ptr) += len;
+}
+
+static inline void write_uuid(uint8_t **ptr, const uint8_t *src)
+{
+    memcpy(*ptr, src, UUID_SIZE);
+    (*ptr) += UUID_SIZE;
+}
+
+static int register_topic_fill_send(struct send_state *out, const struct raft_log *lg, raft_log_t /*event*/)
 {
     const union raft_log_options *tmp = &lg->opt;
     uint16_t entry_length = 0;
+    const bool retained_uuid = (out->arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
+
+    write_u32(&out->ptr, htons(out->arg_flags));
+    write_u16(&out->ptr, htons(strlen((void *)out->arg_str)));
+    write_str(&out->ptr, out->arg_str, strlen((void *)out->arg_str));
+    if (retained_uuid)
+        write_uuid(&out->ptr, out->arg_msg_uuid);
 
     const size_t tmp_len     = strlen((void *)out->arg_str);
     const uint16_t len       = htons(tmp_len);
-    const bool retained_uuid = (out->arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
     out->arg_flags                = htonl(out->arg_flags);
 
     memcpy(out->ptr, &out->arg_flags, sizeof(uint32_t)) ; out->ptr += sizeof(uint32_t) ;
@@ -349,6 +405,60 @@ fail:
     return -1;
 }
 
+static raft_status_t register_session_process_packet(size_t *bytes_remaining, const uint8_t **ptr,
+        [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *lg)
+{
+    if (lg == NULL) {
+        errno = EINVAL;
+        goto fail;
+    }
+
+    union raft_log_options *out = &lg->opt;
+    raft_status_t reply = RAFT_OK;
+    int rc = 0;
+
+    if (*bytes_remaining < (2+4+UUID_SIZE+4+2)) {
+        errno = EINVAL;
+        goto fail;
+    }
+
+    memcpy(&out->register_session.flags, *ptr, sizeof(uint16_t));
+    *ptr += sizeof(uint16_t);
+    out->register_session.flags = ntohs(out->register_session.flags);
+
+    memcpy(&out->register_session.expiry_interval, *ptr, sizeof(uint32_t));
+    *ptr += sizeof(uint32_t);
+    out->register_session.expiry_interval = ntohl(out->register_session.expiry_interval);
+
+    memcpy(&out->register_session.uuid, *ptr, UUID_SIZE);
+    *ptr += UUID_SIZE;
+
+    memcpy(&out->register_session.last_connected, *ptr, sizeof(uint32_t));
+    *ptr += sizeof(uint32_t);
+    out->register_session.last_connected = ntohl(out->register_session.last_connected);
+
+    memcpy(&out->register_session.client_id_length, *ptr, sizeof(uint16_t));
+    *ptr += sizeof(uint16_t);
+    out->register_session.client_id_length = ntohs(out->register_session.client_id_length);
+
+    if (out->register_session.client_id_length > *bytes_remaining) {
+        errno = EMSGSIZE;
+        goto fail;
+    }
+
+    if ((out->register_session.client_id = (void *)strndup((const void *)*ptr,
+                    out->register_session.client_id_length)) == NULL)
+        goto fail;
+
+    if (rc == -1)
+        reply = RAFT_ERR;
+
+    return reply;
+
+fail:
+    return -1;
+}
+
 static raft_status_t register_topic_process_packet(size_t *bytes_remaining, const uint8_t **ptr,
         [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *lg)
 {
@@ -362,10 +472,6 @@ static raft_status_t register_topic_process_packet(size_t *bytes_remaining, cons
 
     rdbg_printf("IMPL register_topic_process_packet: bytes_remaining=%lu\n",
             *bytes_remaining);
-
-    if (*bytes_remaining == 13) {
-        abort();
-    }
 
     if (*bytes_remaining < sizeof(uint32_t))
         goto fail;
@@ -450,7 +556,7 @@ fail:
     return -1;
 }
 
-static int save_log(const struct raft_log *lg, uint8_t **event_buf)
+static int save_log(const struct raft_log *lg, uint8_t **event_buf, raft_log_t /*event*/)
 {
     int rc = 0;
     errno = EINVAL;
@@ -461,7 +567,7 @@ static int save_log(const struct raft_log *lg, uint8_t **event_buf)
 
     const union raft_log_options *l = &lg->opt;
 
-    switch (lg->event)
+    switch (lg->log_type)
     {
         case RAFT_LOG_NOOP:
             rc = 2+4+UUID_SIZE+4+2+l->register_session.client_id_length;
@@ -507,7 +613,7 @@ static int save_log(const struct raft_log *lg, uint8_t **event_buf)
             break;
 
         default:
-            warnx("save_log: unknown event %d", lg->event);
+            warnx("save_log: unknown event %d", lg->log_type);
             goto fail;
     }
 
@@ -523,19 +629,17 @@ fail:
     return -1;
 }
 
-static int read_log(struct raft_log *lg, const uint8_t *event_buf, int len)
+static int read_log(struct raft_log *lg, const uint8_t *event_buf, int len, raft_log_t /*event*/)
 {
     const uint8_t *ptr = event_buf;
     union raft_log_options *l = &lg->opt;
     errno = EINVAL;
     size_t bytes_remaining = len;
 
-    //rdbg_printf("IMPL read_log: event_buf=%p len=%d\n", event_buf, len);
-
     if (event_buf == NULL || len == 0)
         goto fail;
 
-    switch (lg->event)
+    switch (lg->log_type)
     {
         case RAFT_LOG_NOOP:
             break;
@@ -607,14 +711,14 @@ static int read_log(struct raft_log *lg, const uint8_t *event_buf, int len)
             break;
 
         default:
-            warnx("read_log: unknown event %d", lg->event);
+            warnx("read_log: unknown event %d", lg->log_type);
             goto fail;
     }
 
     return 0;
 
 fail:
-    switch (lg->event)
+    switch (lg->log_type)
     {
         case RAFT_LOG_REGISTER_TOPIC:
             if (l->register_topic.name) {
@@ -638,19 +742,20 @@ fail:
 }
 
 const struct raft_impl mqtt_raft_impl = {
-    .name = "fail-mqttd",
+    .name          = "fail-mqttd",
     .num_log_types = RAFT_MAX_LOG,
-    .handlers = {
+    .limits        = raft_log_settings,
+    .handlers      = {
         [RAFT_LOG_NOOP] = {
             .save_log           = save_log,
             .read_log           = read_log,
         },
         [RAFT_LOG_REGISTER_TOPIC] = {
             .free_log           = free_log,
-            .commit_and_advance = register_topic_commit_and_advance,
-            .leader_append      = register_topic_leader_append,
-            .client_append      = register_topic_client_append,
-            .pre_send           = register_topic_pre_send,
+            .apply              = register_topic_apply,
+            .leader_append      = register_topic_append,
+            .client_append      = register_topic_append,
+            .size_send          = register_topic_size_send,
             .fill_send          = register_topic_fill_send,
             .process_packet     = register_topic_process_packet,
             .save_log           = save_log,
@@ -658,10 +763,10 @@ const struct raft_impl mqtt_raft_impl = {
         },
         [RAFT_LOG_UNREGISTER_TOPIC] = {
             .free_log           = free_log,
-            .commit_and_advance = unregister_topic_commit_and_advance,
-            .leader_append      = unregister_topic_leader_append,
-            .client_append      = unregister_topic_client_append,
-            .pre_send           = unregister_topic_pre_send,
+            .apply              = unregister_topic_apply,
+            .leader_append      = unregister_topic_append,
+            .client_append      = unregister_topic_append,
+            .size_send          = unregister_topic_size_send,
             .fill_send          = unregister_topic_fill_send,
             .process_packet     = unregister_topic_process_packet,
             .save_log           = save_log,
@@ -669,6 +774,11 @@ const struct raft_impl mqtt_raft_impl = {
 
         },
         [RAFT_LOG_REGISTER_SESSION] = {
+            .leader_append      = register_session_append,
+            .client_append      = register_session_append,
+            .size_send          = register_session_size_send,
+            .fill_send          = register_session_fill_send,
+            .process_packet     = register_session_process_packet,
             .free_log           = free_log,
             .save_log           = save_log,
             .read_log           = read_log,

@@ -208,12 +208,12 @@ static int raft_save_state_log(bool full_write)
         if (!full_write && p->index <= raft_state.last_saved_index) /* skip already saved logs */
             continue;
 
-        if (p->event >= raft_impl->num_log_types)
+        if (p->log_type >= raft_impl->num_log_types)
             abort();
 
         int event_buf_len;
 
-        if ((event_buf_len = raft_impl->handlers[p->event].save_log(p, &event_buf)) == -1) {
+        if ((event_buf_len = raft_impl->handlers[p->log_type].save_log(p, &event_buf, p->log_type)) == -1) {
             logger(LOG_WARNING, NULL, "raft_save_state_log: save_log: %s", strerror(errno));
             goto fail;
         }
@@ -232,7 +232,7 @@ static int raft_save_state_log(bool full_write)
         const uint32_t save_hdr[RSS_HDR_SIZE] = {
             p->index,
             p->term,
-            p->event,
+            p->log_type,
             event_buf_len,
             };
 
@@ -440,7 +440,7 @@ again2:
             }
 
             if (raft_impl->handlers[read_hdr[RSS_EVENT]].read_log(tmp_log,
-                        event_buf, read_hdr[RSS_EVENT_BUF_LEN]) == -1) {
+                        event_buf, read_hdr[RSS_EVENT_BUF_LEN], read_hdr[RSS_EVENT]) == -1) {
                 logger(LOG_WARNING, NULL, "raft_load_state: read_log: %s", strerror(errno));
                 goto fail;
             }
@@ -857,7 +857,7 @@ static struct raft_log *raft_alloc_log(raft_conn_t conn_type, raft_log_t event)
 
     ret->done = false;
     ret->role = conn_type;
-    ret->event = event;
+    ret->log_type = event;
 
     return ret;
 
@@ -883,14 +883,14 @@ static int raft_free_log(struct raft_log *entry)
 {
     int rc = 0;
 
-    if (entry->event >= raft_impl->num_log_types) {
+    if (entry->log_type >= raft_impl->num_log_types) {
         errno = EINVAL;
         rc = -1;
-        logger(LOG_WARNING, NULL, "raft_free_log: attempt to free unknown event type %u", entry->event);
+        logger(LOG_WARNING, NULL, "raft_free_log: attempt to free unknown event type %u", entry->log_type);
     } else {
-        const struct raft_impl_entry *ent = &raft_impl->handlers[entry->event];
+        const struct raft_impl_entry *ent = &raft_impl->handlers[entry->log_type];
         if (ent->free_log)
-            ent->free_log(entry);
+            ent->free_log(entry, entry->log_type);
     }
 
     if (entry->role == RAFT_CLIENT) {
@@ -1042,17 +1042,17 @@ static int raft_commit_and_advance(void)
             log_entry->term
             );
 
-    if (log_entry->event >= raft_impl->num_log_types) {
+    if (log_entry->log_type >= raft_impl->num_log_types) {
         errno = EINVAL;
         warnx("raft_commit_and_advance: unknown log entry %u@%u/%u",
-                log_entry->event,
+                log_entry->log_type,
                 log_entry->index, log_entry->term);
         return -1;
     }
 
-    const struct raft_impl_entry *ent = &raft_impl->handlers[log_entry->event];
-    if (ent->commit_and_advance)
-        if (ent->commit_and_advance(log_entry/*, &log_entry->reply*/) == -1)
+    const struct raft_impl_entry *ent = &raft_impl->handlers[log_entry->log_type];
+    if (ent->apply)
+        if (ent->apply(log_entry, log_entry->log_type) == -1)
             goto fail;
 
     raft_state.commit_index++;
@@ -1157,7 +1157,7 @@ static int raft_leader_log_appendv(raft_log_t event, struct raft_log *log_p, va_
         const struct raft_impl_entry *ent = &raft_impl->handlers[event];
 
         if (ent->leader_append)
-            if (ent->leader_append(new_log, ap) == -1)
+            if (ent->leader_append(new_log, event, ap) == -1)
                 goto fail;
 
     }
@@ -1926,12 +1926,19 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                 goto fail;
             }
 
+            send_state.arg_req_len = raft_impl->limits[arg_req_type].min_size;
+
             const struct raft_impl_entry *ent = &raft_impl->handlers[arg_req_type];
 
             arg_event = va_arg(ap, struct raft_log *);
-            if (ent->pre_send)
-                if (ent->pre_send(arg_event, &send_state) == -1)
+            if (ent->size_send)
+                if (ent->size_send(arg_event, &send_state, arg_event->log_type) == -1)
                     goto fail;
+            
+            if (send_state.arg_req_len > raft_impl->limits[arg_req_type].max_size) {
+                errno = EMSGSIZE;
+                goto fail;
+            }
 
             if ( ((size_t)packet.length) + send_state.arg_req_len > RAFT_MAX_PACKET_SIZE) {
                 errno = EOVERFLOW;
@@ -1978,16 +1985,23 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
 
                     packet.length += RAFT_LOG_FIXED_SIZE;
 
-                    if (tmp->event >= raft_impl->num_log_types) {
+                    if (tmp->log_type >= raft_impl->num_log_types) {
                         errno = EINVAL;
                         goto fail;
                     }
 
-                    const struct raft_impl_entry *ent = &raft_impl->handlers[tmp->event];
+                    send_states[idx].arg_req_len = raft_impl->limits[arg_req_type].min_size;
 
-                    if (ent->pre_send)
-                        if (ent->pre_send(tmp, &send_states[idx]) == -1)
+                    const struct raft_impl_entry *ent = &raft_impl->handlers[tmp->log_type];
+
+                    if (ent->size_send)
+                        if (ent->size_send(tmp, &send_states[idx], tmp->log_type) == -1)
                             goto fail;
+
+                    if (send_states[idx].arg_req_len > raft_impl->limits[arg_req_type].max_size) {
+                        errno = EMSGSIZE;
+                        goto fail;
+                    }
 
                     tmp = tmp->next;
                     arg_req_len += send_states[idx].arg_req_len;
@@ -2096,7 +2110,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
             send_state.ptr = ptr;
 
             if (ent->fill_send)
-                if (ent->fill_send(&send_state, arg_event) == -1)
+                if (ent->fill_send(&send_state, arg_event, arg_event->log_type) == -1)
                     goto fail;
 
             ptr = send_state.ptr;
@@ -2140,7 +2154,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
 
                 for (unsigned idx = 0; tmp && idx < arg_num_entries; idx++)
                 {
-                    *ptr = (uint8_t)tmp->event; ptr++; /* type  */
+                    *ptr = (uint8_t)tmp->log_type; ptr++; /* type  */
                     *ptr = 0; ptr++;                   /* flags */
                     index = htonl(tmp->index);         /* index */
                     term = htonl(tmp->term);           /* term  */
@@ -2150,18 +2164,18 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                     ptr += sizeof(uint16_t);
                     entry_length = 0;
 
-                    if (tmp->event >= raft_impl->num_log_types) {
+                    if (tmp->log_type >= raft_impl->num_log_types) {
                         errno = EINVAL;
-                        logger(LOG_WARNING, NULL, "raft_send: tmp->event (%u) unknown inside RAFT_APPEND_ENTRIES", tmp->event);
+                        logger(LOG_WARNING, NULL, "raft_send: tmp->event (%u) unknown inside RAFT_APPEND_ENTRIES", tmp->log_type);
                         goto fail;
                     }
 
-                    const struct raft_impl_entry *ent = &raft_impl->handlers[tmp->event];
+                    const struct raft_impl_entry *ent = &raft_impl->handlers[tmp->log_type];
 
                     ssize_t rc;
                     if (ent->fill_send) {
                         send_states[idx].ptr = ptr;
-                        if ((rc = ent->fill_send(&send_states[idx], tmp)) == -1)
+                        if ((rc = ent->fill_send(&send_states[idx], tmp, tmp->log_type)) == -1)
                             goto fail;
 
                         if (rc > USHRT_MAX || (((size_t)entry_length) + rc > USHRT_MAX)) {
