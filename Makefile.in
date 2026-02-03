@@ -142,7 +142,7 @@ uninstall:
 .PHONY: mostlyclean clean distclean maintainer-clean
 
 maintainer-clean: distclean
-	$(RM) $(objdir)/config.status $(objdir)/config.log
+	$(RM) $(objdir)/config.status $(objdir)/config.log $(objdir)/config.h~
 
 distclean: clean
 	$(RM) $(objdir)/config.h $(objdir)/Makefile $(objdir)/fail-mqttd.spec \

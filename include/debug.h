@@ -1,28 +1,11 @@
-#ifndef _DEBUG_H
-#define _DEBUG_H
+#ifndef _FAIL_DEBUG_H
+#define _FAIL_DEBUG_H
 
-#define _XOPEN_SOURCE 800
-
-#include <stdint.h>
-#include <unistd.h>
-#include <sys/types.h>
-
-#ifndef FEATURE_DEBUG
-# define dbg_printf(...) { }
-# define dbg_cprintf(...) { }
-#else
-# define dbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
-# define dbg_cprintf(...) { printf(__VA_ARGS__); }
-#endif
-#ifndef FEATURE_RAFT_DEBUG
-# define rdbg_printf(...) { }
-# define rdbg_cprintf(...) { }
-#else
-# define rdbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
-# define rdbg_cprintf(...) { printf(__VA_ARGS__); }
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 800
 #endif
 
-#if defined(FEATURE_DEBUG) || defined(FEATURE_RAFT_DEBUG)
+#if defined(FEATURE_DEBUG) || defined(FEATURE_RAFT_DEBUG) || defined(FEATURE_RAFT_IMPL_DEBUG)
 # define CRESET "\x1b[0m"
 
 # define BBLU "\x1b[1;34m"
@@ -40,7 +23,34 @@
 # define NRED "\x1b[0;31m"
 # define NWHT "\x1b[0;37m"
 # define NYEL "\x1b[0;33m"
+#endif
 
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/types.h>
+
+#ifdef FEATURE_DEBUG
+# define dbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
+# define dbg_cprintf(...) { printf(__VA_ARGS__); }
+#else
+# define dbg_printf(...) { }
+# define dbg_cprintf(...) { }
+#endif
+
+#ifdef FEATURE_RAFT_DEBUG
+# define rdbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
+# define rdbg_cprintf(...) { printf(__VA_ARGS__); }
+#else
+# define rdbg_printf(...) { }
+# define rdbg_cprintf(...) { }
+#endif
+
+#ifdef FEATURE_RAFT_DEBUG
+# define ridbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
+# define ridbg_cprintf(...) { printf(__VA_ARGS__); }
+#else
+# define ridbg_printf(...) { }
+# define ridbg_cprintf(...) { }
 #endif
 
 #include "mqtt.h"

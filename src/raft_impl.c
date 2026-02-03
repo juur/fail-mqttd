@@ -1,4 +1,8 @@
-#define _XOPEN_SOURCE 800
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 800
+#endif
+
+#include "config.h"
 
 #include <stdlib.h>
 #include <pthread.h>
@@ -9,53 +13,28 @@
 #include <stdio.h>
 #include <assert.h>
 
-#include "config.h"
 #include "mqtt.h"
 #include "raft.h"
+#include "debug.h"
 
-#if defined(FEATURE_RAFT_IMPL_DEBUG)
-# define CRESET "\x1b[0m"
+#ifdef FEATURE_RAFT_IMPL_DEBUG
+static int64_t timems(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
+        return -1;
 
-# define BBLU "\x1b[1;34m"
-# define BCYN "\x1b[1;36m"
-# define BGRN "\x1b[1;32m"
-# define BMAG "\x1b[1;35m"
-# define BRED "\x1b[1;31m"
-# define BWHT "\x1b[1;37m"
-# define BYEL "\x1b[1;33m"
-
-# define NBLU "\x1b[0;34m"
-# define NCYN "\x1b[0;36m"
-# define NGRN "\x1b[0;32m"
-# define NMAG "\x1b[0;35m"
-# define NRED "\x1b[0;31m"
-# define NWHT "\x1b[0;37m"
-# define NYEL "\x1b[0;33m"
-
-#endif
-
-#ifndef FEATURE_RAFT_IMPL_DEBUG
-# define rdbg_printf(...) { }
-# define rdbg_cprintf(...) { }
-#else
-# define rdbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
-# define rdbg_cprintf(...) { printf(__VA_ARGS__); }
-extern const char *uuid_to_string(const uint8_t uuid[const static UUID_SIZE]);
+    return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+}
 #endif
 
 extern struct message *find_message_by_uuid(const uint8_t uuid[static const UUID_SIZE]);
 extern struct topic *find_topic_by_uuid(const uint8_t uuid[static const UUID_SIZE]);
 extern struct topic *find_topic(const uint8_t *name, bool active_only, bool need_lock);
 extern int save_topic(const struct topic *topic);
-[[gnu::nonnull(1),gnu::warn_unused_result]] struct topic *register_topic(const uint8_t *name,
-        const uint8_t uuid[const UUID_SIZE]
-#ifdef FEATURE_RAFT
-        , bool source_self
-#endif
-        );
+extern struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE] RAFT_API_SOURCE_SELF);
 extern int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...);
 extern int raft_leader_log_append(raft_log_t event, ...);
-
 
 extern pthread_rwlock_t global_topics_lock;
 extern bool opt_database;
@@ -70,16 +49,6 @@ static const struct raft_impl_limits raft_log_settings[RAFT_MAX_LOG] ={
     [RAFT_LOG_REGISTER_SESSION]   = { RAFT_LOG_REGISTER_SESSION_SIZE   , RAFT_LOG_MAX_PAYLOAD_SIZE        } ,
     [RAFT_LOG_UNREGISTER_SESSION] = { RAFT_LOG_UNREGISTER_SESSION_SIZE , RAFT_LOG_UNREGISTER_SESSION_SIZE } ,
 };
-
-
-[[maybe_unused]] static int64_t timems(void)
-{
-    struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
-        return -1;
-
-    return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
-}
 
 static int free_log(struct raft_log *lg, raft_log_t event)
 {
@@ -115,7 +84,7 @@ static int unregister_topic_apply(struct raft_log *lg/*, struct raft_reply *repl
         goto fail;
     }
 
-    rdbg_printf("IMPL unregister_topic_apply: dunno how to unregstier a topic\n");
+    ridbg_printf("IMPL unregister_topic_apply: dunno how to unregstier a topic\n");
 
     return 0;
 
@@ -144,7 +113,7 @@ static int register_topic_apply(struct raft_log *lg /*, struct raft_reply *reply
         }
         topic->state = TOPIC_ACTIVE;
         pthread_rwlock_unlock(&global_topics_lock);
-        rdbg_printf("IMPL raft_apply: activated topic <%s>\n", log_entry->register_topic.name);
+        ridbg_printf("IMPL raft_apply: activated topic <%s>\n", log_entry->register_topic.name);
     } else {
         pthread_rwlock_unlock(&global_topics_lock);
 
@@ -152,7 +121,7 @@ static int register_topic_apply(struct raft_log *lg /*, struct raft_reply *reply
             warn("raft_apply: register_topic");
             goto fail;
         } else {
-            rdbg_printf("IMPL raft_apply: registered new topic <%s>\n", log_entry->register_topic.name);
+            ridbg_printf("IMPL raft_apply: registered new topic <%s>\n", log_entry->register_topic.name);
         }
     }
 
@@ -184,37 +153,6 @@ static int unregister_topic_append(struct raft_log *lg, raft_log_t /* event */, 
 
     return 0;
 }
-
-#if 0
-static int register_topic_leader_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
-{
-    size_t name_len;
-    union raft_log_options *new_log = &lg->opt;
-
-    new_log->register_topic.name = (void *)strdup((void *)va_arg(ap, uint8_t *));
-    if (new_log->register_topic.name == NULL)
-        goto fail;
-    if ((name_len = strlen((void *)new_log->register_topic.name)) > UINT16_MAX) {
-        errno = EOVERFLOW;
-        goto fail;
-    }
-    new_log->register_topic.length = name_len;
-
-    memcpy(&new_log->register_topic.uuid, va_arg(ap, uint8_t *), UUID_SIZE);
-
-    new_log->register_topic.flags = va_arg(ap, uint32_t);
-    new_log->register_topic.retained = (new_log->register_topic.flags &
-            RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
-
-    if (new_log->register_topic.retained)
-        memcpy(&new_log->register_topic.msg_uuid, va_arg(ap, uint8_t *), UUID_SIZE);
-    else
-        memset(&new_log->register_topic.msg_uuid, 0, UUID_SIZE);
-    return 0;
-fail:
-    return -1;
-}
-#endif
 
 static int register_session_append(struct raft_log *lg, raft_log_t /* event */, va_list ap)
 {
@@ -267,29 +205,26 @@ static int register_topic_append(struct raft_log *lg, raft_log_t /* event */, va
     else
         memset(&new_client_event->register_topic.msg_uuid, 0, UUID_SIZE);
 
-    rdbg_printf("IMPL register_topic_append: returning %u\n", rc);
+    ridbg_printf("IMPL register_topic_append: returning %u\n", rc);
 
     return rc;
 fail:
     return -1;
 }
 
-static int unregister_topic_size_send(struct raft_log *lg, struct send_state *out, raft_log_t /*event*/)
+static int register_session_size_send(struct raft_log *lg, struct send_state *out, raft_log_t /*event*/)
 {
     union raft_log_options *arg_event = &lg->opt;
-    out->arg_uuid = arg_event->unregister_topic.uuid;
-    return 0;
-}
 
-static int register_session_size_send(struct raft_log *lg, struct send_state * /* out */, raft_log_t /*event*/)
-{
-    [[maybe_unused]] union raft_log_options *arg_event = &lg->opt;
+    out->arg_req_len += arg_event->register_session.client_id_length;
+
     return 0;
 }
 
 static int register_topic_size_send(struct raft_log *lg, struct send_state *out, raft_log_t /*event*/)
 {
     union raft_log_options *arg_event = &lg->opt;
+
     out->arg_str = arg_event->register_topic.name;
     out->arg_uuid = arg_event->register_topic.uuid;
     out->arg_flags = arg_event->register_topic.flags;
@@ -302,24 +237,9 @@ static int register_topic_size_send(struct raft_log *lg, struct send_state *out,
     } else
         out->arg_msg_uuid = NULL;
 
-    rdbg_printf("IMPL register_topic_size_send: length now %u\n", out->arg_req_len);
+    ridbg_printf("IMPL register_topic_size_send: length now %u\n", out->arg_req_len);
 
     return 0;
-}
-
-static int unregister_topic_fill_send(struct send_state *out, const struct raft_log * /* lg */, raft_log_t /*event*/)
-{
-    memcpy(out->ptr, out->arg_uuid, UUID_SIZE) ; out->ptr += UUID_SIZE ;
-
-    return UUID_SIZE;
-}
-
-static int register_session_fill_send(struct send_state * /* out */, const struct raft_log *lg, raft_log_t /*event*/)
-{
-    [[maybe_unused]] const union raft_log_options *tmp = &lg->opt;
-    int entry_length = 0;
-
-    return entry_length;
 }
 
 static inline void write_u32(struct send_state *out, const uint32_t val)
@@ -347,6 +267,21 @@ static inline void write_uuid(struct send_state *out, const uint8_t *src)
     out->ptr += UUID_SIZE;
 }
 
+static int unregister_topic_fill_send(struct send_state *out, const struct raft_log * /* lg */, raft_log_t /*event*/)
+{
+    write_uuid(out, out->arg_uuid);
+
+    return UUID_SIZE;
+}
+
+static int register_session_fill_send(struct send_state * /* out */, const struct raft_log *lg, raft_log_t /*event*/)
+{
+    [[maybe_unused]] const union raft_log_options *tmp = &lg->opt;
+    int entry_length = 0;
+
+    return entry_length;
+}
+
 static int register_topic_fill_send(struct send_state *out, const struct raft_log *lg, raft_log_t /*event*/)
 {
     const union raft_log_options *tmp = &lg->opt;
@@ -368,7 +303,7 @@ static int register_topic_fill_send(struct send_state *out, const struct raft_lo
     if (tmp->register_topic.retained)
         entry_length += UUID_SIZE;
 
-    rdbg_printf("IMPL register_topic_fill_send: returning %u\n", entry_length);
+    ridbg_printf("IMPL register_topic_fill_send: returning %u\n", entry_length);
 
     return entry_length;
 }
@@ -396,6 +331,55 @@ fail:
     return -1;
 }
 
+static int read_u16(uint16_t *dest, const uint8_t **ptr, size_t *bytes_remaining)
+{
+    memcpy(dest, *ptr, sizeof(*dest));
+    *dest = ntohs(*dest);
+    (*ptr) += sizeof(*dest);
+    (*bytes_remaining) -= sizeof(*dest);
+
+    return 0;
+}
+
+static int read_u32(uint32_t *dest, const uint8_t **ptr, size_t *bytes_remaining)
+{
+    memcpy(dest, *ptr, sizeof(*dest));
+    *dest = ntohl(*dest);
+    (*ptr) += sizeof(*dest);
+    (*bytes_remaining) -= sizeof(*dest);
+
+    return 0;
+}
+
+static int read_uuid(uint8_t dest[static UUID_SIZE], const uint8_t **ptr, size_t *bytes_remaining)
+{
+    if (*bytes_remaining < UUID_SIZE) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    memcpy(dest, *ptr, UUID_SIZE);
+    (*ptr) += UUID_SIZE;
+    (*bytes_remaining) -= UUID_SIZE;
+
+    return 0;
+}
+
+static int read_str(uint8_t **string, const uint8_t **ptr, size_t length, size_t *bytes_remaining)
+{
+    if (*bytes_remaining < length) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    if ((*string = (void *)strndup((void *)*ptr, length)) == NULL)
+        return -1;
+
+    *bytes_remaining -= length;
+    *ptr += length;
+    return 0;
+}
+
 static raft_status_t register_session_process_packet(size_t *bytes_remaining, const uint8_t **ptr,
         [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *lg)
 {
@@ -408,37 +392,19 @@ static raft_status_t register_session_process_packet(size_t *bytes_remaining, co
     raft_status_t reply = RAFT_OK;
     int rc = 0;
 
-    if (*bytes_remaining < (2+4+UUID_SIZE+4+2)) {
-        errno = EINVAL;
-        goto fail;
-    }
-
-    memcpy(&out->register_session.flags, *ptr, sizeof(uint16_t));
-    *ptr += sizeof(uint16_t);
-    out->register_session.flags = ntohs(out->register_session.flags);
-
-    memcpy(&out->register_session.expiry_interval, *ptr, sizeof(uint32_t));
-    *ptr += sizeof(uint32_t);
-    out->register_session.expiry_interval = ntohl(out->register_session.expiry_interval);
-
-    memcpy(&out->register_session.uuid, *ptr, UUID_SIZE);
-    *ptr += UUID_SIZE;
-
-    memcpy(&out->register_session.last_connected, *ptr, sizeof(uint32_t));
-    *ptr += sizeof(uint32_t);
-    out->register_session.last_connected = ntohl(out->register_session.last_connected);
-
-    memcpy(&out->register_session.client_id_length, *ptr, sizeof(uint16_t));
-    *ptr += sizeof(uint16_t);
-    out->register_session.client_id_length = ntohs(out->register_session.client_id_length);
+    read_u16(&out->register_session.flags, ptr, bytes_remaining);
+    read_u32(&out->register_session.expiry_interval, ptr, bytes_remaining);
+    read_uuid(out->register_session.uuid, ptr, bytes_remaining);
+    read_u32(&out->register_session.last_connected, ptr, bytes_remaining);
+    read_u16(&out->register_session.client_id_length, ptr, bytes_remaining);
 
     if (out->register_session.client_id_length > *bytes_remaining) {
         errno = EMSGSIZE;
         goto fail;
     }
 
-    if ((out->register_session.client_id = (void *)strndup((const void *)*ptr,
-                    out->register_session.client_id_length)) == NULL)
+    if (read_str(&out->register_session.client_id, ptr,
+                out->register_session.client_id_length, bytes_remaining) == -1)
         goto fail;
 
     if (rc == -1)
@@ -455,79 +421,27 @@ static raft_status_t register_topic_process_packet(size_t *bytes_remaining, cons
 {
     union raft_log_options *out = &lg->opt;
     uint8_t *temp_string = NULL;
-    uint32_t flags;
-    uint16_t tmp_len;
-    uint8_t uuid[UUID_SIZE], msg_uuid[UUID_SIZE];
     raft_status_t reply = RAFT_OK;
     int rc = 0;
 
-    rdbg_printf("IMPL register_topic_process_packet: bytes_remaining=%lu\n",
+    ridbg_printf("IMPL register_topic_process_packet: bytes_remaining=%lu\n",
             *bytes_remaining);
 
-    if (*bytes_remaining < sizeof(uint32_t))
+    read_u32(&out->register_topic.flags, ptr, bytes_remaining);
+    read_u16(&out->register_topic.length, ptr, bytes_remaining);
+
+    if (read_str(&out->register_topic.name, ptr, out->register_topic.length,
+            bytes_remaining) == -1)
         goto fail;
 
-    memcpy(&flags, *ptr, sizeof(uint32_t));
-    *ptr += sizeof(uint32_t);
-    *bytes_remaining -= sizeof(uint32_t);
+    read_uuid(out->register_topic.uuid, ptr, bytes_remaining);
+    out->register_topic.retained = (out->register_topic.flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
 
-    flags = ntohl(flags);
-
-    if (*bytes_remaining < sizeof(uint16_t))
-        goto fail;
-
-    memcpy(&tmp_len, *ptr, sizeof(uint16_t));
-    *ptr += sizeof(uint16_t);
-    *bytes_remaining -= sizeof(uint16_t);
-
-    tmp_len = ntohs(tmp_len);
-
-    if (*bytes_remaining < (size_t)tmp_len + 1)
-        goto fail;
-
-    if ((*ptr)[tmp_len] != '\0')
-        goto fail;
-
-    if ((temp_string = (void *)strndup((void *)*ptr, tmp_len)) == NULL) {
-        warnx("process_packet: strndup");
-        goto fail;
-    }
-    *ptr += tmp_len + 1;
-    *bytes_remaining -= (tmp_len + 1);
-
-    if (*bytes_remaining < UUID_SIZE)
-        goto fail;
-
-    memcpy(&uuid, *ptr, UUID_SIZE);
-    *ptr += UUID_SIZE;
-    *bytes_remaining -= UUID_SIZE;
-
-    if (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
-        if (*bytes_remaining < UUID_SIZE)
-            goto fail;
-        memcpy(&msg_uuid, *ptr, UUID_SIZE);
-        *ptr += UUID_SIZE;
-        *bytes_remaining -= UUID_SIZE;
-    }
-
-    if (*bytes_remaining != 0)
-        goto fail;
-
-    if (out != NULL) {
-        out->register_topic.retained = (flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
-        if ((out->register_topic.name = (void *)strdup((void *)temp_string)) == NULL)
+    if (out->register_topic.retained)
+        if (read_uuid(out->register_topic.msg_uuid, ptr, bytes_remaining) == -1)
             goto fail;
 
-        out->register_topic.length = tmp_len;
-        out->register_topic.flags = flags;
-        memcpy(out->register_topic.uuid, uuid, UUID_SIZE);
-        if (out->register_topic.retained)
-            memcpy(out->register_topic.msg_uuid, msg_uuid, UUID_SIZE);
-        else
-            memset(out->register_topic.msg_uuid, 0, UUID_SIZE);
-    }
-
-    rdbg_printf("IMPL process_packet: %s: REGISTER_TOPIC(%s)\n", raft_rpc_str[rpc], temp_string);
+    ridbg_printf("IMPL process_packet: %s: REGISTER_TOPIC(%s)\n", raft_rpc_str[rpc], temp_string);
     /*
     rc = raft_leader_log_append(type,
             temp_string, uuid, flags,
@@ -668,7 +582,7 @@ static int read_log(struct raft_log *lg, const uint8_t *event_buf, int len, raft
 
             memcpy(&l->unregister_topic.uuid, ptr, UUID_SIZE) ; ptr += UUID_SIZE ; bytes_remaining -= UUID_SIZE;
 
-            rdbg_printf("IMPL read_log: UNREGISTER_TOPIC <%s>\n", uuid_to_string(l->unregister_topic.uuid));
+            ridbg_printf("IMPL read_log: UNREGISTER_TOPIC <%s>\n", uuid_to_string(l->unregister_topic.uuid));
             break;
 
         case RAFT_LOG_REGISTER_TOPIC:
@@ -696,7 +610,7 @@ static int read_log(struct raft_log *lg, const uint8_t *event_buf, int len, raft
                 memcpy(&l->register_topic.msg_uuid, ptr, UUID_SIZE)  ; ptr += UUID_SIZE        ; bytes_remaining -= UUID_SIZE        ;
             }
 
-            rdbg_printf("IMPL read_log: REGISTER_TOPIC <%s>\n",
+            ridbg_printf("IMPL read_log: REGISTER_TOPIC <%s>\n",
                     l->register_topic.name);
             assert(ptr == (event_buf + len));
             break;
@@ -757,7 +671,6 @@ const struct raft_impl mqtt_raft_impl = {
             .apply              = unregister_topic_apply,
             .leader_append      = unregister_topic_append,
             .client_append      = unregister_topic_append,
-            .size_send          = unregister_topic_size_send,
             .fill_send          = unregister_topic_fill_send,
             .process_packet     = unregister_topic_process_packet,
             .save_log           = save_log,

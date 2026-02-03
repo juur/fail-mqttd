@@ -1,4 +1,7 @@
-#define _XOPEN_SOURCE 800
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 800
+#endif
+
 #include "config.h"
 
 #include <stdlib.h>
@@ -43,9 +46,11 @@
 
 static int64_t timems(void);
 
-#include "debug.h"
+#define RAFT_API_SOURCE_SELF
+
 #include "mqtt.h"
 #include "raft.h"
+#include "debug.h"
 
 #define MAX(a,b) (((a)>(b)) ? (a) : (b))
 #define MIN(a,b) (((a)<(b)) ? (a) : (b))
@@ -251,11 +256,7 @@ static const struct {
 [[gnu::nonnull(3),gnu::format(printf,3,4)]] void logger(int priority,
         const struct client *client, const char *format, ...);
 [[gnu::nonnull(1),gnu::warn_unused_result]] struct topic *register_topic(const uint8_t *name,
-        const uint8_t uuid[const UUID_SIZE]
-#ifdef FEATURE_RAFT
-        , bool source_self
-#endif
-        );
+        const uint8_t uuid[const UUID_SIZE] RAFT_API_SOURCE_SELF);
 [[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe_from_topics(struct session *session,
         const struct topic_sub_request *request);
 [[gnu::nonnull]] static int unsubscribe_session_from_all(struct session *session);
@@ -3762,12 +3763,7 @@ static struct subscription *find_subscription(const struct session *session,
 }
 
 [[gnu::nonnull(1), gnu::warn_unused_result]]
-struct topic *register_topic(const uint8_t *name,
-        const uint8_t uuid[const UUID_SIZE]
-#ifdef FEATURE_RAFT
-        , bool source_self
-#endif
-        )
+struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE] RAFT_API_SOURCE_SELF)
 {
     struct topic *ret;
 

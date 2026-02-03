@@ -23,7 +23,7 @@
 //#include "config.h"
 
 #ifndef TIMEMS_T_DEFINED
-#define TIMEMS_T_DEFINED
+# define TIMEMS_T_DEFINED
 typedef long timems_t;
 #endif
 

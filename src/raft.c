@@ -1,4 +1,7 @@
-#define _XOPEN_SOURCE 800
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 800
+#endif
+
 #include "config.h"
 
 #include <unistd.h>
@@ -24,8 +27,10 @@
 #include <syslog.h>
 #include <sys/uio.h>
 
-#include "debug.h"
+#define RAFT_API_SOURCE_SELF
+
 #include "raft.h"
+#include "debug.h"
 
 #ifdef TESTS
 # include "raft_test_api.h"
@@ -75,16 +80,6 @@ void sock_nodelay(int fd);
 void sock_reuse(int fd, int reuse);
 void sock_nonblock(int fd);
 void logger(int priority, const struct client *client, const char *format, ...);
-struct topic *find_topic(const uint8_t *name, bool active_only, bool need_lock);
-struct message *find_message_by_uuid(const uint8_t uuid[static const UUID_SIZE]);
-int attempt_save_all_topics(void);
-int save_topic(const struct topic *topic);
-struct topic *register_topic(const uint8_t *name,
-        const uint8_t uuid[const UUID_SIZE]
-#ifdef FEATURE_RAFT
-        , bool source_self
-#endif
-        );
 
 /* Forward decl */
 static struct raft_log *raft_alloc_log(raft_conn_t, raft_log_t);
