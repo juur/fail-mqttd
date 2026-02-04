@@ -33,23 +33,26 @@ extern const struct raft_impl *raft_impl;
 static int free_log_called;
 static int commit_called;
 
-static int test_free_log(struct raft_log *entry)
+static int test_free_log(struct raft_log *entry, raft_log_t event)
 {
 	(void)entry;
+	(void)event;
 	free_log_called++;
 	return 0;
 }
 
-static int test_commit_and_advance(struct raft_log *entry)
+static int test_apply(struct raft_log *entry, raft_log_t event)
 {
 	(void)entry;
+	(void)event;
 	commit_called++;
 	return 0;
 }
 
-static int test_save_log(const struct raft_log *entry, uint8_t **buf)
+static int test_save_log(const struct raft_log *entry, uint8_t **buf, raft_log_t event)
 {
 	(void)entry;
+	(void)event;
 	if (buf)
 		*buf = NULL;
 	return 0;
@@ -71,16 +74,25 @@ static raft_status_t test_process_packet(size_t *bytes_remaining,
 	return RAFT_OK;
 }
 
+static const struct raft_impl_limits test_limits[RAFT_MAX_LOG] = {
+	[RAFT_LOG_NOOP] = { 0, 0 },
+	[RAFT_LOG_REGISTER_TOPIC] = { 0, 0 },
+	[RAFT_LOG_UNREGISTER_TOPIC] = { 0, 0 },
+	[RAFT_LOG_REGISTER_SESSION] = { 0, 0 },
+	[RAFT_LOG_UNREGISTER_SESSION] = { 0, 0 },
+};
+
 static const struct raft_impl test_impl = {
 	.name = "conformance",
 	.num_log_types = RAFT_MAX_LOG,
+	.limits = test_limits,
 	.handlers = {
 		[RAFT_LOG_NOOP] = {
 			.save_log = test_save_log,
 		},
 		[RAFT_LOG_REGISTER_TOPIC] = {
 			.free_log = test_free_log,
-			.commit_and_advance = test_commit_and_advance,
+			.apply = test_apply,
 			.process_packet = test_process_packet,
 			.save_log = test_save_log,
 		},
@@ -307,6 +319,7 @@ static void assert_election_safety(void)
 	if (raft_state.state == RAFT_STATE_LEADER) {
 		ck_assert_uint_eq(client_state->current_leader_id, raft_state.self_id);
 		ck_assert_uint_eq(raft_state.voted_for, raft_state.self_id);
+		ck_assert(!raft_state.election);
 	}
 }
 
@@ -314,19 +327,45 @@ static void assert_log_matching(void)
 {
 	const struct raft_log *cur = raft_state.log_head;
 	uint32_t last_index = 0;
+	unsigned counted = 0;
+	uint32_t start_index = 0;
+
+	if (raft_state.log_head) {
+		ck_assert_uint_ge(raft_state.log_head->index, 1);
+		start_index = raft_state.log_head->index;
+		last_index = start_index - 1;
+	} else {
+		ck_assert_ptr_eq(raft_state.log_tail, NULL);
+	}
 
 	for (; cur; cur = cur->next) {
-		ck_assert(cur->index > last_index);
+		ck_assert_uint_gt(cur->index, last_index);
+		ck_assert_uint_eq(cur->index, last_index + 1);
+		ck_assert_uint_ge(cur->term, 1);
 		last_index = cur->index;
+		counted++;
+	}
+
+	ck_assert_uint_eq((unsigned)atomic_load(&raft_state.log_length), counted);
+	if (raft_state.log_tail) {
+		ck_assert_uint_eq(raft_state.log_tail->index, start_index + counted - 1);
+		ck_assert_ptr_eq(raft_state.log_tail->next, NULL);
+	} else {
+		ck_assert_uint_eq(counted, 0);
 	}
 }
 
 static void assert_leader_completeness(void)
 {
-	if (raft_state.log_tail)
+	if (raft_state.log_tail) {
 		ck_assert_uint_le(raft_state.commit_index, raft_state.log_tail->index);
-	else
+		if (raft_state.commit_index > 0 &&
+				raft_state.commit_index >= raft_state.log_head->index)
+			ck_assert_uint_ge(raft_test_api.raft_term_at(raft_state.commit_index), 1);
+	} else {
 		ck_assert_uint_eq(raft_state.commit_index, 0);
+	}
+	ck_assert_uint_le(raft_state.last_applied, raft_state.commit_index);
 }
 
 static void assert_monotonicity(struct conformance_ctx *ctx)
@@ -746,7 +785,7 @@ static bool impl_logs_match(const struct raft_state *lhs, const struct raft_stat
 			return false;
 		if (a->term != b->term)
 			return false;
-		if (a->event != b->event)
+		if (a->log_type != b->log_type)
 			return false;
 	}
 

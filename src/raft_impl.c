@@ -57,13 +57,17 @@ static int free_log(struct raft_log *lg, raft_log_t event)
     switch(event)
     {
         case RAFT_LOG_REGISTER_TOPIC:
-            if (entry->register_topic.name)
+            if (entry->register_topic.name) {
                 free(entry->register_topic.name);
+                entry->register_topic.name = NULL;
+            }
             break;
 
         case RAFT_LOG_REGISTER_SESSION:
-            if (entry->register_session.client_id)
+            if (entry->register_session.client_id) {
                 free(entry->register_session.client_id);
+                entry->register_session.client_id = NULL;
+            }
             break;
 
         default:

@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <signal.h>
 
 #include "raft.h"
 #include "raft_test_api.h"
@@ -32,24 +33,27 @@ extern in_port_t opt_port;
 static int free_log_called;
 static int commit_called;
 
-static int test_free_log(struct raft_log *entry)
+static int test_free_log(struct raft_log *entry, raft_log_t event)
 {
 	(void)entry;
+	(void)event;
 	free_log_called++;
 	return 0;
 }
 
-static int test_commit_and_advance(struct raft_log *entry)
+static int test_apply(struct raft_log *entry, raft_log_t event)
 {
 	(void)entry;
+	(void)event;
 	commit_called++;
 	return 0;
 }
 
-static int test_save_log(const struct raft_log *entry, uint8_t **buf)
+static int test_save_log(const struct raft_log *entry, uint8_t **buf, raft_log_t event)
 {
 	uint32_t value;
 
+	(void)event;
 	if (!buf) {
 		errno = EINVAL;
 		return -1;
@@ -64,18 +68,20 @@ static int test_save_log(const struct raft_log *entry, uint8_t **buf)
 	return (int)sizeof(value);
 }
 
-static int test_save_log_empty(const struct raft_log *entry, uint8_t **buf)
+static int test_save_log_empty(const struct raft_log *entry, uint8_t **buf, raft_log_t event)
 {
 	(void)entry;
+	(void)event;
 	if (buf)
 		*buf = NULL;
 	return 0;
 }
 
-static int test_read_log(struct raft_log *entry, const uint8_t *buf, int len)
+static int test_read_log(struct raft_log *entry, const uint8_t *buf, int len, raft_log_t event)
 {
 	uint32_t value;
 
+	(void)event;
 	if (!entry || !buf || len != (int)sizeof(value)) {
 		errno = EINVAL;
 		return -1;
@@ -86,9 +92,11 @@ static int test_read_log(struct raft_log *entry, const uint8_t *buf, int len)
 	return 0;
 }
 
-static int test_pre_send_empty(struct raft_log *entry, struct send_state *state)
+static int test_size_send_empty(struct raft_log *entry, struct send_state *state,
+		raft_log_t event)
 {
 	(void)entry;
+	(void)event;
 	if (!state) {
 		errno = EINVAL;
 		return -1;
@@ -97,11 +105,32 @@ static int test_pre_send_empty(struct raft_log *entry, struct send_state *state)
 	return 0;
 }
 
-static int test_fill_send_empty(struct send_state *state, const struct raft_log *entry)
+static int test_fill_send_empty(struct send_state *state, const struct raft_log *entry,
+		raft_log_t event)
 {
 	(void)state;
 	(void)entry;
+	(void)event;
 	return 0;
+}
+
+static int test_fill_send_fail(struct send_state *state, const struct raft_log *entry,
+		raft_log_t event)
+{
+	(void)state;
+	(void)entry;
+	(void)event;
+	errno = EIO;
+	return -1;
+}
+
+static int test_fill_send_overflow(struct send_state *state, const struct raft_log *entry,
+		raft_log_t event)
+{
+	(void)state;
+	(void)entry;
+	(void)event;
+	return (int)USHRT_MAX + 1;
 }
 
 static raft_status_t test_process_packet_fail(size_t *bytes_remaining,
@@ -117,25 +146,89 @@ static raft_status_t test_process_packet_fail(size_t *bytes_remaining,
 	return -1;
 }
 
-static int test_pre_send_fail_overflow(struct raft_log *entry, struct send_state *state)
+static int test_size_send_fail_overflow(struct raft_log *entry, struct send_state *state,
+		raft_log_t event)
 {
 	(void)entry;
 	(void)state;
+	(void)event;
 	errno = EOVERFLOW;
 	return -1;
 }
 
+static int test_size_send_too_large(struct raft_log *entry, struct send_state *state,
+		raft_log_t event)
+{
+	(void)entry;
+	(void)event;
+	if (!state) {
+		errno = EINVAL;
+		return -1;
+	}
+	state->arg_req_len = 1;
+	return 0;
+}
+
+static int test_save_log_fail(const struct raft_log *entry, uint8_t **buf, raft_log_t event)
+{
+	(void)entry;
+	(void)buf;
+	(void)event;
+	errno = EIO;
+	return -1;
+}
+
+static const struct raft_impl_limits test_limits[RAFT_MAX_LOG] = {
+	[RAFT_LOG_NOOP] = { 0, 0 },
+	[RAFT_LOG_REGISTER_TOPIC] = { 0, 0 },
+	[RAFT_LOG_UNREGISTER_TOPIC] = { 0, 0 },
+	[RAFT_LOG_REGISTER_SESSION] = { 0, 0 },
+	[RAFT_LOG_UNREGISTER_SESSION] = { 0, 0 },
+};
+
+static const struct raft_impl_limits tiny_limits[RAFT_MAX_LOG] = {
+	[RAFT_LOG_NOOP] = { 0, 0 },
+	[RAFT_LOG_REGISTER_TOPIC] = { 0, 0 },
+	[RAFT_LOG_UNREGISTER_TOPIC] = { 0, 0 },
+	[RAFT_LOG_REGISTER_SESSION] = { 0, 0 },
+	[RAFT_LOG_UNREGISTER_SESSION] = { 0, 0 },
+};
+
+static const struct raft_impl save_fail_impl = {
+	.name = "save-fail",
+	.num_log_types = RAFT_MAX_LOG,
+	.limits = test_limits,
+	.handlers = {
+		[RAFT_LOG_REGISTER_TOPIC] = {
+			.save_log = test_save_log_fail,
+		},
+	},
+};
+
+static const struct raft_impl size_send_too_large_impl = {
+	.name = "size-send-too-large",
+	.num_log_types = RAFT_MAX_LOG,
+	.limits = tiny_limits,
+	.handlers = {
+		[RAFT_LOG_REGISTER_TOPIC] = {
+			.size_send = test_size_send_too_large,
+			.save_log = test_save_log,
+		},
+	},
+};
+
 static const struct raft_impl test_impl = {
 	.name = "test",
 	.num_log_types = RAFT_MAX_LOG,
+	.limits = test_limits,
 	.handlers = {
 		[RAFT_LOG_NOOP] = {
 			.save_log = test_save_log_empty,
 		},
 		[RAFT_LOG_REGISTER_TOPIC] = {
 			.free_log = test_free_log,
-			.commit_and_advance = test_commit_and_advance,
-			.pre_send = test_pre_send_empty,
+			.apply = test_apply,
+			.size_send = test_size_send_empty,
 			.fill_send = test_fill_send_empty,
 			.save_log = test_save_log,
 			.read_log = test_read_log,
@@ -146,6 +239,7 @@ static const struct raft_impl test_impl = {
 static const struct raft_impl fail_impl = {
 	.name = "fail",
 	.num_log_types = RAFT_MAX_LOG,
+	.limits = test_limits,
 	.handlers = {
 		[RAFT_LOG_REGISTER_TOPIC] = {
 			.process_packet = test_process_packet_fail,
@@ -156,9 +250,34 @@ static const struct raft_impl fail_impl = {
 static const struct raft_impl pre_send_overflow_impl = {
 	.name = "pre-send-overflow",
 	.num_log_types = RAFT_MAX_LOG,
+	.limits = test_limits,
 	.handlers = {
 		[RAFT_LOG_REGISTER_TOPIC] = {
-			.pre_send = test_pre_send_fail_overflow,
+			.size_send = test_size_send_fail_overflow,
+		},
+	},
+};
+
+static const struct raft_impl fill_send_fail_impl = {
+	.name = "fill-send-fail",
+	.num_log_types = RAFT_MAX_LOG,
+	.limits = test_limits,
+	.handlers = {
+		[RAFT_LOG_REGISTER_TOPIC] = {
+			.size_send = test_size_send_empty,
+			.fill_send = test_fill_send_fail,
+		},
+	},
+};
+
+static const struct raft_impl fill_send_overflow_impl = {
+	.name = "fill-send-overflow",
+	.num_log_types = RAFT_MAX_LOG,
+	.limits = test_limits,
+	.handlers = {
+		[RAFT_LOG_REGISTER_TOPIC] = {
+			.size_send = test_size_send_empty,
+			.fill_send = test_fill_send_overflow,
 		},
 	},
 };
@@ -218,6 +337,30 @@ static void destroy_entry_locks(struct raft_host_entry *entry)
 {
 	pthread_rwlock_destroy(&entry->wr_lock);
 	pthread_rwlock_destroy(&entry->ss_lock);
+}
+
+static struct raft_host_entry *alloc_peers(unsigned count)
+{
+	struct raft_host_entry *peers = calloc(count, sizeof(*peers));
+
+	ck_assert_ptr_nonnull(peers);
+	for (unsigned idx = 0; idx < count; idx++) {
+		init_entry_locks(&peers[idx]);
+		peers[idx].peer_fd = -1;
+		peers[idx].server_id = idx + 1;
+	}
+
+	return peers;
+}
+
+static void free_peers(struct raft_host_entry *peers, unsigned count)
+{
+	if (!peers)
+		return;
+
+	for (unsigned idx = 0; idx < count; idx++)
+		destroy_entry_locks(&peers[idx]);
+	free(peers);
 }
 
 static int redirect_stderr_to_null(int *saved_fd)
@@ -503,6 +646,72 @@ START_TEST(test_save_state_header_only_preserves_log)
 }
 END_TEST
 
+START_TEST(test_save_state_vars_self_id_zero)
+{
+	raft_state.self_id = 0;
+	init_state_filenames();
+
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_save_state_vars(), -1);
+	ck_assert_int_eq(errno, EALREADY);
+}
+END_TEST
+
+START_TEST(test_save_state_log_save_log_error)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	const struct raft_impl *saved_impl = raft_impl;
+	struct raft_log *log1;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	init_state_filenames();
+
+	log1 = make_log(1, 1);
+	ck_assert_int_eq(raft_test_api.raft_append_log(log1, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
+
+	raft_impl = &save_fail_impl;
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_save_state_log(false), -1);
+	ck_assert_int_eq(errno, EIO);
+	raft_impl = saved_impl;
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_save_state_vars_open_fail)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	char no_write[PATH_MAX];
+	const char *suffix = "/nowrite";
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	ck_assert(strlen(tmpdir) + strlen(suffix) + 1 < sizeof(no_write));
+	ck_assert_int_gt(snprintf(no_write, sizeof(no_write), "%s%s", tmpdir, suffix), 0);
+	ck_assert_int_eq(mkdir(no_write, 0500), 0);
+
+	raft_state.self_id = 1;
+	ck_assert(strlen(no_write) + strlen("/vars.bin") + 1 < sizeof(raft_state.fn_vars_new));
+	ck_assert_int_gt(snprintf(raft_state.fn_vars_new, sizeof(raft_state.fn_vars_new),
+			"%s/vars.bin", no_write), 0);
+	ck_assert_int_gt(snprintf(raft_state.fn_vars, sizeof(raft_state.fn_vars),
+			"%s/vars.bin", no_write), 0);
+
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_save_state_vars(), -1);
+	ck_assert_int_ne(errno, 0);
+
+	rmdir(no_write);
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
 START_TEST(test_load_state_missing_file)
 {
 	char tmpdir[PATH_MAX];
@@ -522,6 +731,60 @@ START_TEST(test_load_state_missing_file)
 
 	ck_assert_ptr_eq(raft_state.log_head, NULL);
 	ck_assert_uint_eq(raft_state.commit_index, 0);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_load_state_vars_short_read)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	int saved_stderr = -1;
+	int fd;
+	uint32_t value = 1;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	init_state_filenames();
+
+	fd = open(raft_state.fn_vars, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	ck_assert_int_ne(fd, -1);
+	ck_assert_int_eq(write(fd, &value, sizeof(value)), (int)sizeof(value));
+	close(fd);
+
+	ck_assert_int_eq(redirect_stderr_to_null(&saved_stderr), 0);
+	ck_assert_int_eq(raft_test_api.raft_load_state_vars(), -1);
+	restore_stderr(saved_stderr);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_load_state_read_log_error)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+	int saved_stderr = -1;
+	int fd;
+	uint32_t header[TEST_RSL_HDR_SIZE] = { 1, 1, RAFT_LOG_REGISTER_TOPIC, 2 };
+	uint8_t log_bytes[2] = { 0x12, 0x34 };
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	init_state_filenames();
+
+	fd = open(raft_state.fn_log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	ck_assert_int_ne(fd, -1);
+	ck_assert_int_eq(write(fd, header, sizeof(header)), (int)sizeof(header));
+	ck_assert_int_eq(write(fd, log_bytes, sizeof(log_bytes)), (int)sizeof(log_bytes));
+	close(fd);
+
+	ck_assert_int_eq(redirect_stderr_to_null(&saved_stderr), 0);
+	ck_assert_int_eq(raft_test_api.raft_load_state_logs(), -1);
+	restore_stderr(saved_stderr);
 
 	leave_temp_dir(tmpdir, saved_cwd_fd);
 }
@@ -1177,6 +1440,73 @@ START_TEST(test_try_write_invalid)
 }
 END_TEST
 
+START_TEST(test_try_write_eagain)
+{
+	struct raft_host_entry entry;
+	int fds[2];
+	uint8_t scratch[PIPE_BUF];
+	ssize_t filled;
+
+	ck_assert_int_eq(pipe(fds), 0);
+	ck_assert_int_eq(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+
+	memset(scratch, 'A', sizeof(scratch));
+	filled = fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
+	ck_assert_int_ge(filled, 0);
+
+	memset(&entry, 0, sizeof(entry));
+	init_entry_locks(&entry);
+	entry.peer_fd = fds[1];
+
+	ck_assert_int_eq(raft_test_api.raft_add_write(&entry,
+				(uint8_t *)malloc(sizeof(scratch)), sizeof(scratch)), 0);
+
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_try_write(&entry), -1);
+	ck_assert_int_eq(errno, EAGAIN);
+	ck_assert_ptr_nonnull(entry.wr_active);
+	ck_assert_int_eq(entry.peer_fd, fds[1]);
+
+	raft_test_api.raft_reset_write_state(&entry, true);
+	close(fds[0]);
+	close(fds[1]);
+	destroy_entry_locks(&entry);
+}
+END_TEST
+
+START_TEST(test_try_write_error_closes)
+{
+	struct raft_host_entry entry;
+	int fds[2];
+	struct sigaction old_action;
+	struct sigaction action;
+
+	ck_assert_int_eq(pipe(fds), 0);
+	close(fds[0]);
+
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = SIG_IGN;
+	ck_assert_int_eq(sigaction(SIGPIPE, &action, &old_action), 0);
+
+	memset(&entry, 0, sizeof(entry));
+	init_entry_locks(&entry);
+	entry.peer_fd = fds[1];
+
+	ck_assert_int_eq(raft_test_api.raft_add_write(&entry,
+				(uint8_t *)malloc(4), 4), 0);
+
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_try_write(&entry), -1);
+	ck_assert_int_eq(errno, EPIPE);
+	ck_assert_int_eq(entry.peer_fd, -1);
+
+	raft_test_api.raft_reset_write_state(&entry, true);
+	close(fds[1]);
+	destroy_entry_locks(&entry);
+	ck_assert_int_eq(sigaction(SIGPIPE, &old_action, NULL), 0);
+}
+END_TEST
+
 START_TEST(test_has_pending_write)
 {
 	struct raft_host_entry entry;
@@ -1348,6 +1678,40 @@ static ssize_t read_full(int fd, uint8_t *buf, size_t len)
 	}
 
 	return (ssize_t)offset;
+}
+
+struct sendv_thread_ctx {
+	int rc;
+};
+
+static void *sendv_thread(void *arg)
+{
+	struct sendv_thread_ctx *ctx = arg;
+
+	ctx->rc = call_client_log_sendv(RAFT_LOG_REGISTER_TOPIC);
+	return NULL;
+}
+
+struct client_send_thread_ctx {
+	int rc;
+	raft_log_t event;
+};
+
+static void *client_send_thread(void *arg)
+{
+	struct client_send_thread_ctx *ctx = arg;
+
+	ctx->rc = raft_client_log_send(ctx->event);
+	return NULL;
+}
+
+static void sleep_ms(unsigned ms)
+{
+	struct timespec ts;
+
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+	(void)nanosleep(&ts, NULL);
 }
 
 START_TEST(test_new_conn_success)
@@ -2001,8 +2365,8 @@ START_TEST(test_recv_header_max_size)
 	client.peer_fd = fds[0];
 	client.rd_state = RAFT_PCK_NEW;
 
-	fill_header(header, RAFT_CLIENT_REQUEST_REPLY,
-			RAFT_HDR_SIZE + RAFT_CLIENT_REQUEST_REPLY_SIZE + 1);
+	fill_header(header, RAFT_REQUEST_VOTE,
+			RAFT_HDR_SIZE + RAFT_REQUEST_VOTE_SIZE + 1);
 
 	ck_assert_int_eq(write(fds[1], header, sizeof(header)), (ssize_t)sizeof(header));
 	errno = 0;
@@ -2340,6 +2704,81 @@ START_TEST(test_recv_full_packet_success)
 }
 END_TEST
 
+START_TEST(test_is_leader)
+{
+	raft_state.state = RAFT_STATE_LEADER;
+	ck_assert(raft_is_leader());
+
+	raft_state.state = RAFT_STATE_FOLLOWER;
+	ck_assert(!raft_is_leader());
+}
+END_TEST
+
+START_TEST(test_get_leader_address_too_small)
+{
+	char buf[INET_ADDRSTRLEN + 1 + 5 + 1];
+
+	errno = 0;
+	ck_assert_int_eq(raft_get_leader_address(buf, 4), -1);
+	ck_assert_int_eq(errno, ENOSPC);
+}
+END_TEST
+
+START_TEST(test_get_leader_address_success)
+{
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry leader;
+	char buf[INET_ADDRSTRLEN + 1 + 5 + 1];
+	struct in_addr addr;
+
+	memset(&leader, 0, sizeof(leader));
+	ck_assert_int_eq(inet_pton(AF_INET, "127.0.0.1", &addr), 1);
+	leader.mqtt_addr = addr;
+	leader.mqtt_port = htons(1883);
+
+	client_state->current_leader = &leader;
+
+	ck_assert_int_eq(raft_get_leader_address(buf, sizeof(buf)), 0);
+	ck_assert_str_eq(buf, "127.0.0.1:1883");
+
+	client_state->current_leader = NULL;
+}
+END_TEST
+
+START_TEST(test_get_leader_address_no_leader)
+{
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	char buf[INET_ADDRSTRLEN + 1 + 5 + 1];
+
+	memset(buf, 0xAA, sizeof(buf));
+	client_state->current_leader = NULL;
+	client_state->current_leader_id = NULL_ID;
+
+	ck_assert_int_eq(raft_get_leader_address(buf, sizeof(buf)), -1);
+}
+END_TEST
+
+START_TEST(test_get_leader_address_no_addr)
+{
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry leader;
+	char buf[INET_ADDRSTRLEN + 1 + 5 + 1];
+
+	memset(&leader, 0, sizeof(leader));
+	memset(buf, 0xAA, sizeof(buf));
+
+	leader.mqtt_addr.s_addr = 0;
+	leader.mqtt_port = htons(1883);
+	client_state->current_leader = &leader;
+	client_state->current_leader_id = 1;
+
+	ck_assert_int_eq(raft_get_leader_address(buf, sizeof(buf)), -1);
+
+	client_state->current_leader = NULL;
+	client_state->current_leader_id = NULL_ID;
+}
+END_TEST
+
 START_TEST(test_send_invalid_rpc)
 {
 	struct raft_host_entry client;
@@ -2401,6 +2840,182 @@ START_TEST(test_send_hello_success)
 	close(fds[0]);
 	close(fds[1]);
 	destroy_entry_locks(&client);
+}
+END_TEST
+
+START_TEST(test_send_broadcast_peers)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry *peers;
+	int fds1[2];
+	int fds2[2];
+	uint8_t packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+	int idx;
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds1), 0);
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds2), 0);
+
+	peers = calloc(3, sizeof(*peers));
+	ck_assert_ptr_nonnull(peers);
+	init_entry_locks(&peers[0]);
+	init_entry_locks(&peers[1]);
+	init_entry_locks(&peers[2]);
+	peers[0].server_id = 1;
+	peers[0].peer_fd = -1;
+	peers[1].server_id = 2;
+	peers[1].peer_fd = -1;
+	peers[1].port = htons(9999);
+	peers[2].server_id = 3;
+	peers[2].peer_fd = fds2[0];
+	peers[2].port = htons(9998);
+	*peers_ptr = peers;
+	*num_ptr = 3;
+
+	raft_state.self_id = 1;
+	client_state->unknown_clients = NULL;
+
+	fill_hello_packet(packet, 2, RAFT_PEER, RAFT_PEER, INADDR_LOOPBACK, 1883);
+	ck_assert_int_eq(write(fds1[1], packet, sizeof(packet)), (ssize_t)sizeof(packet));
+	idx = raft_test_api.raft_new_conn(fds1[0], NULL, NULL, 0);
+	if (idx == -1 && errno == EAGAIN) {
+		struct raft_host_entry *unknown = client_state->unknown_clients;
+		ck_assert_ptr_nonnull(unknown);
+		idx = raft_test_api.raft_new_conn(-1, unknown, NULL, 0);
+	}
+	ck_assert_int_eq(idx, 1);
+
+	ck_assert_int_eq(raft_send(RAFT_PEER, NULL, RAFT_HELLO, 42U, RAFT_PEER), 2);
+
+	ck_assert_int_eq(read_full(fds1[1], packet, sizeof(packet)),
+			(ssize_t)sizeof(packet));
+	ck_assert_int_eq(packet[0], RAFT_HELLO);
+	ck_assert_int_eq(packet[2], RAFT_PEER);
+
+	ck_assert_int_eq(read_full(fds2[1], packet, sizeof(packet)),
+			(ssize_t)sizeof(packet));
+	ck_assert_int_eq(packet[0], RAFT_HELLO);
+	ck_assert_int_eq(packet[2], RAFT_PEER);
+
+	close(fds1[0]);
+	close(fds1[1]);
+	close(fds2[0]);
+	close(fds2[1]);
+	destroy_entry_locks(&peers[0]);
+	destroy_entry_locks(&peers[1]);
+	destroy_entry_locks(&peers[2]);
+	free(peers);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
+START_TEST(test_send_broadcast_try_write_eagain)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry *peers;
+	int hello_fds[2];
+	int fds[2];
+	uint8_t packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+	uint8_t scratch[PIPE_BUF];
+	ssize_t filled;
+	int idx;
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, hello_fds), 0);
+	ck_assert_int_eq(pipe(fds), 0);
+	ck_assert_int_eq(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+
+	memset(scratch, 'A', sizeof(scratch));
+	filled = fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
+	ck_assert_int_ge(filled, 0);
+
+	peers = alloc_peers(2);
+	peers[1].server_id = 2;
+	peers[1].peer_fd = -1;
+	peers[1].port = htons(9999);
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	raft_state.self_id = 1;
+	client_state->unknown_clients = NULL;
+
+	fill_hello_packet(packet, 2, RAFT_PEER, RAFT_PEER, INADDR_LOOPBACK, 1883);
+	ck_assert_int_eq(write(hello_fds[1], packet, sizeof(packet)), (ssize_t)sizeof(packet));
+	idx = raft_test_api.raft_new_conn(hello_fds[0], NULL, NULL, 0);
+	if (idx == -1 && errno == EAGAIN) {
+		struct raft_host_entry *unknown = client_state->unknown_clients;
+		ck_assert_ptr_nonnull(unknown);
+		idx = raft_test_api.raft_new_conn(-1, unknown, NULL, 0);
+	}
+	ck_assert_int_eq(idx, 1);
+
+	close(hello_fds[0]);
+	close(hello_fds[1]);
+
+	peers[1].peer_fd = fds[1];
+	ck_assert_int_eq(raft_send(RAFT_PEER, NULL, RAFT_HELLO, 42U, RAFT_PEER), 0);
+	ck_assert_int_eq(peers[1].peer_fd, fds[1]);
+
+	raft_test_api.raft_reset_write_state(&peers[1], true);
+	close(fds[0]);
+	close(fds[1]);
+	free_peers(peers, 2);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
+START_TEST(test_send_broadcast_add_write_failure_closes)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry *peers;
+	int hello_fds[2];
+	int fds[2];
+	uint8_t packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+	int idx;
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, hello_fds), 0);
+	ck_assert_int_eq(pipe(fds), 0);
+
+	peers = alloc_peers(2);
+	peers[1].server_id = 2;
+	peers[1].peer_fd = -1;
+	peers[1].port = htons(9999);
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	raft_state.self_id = 1;
+	client_state->unknown_clients = NULL;
+
+	fill_hello_packet(packet, 2, RAFT_PEER, RAFT_PEER, INADDR_LOOPBACK, 1883);
+	ck_assert_int_eq(write(hello_fds[1], packet, sizeof(packet)), (ssize_t)sizeof(packet));
+	idx = raft_test_api.raft_new_conn(hello_fds[0], NULL, NULL, 0);
+	if (idx == -1 && errno == EAGAIN) {
+		struct raft_host_entry *unknown = client_state->unknown_clients;
+		ck_assert_ptr_nonnull(unknown);
+		idx = raft_test_api.raft_new_conn(-1, unknown, NULL, 0);
+	}
+	ck_assert_int_eq(idx, 1);
+
+	close(hello_fds[0]);
+	close(hello_fds[1]);
+
+	peers[1].peer_fd = fds[1];
+	peers[1].wr_queue = 11;
+
+	ck_assert_int_eq(raft_send(RAFT_PEER, NULL, RAFT_HELLO, 42U, RAFT_PEER), 0);
+	ck_assert_int_eq(peers[1].peer_fd, -1);
+
+	close(fds[0]);
+	close(fds[1]);
+	free_peers(peers, 2);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
 }
 END_TEST
 
@@ -2637,6 +3252,67 @@ START_TEST(test_send_append_entries_null_entries)
 }
 END_TEST
 
+START_TEST(test_send_server_bad_fd)
+{
+	struct raft_host_entry client;
+
+	memset(&client, 0, sizeof(client));
+	init_entry_locks(&client);
+	client.peer_fd = -1;
+
+	errno = 0;
+	ck_assert_int_eq(raft_send(RAFT_SERVER, &client, RAFT_HELLO,
+				1U, (raft_conn_t)RAFT_CLIENT), -1);
+	ck_assert_int_eq(errno, EBADF);
+
+	destroy_entry_locks(&client);
+}
+END_TEST
+
+START_TEST(test_send_client_bad_fd)
+{
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry leader;
+
+	memset(&leader, 0, sizeof(leader));
+	init_entry_locks(&leader);
+	leader.peer_fd = -1;
+	client_state->current_leader = &leader;
+
+	errno = 0;
+	ck_assert_int_eq(raft_send(RAFT_CLIENT, NULL, RAFT_HELLO,
+				1U, (raft_conn_t)RAFT_CLIENT), -1);
+	ck_assert_int_eq(errno, EBADF);
+
+	client_state->current_leader = NULL;
+	destroy_entry_locks(&leader);
+}
+END_TEST
+
+START_TEST(test_send_add_write_enospc)
+{
+	struct raft_host_entry client;
+	int fds[2];
+
+	ck_assert_int_eq(pipe(fds), 0);
+
+	memset(&client, 0, sizeof(client));
+	init_entry_locks(&client);
+	client.peer_fd = fds[1];
+	client.wr_queue = 11;
+
+	errno = 0;
+	ck_assert_int_eq(raft_send(RAFT_SERVER, &client, RAFT_HELLO,
+				1U, (raft_conn_t)RAFT_CLIENT), -1);
+	ck_assert_int_eq(errno, ENOSPC);
+	ck_assert_int_eq(client.peer_fd, fds[1]);
+
+	close(fds[0]);
+	close(fds[1]);
+	destroy_entry_locks(&client);
+}
+END_TEST
+
 START_TEST(test_send_client_request_invalid_type)
 {
 	struct raft_host_entry client;
@@ -2659,10 +3335,12 @@ START_TEST(test_send_client_request_invalid_type)
 }
 END_TEST
 
-START_TEST(test_send_client_request_reply_invalid_log_type)
+START_TEST(test_send_client_request_reply_allows_unknown_log_type)
 {
 	struct raft_host_entry client;
 	int fds[2];
+	uint8_t packet[RAFT_HDR_SIZE + RAFT_CLIENT_REQUEST_REPLY_SIZE];
+	uint32_t length;
 
 	ck_assert_int_eq(pipe(fds), 0);
 
@@ -2672,12 +3350,372 @@ START_TEST(test_send_client_request_reply_invalid_log_type)
 
 	errno = 0;
 	ck_assert_int_eq(raft_send(RAFT_SERVER, &client, RAFT_CLIENT_REQUEST_REPLY,
-				RAFT_OK, RAFT_MAX_LOG, 1, 1), -1);
-	ck_assert_int_eq(errno, EINVAL);
+				RAFT_OK, RAFT_MAX_LOG, 1, 1), 1);
+	ck_assert_int_eq(read_full(fds[0], packet, sizeof(packet)),
+			(ssize_t)sizeof(packet));
+
+	memcpy(&length, packet + 4, sizeof(length));
+	length = ntohl(length);
+	ck_assert_uint_eq(length, (uint32_t)sizeof(packet));
+	ck_assert_int_eq(packet[RAFT_HDR_SIZE], RAFT_OK);
+	ck_assert_int_eq(packet[RAFT_HDR_SIZE + 1], RAFT_MAX_LOG);
 
 	close(fds[0]);
 	close(fds[1]);
 	destroy_entry_locks(&client);
+}
+END_TEST
+
+START_TEST(test_leader_log_append_wrapper)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	raft_state.current_term = 1;
+	init_state_filenames();
+
+	ck_assert_int_eq(raft_leader_log_append(RAFT_LOG_NOOP), 0);
+	ck_assert_ptr_nonnull(raft_state.log_head);
+	ck_assert_uint_eq(raft_state.log_head->log_type, RAFT_LOG_NOOP);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_client_log_send_leader_path)
+{
+	char tmpdir[PATH_MAX];
+	int saved_cwd_fd = -1;
+
+	ck_assert_int_eq(enter_temp_dir(tmpdir, sizeof(tmpdir), &saved_cwd_fd), 0);
+
+	raft_state.self_id = 1;
+	raft_state.current_term = 1;
+	raft_state.state = RAFT_STATE_LEADER;
+	init_state_filenames();
+
+	ck_assert_int_eq(raft_client_log_send(RAFT_LOG_NOOP), 0);
+	ck_assert_ptr_nonnull(raft_state.log_head);
+	ck_assert_uint_eq(raft_state.log_head->log_type, RAFT_LOG_NOOP);
+
+	leave_temp_dir(tmpdir, saved_cwd_fd);
+}
+END_TEST
+
+START_TEST(test_client_log_send_follower_path)
+{
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry leader;
+	struct raft_host_entry client;
+	int fds[2];
+	pthread_t tid;
+	struct client_send_thread_ctx ctx = { .rc = -1, .event = RAFT_LOG_REGISTER_TOPIC };
+	uint8_t payload[RAFT_CLIENT_REQUEST_REPLY_SIZE];
+	int ready = 0;
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+	memset(&leader, 0, sizeof(leader));
+	init_entry_locks(&leader);
+	leader.peer_fd = fds[1];
+	client_state->current_leader = &leader;
+
+	raft_state.self_id = 1;
+	raft_state.state = RAFT_STATE_FOLLOWER;
+	atomic_store(&client_state->sequence_num, 0);
+
+	ck_assert_int_eq(pthread_create(&tid, NULL, client_send_thread, &ctx), 0);
+
+	for (int i = 0; i < 100; i++) {
+		if (client_state->log_pending_head) {
+			ready = 1;
+			break;
+		}
+		sleep_ms(1);
+	}
+	ck_assert(ready);
+
+	memset(&client, 0, sizeof(client));
+	fill_client_request_reply_payload(payload, RAFT_OK, RAFT_LOG_REGISTER_TOPIC,
+			raft_state.self_id, 1);
+	client.rd_packet_buffer = payload;
+	client.rd_packet_length = sizeof(payload);
+
+	ck_assert_int_eq(raft_test_api.raft_process_packet(&client, RAFT_CLIENT_REQUEST_REPLY), 0);
+	ck_assert_int_eq(pthread_join(tid, NULL), 0);
+	ck_assert_int_eq(ctx.rc, 0);
+
+	close(fds[0]);
+	close(fds[1]);
+	destroy_entry_locks(&leader);
+	client_state->current_leader = NULL;
+}
+END_TEST
+
+START_TEST(test_client_log_sendv_success)
+{
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry leader;
+	struct raft_host_entry client;
+	int fds[2];
+	pthread_t tid;
+	struct sendv_thread_ctx ctx = { .rc = -1 };
+	uint8_t payload[RAFT_CLIENT_REQUEST_REPLY_SIZE];
+	int ready = 0;
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+	memset(&leader, 0, sizeof(leader));
+	init_entry_locks(&leader);
+	leader.peer_fd = fds[1];
+	client_state->current_leader = &leader;
+
+	raft_state.self_id = 1;
+	atomic_store(&client_state->sequence_num, 0);
+
+	ck_assert_int_eq(pthread_create(&tid, NULL, sendv_thread, &ctx), 0);
+
+	for (int i = 0; i < 100; i++) {
+		if (client_state->log_pending_head) {
+			ready = 1;
+			break;
+		}
+		sleep_ms(1);
+	}
+	ck_assert(ready);
+
+	memset(&client, 0, sizeof(client));
+	fill_client_request_reply_payload(payload, RAFT_OK, RAFT_LOG_REGISTER_TOPIC,
+			raft_state.self_id, 1);
+	client.rd_packet_buffer = payload;
+	client.rd_packet_length = sizeof(payload);
+
+	ck_assert_int_eq(raft_test_api.raft_process_packet(&client, RAFT_CLIENT_REQUEST_REPLY), 0);
+	ck_assert_int_eq(pthread_join(tid, NULL), 0);
+	ck_assert_int_eq(ctx.rc, 0);
+
+	close(fds[0]);
+	close(fds[1]);
+	destroy_entry_locks(&leader);
+	client_state->current_leader = NULL;
+}
+END_TEST
+
+START_TEST(test_tick_follower_timeout_single_node)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_host_entry *peers;
+
+	peers = alloc_peers(1);
+	*peers_ptr = peers;
+	*num_ptr = 1;
+
+	raft_state.self_id = 1;
+	raft_state.state = RAFT_STATE_FOLLOWER;
+	raft_state.current_term = 1;
+	raft_state.voted_for = NULL_ID;
+	raft_state.election_timer = 0;
+
+	ck_assert_int_eq(raft_test_api.raft_tick(), 0);
+	ck_assert_int_eq(raft_state.state, RAFT_STATE_LEADER);
+	ck_assert_uint_eq(raft_state.current_term, 2);
+	ck_assert(!raft_state.election);
+
+	free_peers(peers, 1);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
+START_TEST(test_tick_candidate_resend_votes)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_host_entry *peers;
+	int fds[2];
+	timems_t before;
+
+	ck_assert_int_eq(pipe(fds), 0);
+
+	peers = alloc_peers(2);
+	peers[1].peer_fd = fds[1];
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	raft_state.state = RAFT_STATE_CANDIDATE;
+	raft_state.current_term = 2;
+	raft_state.election = true;
+	raft_state.election_timer = raft_test_api.timems() + 1000;
+	raft_state.next_request_vote = 0;
+
+	before = raft_test_api.timems();
+	ck_assert_int_eq(raft_test_api.raft_tick(), 0);
+	ck_assert(raft_state.next_request_vote > before);
+
+	close(fds[0]);
+	close(fds[1]);
+	free_peers(peers, 2);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
+START_TEST(test_request_votes_missing_term)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_host_entry *peers;
+	struct raft_log *tail;
+
+	peers = alloc_peers(2);
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	tail = make_log(1, 1);
+	raft_state.log_head = NULL;
+	raft_state.log_tail = tail;
+
+	errno = 0;
+	ck_assert_int_eq(raft_test_api.raft_request_votes(), -1);
+	ck_assert_int_eq(errno, ENOENT);
+
+	raft_state.log_tail = NULL;
+	raft_test_api.raft_free_log(tail);
+	free_peers(peers, 2);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
+START_TEST(test_tick_leader_heartbeat_and_replication)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_host_entry *peers;
+	struct raft_log *entry;
+	int fds[2];
+	uint8_t scratch[256];
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+	peers = alloc_peers(2);
+	peers[1].peer_fd = fds[1];
+	peers[1].port = 0;
+	peers[1].next_index = 1;
+	peers[1].last_leader_sync = 0;
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	entry = make_log(1, 1);
+	raft_state.log_head = entry;
+	raft_state.log_tail = entry;
+	atomic_store(&raft_state.log_length, 1);
+	raft_state.state = RAFT_STATE_LEADER;
+	raft_state.current_term = 1;
+	raft_state.commit_index = 0;
+	raft_state.next_ping = 0;
+
+	ck_assert_int_eq(raft_test_api.raft_tick(), 0);
+	{
+		ssize_t rc = read(fds[0], scratch, sizeof(scratch));
+		(void)rc;
+	}
+
+	close(fds[0]);
+	close(fds[1]);
+	free_peers(peers, 2);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
+START_TEST(test_send_log_to_peers_size_too_large)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_host_entry *peers;
+	const struct raft_impl *saved_impl = raft_impl;
+	int fds[2];
+
+	ck_assert_int_eq(pipe(fds), 0);
+
+	peers = alloc_peers(2);
+	peers[1].peer_fd = fds[1];
+	peers[1].next_index = 1;
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	raft_state.self_id = 1;
+	raft_state.current_term = 1;
+
+	raft_impl = &size_send_too_large_impl;
+	ck_assert_int_eq(raft_leader_log_append(RAFT_LOG_REGISTER_TOPIC), 0);
+	raft_impl = saved_impl;
+
+	close(fds[0]);
+	close(fds[1]);
+	free_peers(peers, 2);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
+START_TEST(test_tick_connection_check_connect_success)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_host_entry *peers;
+	int listen_fd;
+	struct sockaddr_in sin;
+	socklen_t sin_len = sizeof(sin);
+	int accepted = -1;
+	int flags;
+
+	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (listen_fd == -1) {
+		if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+				errno == EPERM || errno == EACCES)
+			return;
+		ck_abort_msg("socket(AF_INET) failed: %s", strerror(errno));
+	}
+	flags = fcntl(listen_fd, F_GETFL);
+	if (flags != -1)
+		(void)fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	sin.sin_port = 0;
+	ck_assert_int_eq(bind(listen_fd, (struct sockaddr *)&sin, sizeof(sin)), 0);
+	ck_assert_int_eq(listen(listen_fd, 1), 0);
+	ck_assert_int_eq(getsockname(listen_fd, (struct sockaddr *)&sin, &sin_len), 0);
+
+	peers = alloc_peers(2);
+	peers[1].address = sin.sin_addr;
+	peers[1].port = sin.sin_port;
+	peers[1].next_conn_attempt = 0;
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	ck_assert_int_eq(raft_test_api.raft_tick_connection_check(), 0);
+	ck_assert_int_ne(peers[1].peer_fd, -1);
+
+	for (int tries = 0; tries < 40 && accepted == -1; tries++) {
+		accepted = accept(listen_fd, NULL, NULL);
+		if (accepted == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			sleep_ms(5);
+	}
+	if (accepted != -1)
+		close(accepted);
+
+	raft_test_api.raft_close(&peers[1]);
+	close(listen_fd);
+	free_peers(peers, 2);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
 }
 END_TEST
 
@@ -2716,14 +3754,72 @@ START_TEST(test_send_append_entries_invalid_log_event)
 	client.peer_fd = fds[1];
 
 	entry = make_log(1, 1);
-	entry->event = RAFT_MAX_LOG;
+	entry->log_type = RAFT_MAX_LOG;
 
 	errno = 0;
 	ck_assert_int_eq(raft_send(RAFT_PEER, &client, RAFT_APPEND_ENTRIES,
 				1, 1, 0, 0, 0, 1, entry), -1);
 	ck_assert_int_eq(errno, EINVAL);
 
-	entry->event = RAFT_LOG_REGISTER_TOPIC;
+	entry->log_type = RAFT_LOG_REGISTER_TOPIC;
+	raft_test_api.raft_free_log(entry);
+	close(fds[0]);
+	close(fds[1]);
+	destroy_entry_locks(&client);
+}
+END_TEST
+
+START_TEST(test_send_append_entries_fill_send_fail)
+{
+	struct raft_host_entry client;
+	struct raft_log *entry;
+	const struct raft_impl *saved_impl = raft_impl;
+	int fds[2];
+
+	ck_assert_int_eq(pipe(fds), 0);
+
+	memset(&client, 0, sizeof(client));
+	init_entry_locks(&client);
+	client.peer_fd = fds[1];
+
+	entry = make_log(1, 1);
+
+	raft_impl = &fill_send_fail_impl;
+	errno = 0;
+	ck_assert_int_eq(raft_send(RAFT_PEER, &client, RAFT_APPEND_ENTRIES,
+				1U, 1U, 0U, 0U, 0U, 1U, entry), -1);
+	ck_assert_int_eq(errno, EIO);
+	raft_impl = saved_impl;
+
+	raft_test_api.raft_free_log(entry);
+	close(fds[0]);
+	close(fds[1]);
+	destroy_entry_locks(&client);
+}
+END_TEST
+
+START_TEST(test_send_append_entries_fill_send_overflow)
+{
+	struct raft_host_entry client;
+	struct raft_log *entry;
+	const struct raft_impl *saved_impl = raft_impl;
+	int fds[2];
+
+	ck_assert_int_eq(pipe(fds), 0);
+
+	memset(&client, 0, sizeof(client));
+	init_entry_locks(&client);
+	client.peer_fd = fds[1];
+
+	entry = make_log(1, 1);
+
+	raft_impl = &fill_send_overflow_impl;
+	errno = 0;
+	ck_assert_int_eq(raft_send(RAFT_PEER, &client, RAFT_APPEND_ENTRIES,
+				1U, 1U, 0U, 0U, 0U, 1U, entry), -1);
+	ck_assert_int_eq(errno, EOVERFLOW);
+	raft_impl = saved_impl;
+
 	raft_test_api.raft_free_log(entry);
 	close(fds[0]);
 	close(fds[1]);
@@ -2931,7 +4027,7 @@ START_TEST(test_free_log_unknown_event)
 
 	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
 	ck_assert_ptr_nonnull(entry);
-	entry->event = RAFT_MAX_LOG;
+	entry->log_type = RAFT_MAX_LOG;
 
 	errno = 0;
 	ck_assert_int_eq(raft_test_api.raft_free_log(entry), -1);
@@ -3017,7 +4113,7 @@ START_TEST(test_commit_and_advance_unknown_event)
 	struct raft_log *entry;
 
 	entry = make_log(1, 1);
-	entry->event = RAFT_MAX_LOG;
+	entry->log_type = RAFT_MAX_LOG;
 	raft_test_api.raft_append_log(entry,
 			&raft_state.log_head, &raft_state.log_tail, &raft_state.log_length);
 
@@ -3028,7 +4124,7 @@ START_TEST(test_commit_and_advance_unknown_event)
 	ck_assert_uint_eq(raft_state.commit_index, 0);
 	ck_assert_int_eq(commit_called, 0);
 
-	entry->event = RAFT_LOG_REGISTER_TOPIC;
+	entry->log_type = RAFT_LOG_REGISTER_TOPIC;
 }
 END_TEST
 
@@ -3263,6 +4359,115 @@ START_TEST(test_new_conn_bad_length)
 }
 END_TEST
 
+START_TEST(test_new_conn_unknown_peer)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry *peers;
+	int fds[2];
+	uint8_t packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+	int rc;
+
+	ck_assert_int_eq(pipe(fds), 0);
+
+	peers = calloc(2, sizeof(*peers));
+	ck_assert_ptr_nonnull(peers);
+	init_entry_locks(&peers[0]);
+	init_entry_locks(&peers[1]);
+	peers[0].server_id = 1;
+	peers[0].peer_fd = -1;
+	peers[1].server_id = 2;
+	peers[1].peer_fd = -1;
+	peers[1].port = htons(9999);
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	raft_state.self_id = 1;
+	client_state->unknown_clients = NULL;
+
+	fill_hello_packet(packet, 3, RAFT_PEER, RAFT_PEER, INADDR_LOOPBACK, 1883);
+	ck_assert_int_eq(write(fds[1], packet, sizeof(packet)), (ssize_t)sizeof(packet));
+
+	rc = raft_test_api.raft_new_conn(fds[0], NULL, NULL, 0);
+	if (rc == -1 && errno == EAGAIN) {
+		struct raft_host_entry *unknown = client_state->unknown_clients;
+		ck_assert_ptr_nonnull(unknown);
+		rc = raft_test_api.raft_new_conn(-1, unknown, NULL, 0);
+	}
+
+	ck_assert_int_eq(rc, -1);
+	ck_assert_int_eq(errno, ENOENT);
+	ck_assert_ptr_eq(client_state->unknown_clients, NULL);
+
+	close(fds[0]);
+	close(fds[1]);
+	destroy_entry_locks(&peers[0]);
+	destroy_entry_locks(&peers[1]);
+	free(peers);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
+START_TEST(test_new_conn_partial_read)
+{
+	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
+	unsigned *num_ptr = raft_test_api.num_peers_ptr();
+	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
+	struct raft_host_entry *peers;
+	struct raft_host_entry *unknown;
+	int fds[2];
+	uint8_t packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+	const size_t first_chunk = 6;
+	int idx;
+
+	ck_assert_int_eq(pipe(fds), 0);
+
+	peers = calloc(2, sizeof(*peers));
+	ck_assert_ptr_nonnull(peers);
+	init_entry_locks(&peers[0]);
+	init_entry_locks(&peers[1]);
+	peers[0].server_id = 1;
+	peers[0].peer_fd = -1;
+	peers[1].server_id = 2;
+	peers[1].peer_fd = -1;
+	peers[1].port = htons(9999);
+	*peers_ptr = peers;
+	*num_ptr = 2;
+
+	raft_state.self_id = 1;
+	client_state->unknown_clients = NULL;
+
+	fill_hello_packet(packet, 2, RAFT_PEER, RAFT_PEER, INADDR_LOOPBACK, 1883);
+	ck_assert_int_eq(write(fds[1], packet, first_chunk), (ssize_t)first_chunk);
+
+	errno = 0;
+	idx = raft_test_api.raft_new_conn(fds[0], NULL, NULL, 0);
+	ck_assert_int_eq(idx, -1);
+	ck_assert_int_eq(errno, EAGAIN);
+
+	unknown = client_state->unknown_clients;
+	ck_assert_ptr_nonnull(unknown);
+
+	ck_assert_int_eq(write(fds[1], packet + first_chunk, sizeof(packet) - first_chunk),
+			(ssize_t)(sizeof(packet) - first_chunk));
+	idx = raft_test_api.raft_new_conn(-1, unknown, NULL, 0);
+
+	ck_assert_int_eq(idx, 1);
+	ck_assert_int_eq(peers[1].peer_fd, fds[0]);
+	ck_assert_ptr_eq(client_state->unknown_clients, NULL);
+
+	close(fds[0]);
+	close(fds[1]);
+	destroy_entry_locks(&peers[0]);
+	destroy_entry_locks(&peers[1]);
+	free(peers);
+	*peers_ptr = NULL;
+	*num_ptr = 1;
+}
+END_TEST
+
 START_TEST(test_process_packet_append_entries_invalid_log_type)
 {
 	struct raft_host_entry client;
@@ -3378,6 +4583,8 @@ static Suite *raft_suite(void)
 	tcase_add_test(tc, test_add_write_rejects_full_queue);
 	tcase_add_test(tc, test_try_write_partial_progress);
 	tcase_add_test(tc, test_try_write_invalid);
+	tcase_add_test(tc, test_try_write_eagain);
+	tcase_add_test(tc, test_try_write_error_closes);
 	tcase_add_test(tc, test_has_pending_write);
 	tcase_add_test(tc, test_iobuf_append_and_remove);
 	tcase_add_test(tc, test_remove_iobuf_missing);
@@ -3386,6 +4593,11 @@ static Suite *raft_suite(void)
 	tcase_add_test(tc, test_new_conn_invalid_role);
 	tcase_add_test(tc, test_new_conn_self_peer);
 	tcase_add_test(tc, test_new_conn_invalid_type);
+	tcase_add_test(tc, test_is_leader);
+	tcase_add_test(tc, test_get_leader_address_too_small);
+	tcase_add_test(tc, test_get_leader_address_success);
+	tcase_add_test(tc, test_get_leader_address_no_leader);
+	tcase_add_test(tc, test_get_leader_address_no_addr);
 	tcase_add_test(tc, test_process_packet_client_request_reply_invalid_status);
 	tcase_add_test(tc, test_process_packet_client_request_invalid_type);
 	tcase_add_test(tc, test_process_packet_client_request_no_handler);
@@ -3414,19 +4626,27 @@ static Suite *raft_suite(void)
 	tcase_add_test(tc, test_recv_full_packet_success);
 	tcase_add_test(tc, test_send_invalid_rpc);
 	tcase_add_test(tc, test_send_hello_success);
+	tcase_add_test(tc, test_send_broadcast_peers);
+	tcase_add_test(tc, test_send_broadcast_try_write_eagain);
+	tcase_add_test(tc, test_send_broadcast_add_write_failure_closes);
 	tcase_add_test(tc, test_send_request_vote_success);
 	tcase_add_test(tc, test_send_append_entries_one_entry_success);
 	tcase_add_test(tc, test_send_client_request_success);
 	tcase_add_test(tc, test_send_client_no_leader);
 	tcase_add_test(tc, test_send_server_no_client);
 	tcase_add_test(tc, test_send_peer_bad_fd);
+	tcase_add_test(tc, test_send_server_bad_fd);
+	tcase_add_test(tc, test_send_client_bad_fd);
 	tcase_add_test(tc, test_send_append_entries_null_entries);
 	tcase_add_test(tc, test_send_client_request_invalid_type);
-	tcase_add_test(tc, test_send_client_request_reply_invalid_log_type);
+	tcase_add_test(tc, test_send_client_request_reply_allows_unknown_log_type);
 	tcase_add_test(tc, test_send_request_vote_reply_invalid_status);
 	tcase_add_test(tc, test_send_append_entries_invalid_log_event);
+	tcase_add_test(tc, test_send_append_entries_fill_send_fail);
+	tcase_add_test(tc, test_send_append_entries_fill_send_overflow);
 	tcase_add_test(tc, test_send_client_request_pre_send_overflow);
 	tcase_add_test(tc, test_send_append_entries_pre_send_overflow);
+	tcase_add_test(tc, test_send_add_write_enospc);
 	tcase_add_test(tc, test_update_leader_id);
 	tcase_add_test(tc, test_close_resets_state);
 	tcase_add_test(tc, test_log_at_indices);
@@ -3443,13 +4663,30 @@ static Suite *raft_suite(void)
 	tcase_add_test(tc, test_client_log_sendv_invalid_event);
 	tcase_add_test(tc, test_send_register_client_reply_invalid_status);
 	tcase_add_test(tc, test_send_hello_invalid_conn_type);
+	tcase_add_test(tc, test_leader_log_append_wrapper);
+	tcase_add_test(tc, test_client_log_send_leader_path);
+	tcase_add_test(tc, test_client_log_sendv_success);
+	tcase_add_test(tc, test_client_log_send_follower_path);
+	tcase_add_test(tc, test_tick_follower_timeout_single_node);
+	tcase_add_test(tc, test_tick_candidate_resend_votes);
+	tcase_add_test(tc, test_request_votes_missing_term);
+	tcase_add_test(tc, test_tick_leader_heartbeat_and_replication);
+	tcase_add_test(tc, test_send_log_to_peers_size_too_large);
+	tcase_add_test(tc, test_tick_connection_check_connect_success);
 	tcase_add_test(tc, test_new_conn_not_hello);
 	tcase_add_test(tc, test_new_conn_bad_length);
+	tcase_add_test(tc, test_new_conn_unknown_peer);
+	tcase_add_test(tc, test_new_conn_partial_read);
 	tcase_add_test(tc, test_process_packet_append_entries_invalid_log_type);
 	tcase_add_test(tc, test_process_packet_client_request_overlong);
 	tcase_add_test(tc, test_save_and_load_state_round_trip);
 	tcase_add_test(tc, test_save_state_header_only_preserves_log);
+	tcase_add_test(tc, test_save_state_vars_self_id_zero);
+	tcase_add_test(tc, test_save_state_vars_open_fail);
+	tcase_add_test(tc, test_save_state_log_save_log_error);
 	tcase_add_test(tc, test_load_state_missing_file);
+	tcase_add_test(tc, test_load_state_vars_short_read);
+	tcase_add_test(tc, test_load_state_read_log_error);
 	tcase_add_test(tc, test_load_state_truncated_log_entry);
 
 	suite_add_tcase(s, tc);
