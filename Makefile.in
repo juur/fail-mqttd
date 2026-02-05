@@ -6,7 +6,7 @@ objdir := @@OBJDIR@@
 .SUFFIXES:
 .SUFFIXES: .c .o
 
-DESTDIR          := 
+DESTDIR          :=
 CC               := @@CC@@
 CXX              := @@CXX@@
 LEX              := @@LEX@@
@@ -30,6 +30,7 @@ PACKAGE          := $(shell $(CAT) "$(srcdir)/misc/PACKAGE")
 HELP2MAN         := help2man
 DEPS             := @@DEPS@@
 GCOVR            ?= gcovr
+GCOVR_EXCLUDES   ?= --exclude 'tests/.*'
 COVERAGE_CFLAGS  := --coverage -fprofile-arcs -ftest-coverage
 COVERAGE_LDFLAGS := --coverage
 
@@ -72,6 +73,11 @@ test_BINS         := $(addprefix $(objdir)/,$(notdir $(test_SRCS:.c=)))
 package_BIN       := $(objdir)/$(progprefix)$(PACKAGE)
 package_MAN       := $(objdir)/doc/$(progprefix)$(PACKAGE).8
 
+comma := ,
+empty :=
+space := $(empty) $(empty)
+comma-separate = $(subst $(space),$(comma),$(strip $1))
+
 ifeq ($(DEPS),1)
 CPPFLAGS += -MMD -MP
 endif
@@ -98,8 +104,8 @@ coverage-run:
 		CFLAGS="$(CFLAGS) $(COVERAGE_CFLAGS)" \
 		LDFLAGS="$(LDFLAGS) $(COVERAGE_LDFLAGS)"
 	-$(MKDIR) $(objdir)/coverage/ 2>/dev/null
-	$(GCOVR) -r $(srcdir) --print-summary --xml $(objdir)/coverage/coverage.xml \
-		--html-details $(objdir)/coverage/coverage.html
+	$(GCOVR) -r $(srcdir) -i $(call comma-separate,$(all_SRCS)) --print-summary --xml $(objdir)/coverage/coverage.xml \
+		--html-details $(objdir)/coverage/coverage.html $(GCOVR_EXCLUDES)
 
 $(objdir)/doc:
 	@mkdir -p $(objdir)/doc 2>/dev/null
