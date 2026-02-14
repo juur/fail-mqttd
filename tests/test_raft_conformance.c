@@ -1103,10 +1103,35 @@ static void impl_cluster_init(struct impl_cluster *cluster)
 	}
 }
 
+static void free_log_list(struct raft_log **head)
+{
+	struct raft_log *tmp = *head;
+
+	while (tmp) {
+		struct raft_log *next = tmp->next;
+		raft_test_api.raft_free_log(tmp);
+		tmp = next;
+	}
+
+	*head = NULL;
+}
+
 static void impl_cluster_free(struct impl_cluster *cluster)
 {
 	for (size_t node_idx = 0; node_idx < 3; node_idx++) {
 		struct impl_node *node = &cluster->nodes[node_idx];
+		if (node->state.log_head == raft_state.log_head) {
+			raft_state.log_head = NULL;
+			raft_state.log_tail = NULL;
+			atomic_store(&raft_state.log_length, 0);
+		}
+		free_log_list(&node->state.log_head);
+		node->state.log_tail = NULL;
+		atomic_store(&node->state.log_length, 0);
+
+		free_log_list(&node->client.log_pending_head);
+		node->client.log_pending_tail = NULL;
+
 		for (unsigned idx = 0; idx < node->num_peers; idx++)
 			destroy_entry_locks(&node->peers[idx]);
 		free(node->peers);

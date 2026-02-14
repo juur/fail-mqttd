@@ -936,9 +936,17 @@ START_TEST(test_change_to_leader_updates_peers)
 	ck_assert_uint_eq(peers[2].next_index, expected_next);
 	ck_assert(raft_state.next_ping >= before);
 
-	raft_test_api.raft_free_log(raft_state.log_head);
+	{
+		struct raft_log *tmp = raft_state.log_head;
+		while (tmp) {
+			struct raft_log *next = tmp->next;
+			raft_test_api.raft_free_log(tmp);
+			tmp = next;
+		}
+	}
 	raft_state.log_head = NULL;
 	raft_state.log_tail = NULL;
+	atomic_store(&raft_state.log_length, 0);
 
 	for (unsigned idx = 0; idx < 3; idx++)
 		destroy_entry_locks(&peers[idx]);
@@ -1096,6 +1104,7 @@ END_TEST
 START_TEST(test_reset_write_state_frees_buffer)
 {
 	struct raft_host_entry entry;
+	const uint8_t *buf = NULL;
 
 	memset(&entry, 0, sizeof(entry));
 	init_entry_locks(&entry);
@@ -1103,7 +1112,7 @@ START_TEST(test_reset_write_state_frees_buffer)
 	entry.wr_need = 9;
 	entry.wr_packet_length = 55;
 	{
-		const uint8_t *buf = (const uint8_t *)malloc(32);
+		buf = (const uint8_t *)malloc(32);
 		ck_assert_ptr_nonnull(buf);
 		atomic_store_explicit(&entry.wr_packet_buffer,
 				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
@@ -1118,6 +1127,8 @@ START_TEST(test_reset_write_state_frees_buffer)
 	ck_assert_int_eq(entry.wr_packet_length, 0);
 	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
 				memory_order_seq_cst), NULL);
+	free((void *)buf);
+	buf = NULL;
 	destroy_entry_locks(&entry);
 }
 END_TEST
@@ -1589,6 +1600,9 @@ START_TEST(test_remove_and_free_unknown_host)
 	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
 	struct raft_host_entry *first;
 	struct raft_host_entry *second;
+	const uint8_t *wr_buf = NULL;
+	const uint8_t *ss_buf = NULL;
+	uint8_t *rd_buf = NULL;
 
 	first = calloc(1, sizeof(*first));
 	second = calloc(1, sizeof(*second));
@@ -1601,15 +1615,25 @@ START_TEST(test_remove_and_free_unknown_host)
 	first->unknown_next = second;
 	client_state->unknown_clients = first;
 
+	wr_buf = (const uint8_t *)malloc(8);
+	ck_assert_ptr_nonnull(wr_buf);
 	atomic_store_explicit(&second->wr_packet_buffer,
-			(_Atomic const uint8_t *)malloc(8), memory_order_seq_cst);
+			(_Atomic const uint8_t *)wr_buf, memory_order_seq_cst);
+	ss_buf = (const uint8_t *)malloc(8);
+	ck_assert_ptr_nonnull(ss_buf);
 	atomic_store_explicit(&second->ss_data,
-			(_Atomic const uint8_t *)malloc(8), memory_order_seq_cst);
-	second->rd_packet_buffer = malloc(8);
+			(_Atomic const uint8_t *)ss_buf, memory_order_seq_cst);
+	rd_buf = malloc(8);
+	ck_assert_ptr_nonnull(rd_buf);
+	second->rd_packet_buffer = rd_buf;
 
 	raft_test_api.raft_remove_and_free_unknown_host(second);
 	ck_assert_ptr_eq(client_state->unknown_clients, first);
 	ck_assert_ptr_eq(first->unknown_next, NULL);
+	free((void *)wr_buf);
+	wr_buf = NULL;
+	ss_buf = NULL;
+	rd_buf = NULL;
 
 	raft_test_api.raft_remove_and_free_unknown_host(first);
 	ck_assert_ptr_eq(client_state->unknown_clients, NULL);
@@ -3919,6 +3943,8 @@ END_TEST
 START_TEST(test_close_resets_state)
 {
 	struct raft_host_entry entry;
+	const uint8_t *wr_buf = NULL;
+	const uint8_t *ss_buf = NULL;
 
 	memset(&entry, 0, sizeof(entry));
 	init_entry_locks(&entry);
@@ -3933,16 +3959,16 @@ START_TEST(test_close_resets_state)
 	entry.wr_need = 6;
 	entry.wr_packet_length = 20;
 	{
-		const uint8_t *buf = (const uint8_t *)malloc(16);
-		ck_assert_ptr_nonnull(buf);
+		wr_buf = (const uint8_t *)malloc(16);
+		ck_assert_ptr_nonnull(wr_buf);
 		atomic_store_explicit(&entry.wr_packet_buffer,
-				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
+				(_Atomic const uint8_t *)wr_buf, memory_order_seq_cst);
 	}
 	{
-		const uint8_t *buf = (const uint8_t *)malloc(8);
-		ck_assert_ptr_nonnull(buf);
+		ss_buf = (const uint8_t *)malloc(8);
+		ck_assert_ptr_nonnull(ss_buf);
 		atomic_store_explicit(&entry.ss_data,
-				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
+				(_Atomic const uint8_t *)ss_buf, memory_order_seq_cst);
 	}
 	entry.ss_last_index = 4;
 	entry.ss_last_term = 2;
@@ -3972,6 +3998,10 @@ START_TEST(test_close_resets_state)
 				memory_order_seq_cst), NULL);
 	ck_assert_int_eq(entry.ss_last_index, 0);
 	ck_assert_int_eq(entry.ss_last_term, 0);
+
+	free((void *)wr_buf);
+	wr_buf = NULL;
+	ss_buf = NULL;
 
 	raft_test_api.raft_free_log(raft_state.log_tail);
 	raft_state.log_tail = NULL;

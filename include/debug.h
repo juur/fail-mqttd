@@ -59,6 +59,8 @@
 
 extern const char *uuid_to_string(const uint8_t uuid[const static UUID_SIZE]);
 
+# ifndef _DUMP_C
+#  ifdef FEATURE_DEBUG
 void dump_client(const struct client *client);
 void dump_message(const struct message *message);
 void dump_mds(const struct message_delivery_state *mds);
@@ -76,4 +78,23 @@ void dump_all_topics(void);
 void dump_all_mds(void);
 void dump_all_subscriptions(void);
 void dump_all(void);
+#  else
+#define dump_client(x)
+#define dump_message(x)
+#define dump_mds(x)
+#define dump_packet(x)
+#define dump_subscription(x)
+#define dump_session(x)
+#define dump_topic(x)
+#define dump_any(x,y)
+#define dump_all_clients()
+#define dump_all_sessions()
+#define dump_all_messages()
+#define dump_all_packets()
+#define dump_all_topics()
+#define dump_all_mds()
+#define dump_all_subscriptions()
+#define dump_all()
+#  endif
+# endif
 #endif
