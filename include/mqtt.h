@@ -546,6 +546,8 @@ struct topic {
     uint8_t uuid[UUID_SIZE];
     const uint8_t *name;
     struct message *retained_message;
+    uint8_t retained_msg_uuid[UUID_SIZE]; /* used during loading */
+    bool retained_msg_link;
     struct message *pending_queue;
     pthread_rwlock_t pending_queue_lock;
     _Atomic topic_state_t state;

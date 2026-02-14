@@ -232,8 +232,8 @@ static const struct {
     int (*const func)(datum key, datum content);
     const size_t size;
 } database_init[] = {
-    { &message_dbm, "messages", load_message, sizeof(struct message_save) },
-    { &topic_dbm, "topics", load_topic, sizeof(struct topic_save) },
+    { &topic_dbm   , "topics"   , load_topic   , 0 } ,
+    { &message_dbm , "messages" , load_message , 0 } ,
     { NULL, NULL, NULL, -1 },
 };
 
@@ -242,8 +242,9 @@ static const struct {
  */
 
 [[gnu::nonnull]] static bool is_null_uuid(const uint8_t uuid[static UUID_SIZE]);
-[[gnu::nonnull, gnu::warn_unused_result]] struct session *find_session_by_uuid(const uint8_t uuid[static UUID_SIZE]);
+[[gnu::nonnull, gnu::warn_unused_result]] static struct session *find_session_by_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull, gnu::warn_unused_result]] struct topic *find_topic_by_uuid(const uint8_t uuid[static UUID_SIZE]);
+[[gnu::nonnull, gnu::warn_unused_result]] struct message *find_message_by_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull]] static void handle_outbound(struct client *client);
 [[gnu::nonnull]] static void set_outbound(struct client *client, const uint8_t *buf, unsigned len);
 [[gnu::nonnull]] static void close_session(struct session *session
@@ -2820,15 +2821,18 @@ static int write_mds(char **dst, const struct message_delivery_state *mds)
     write_u16(dst, mds->packet_identifier);
     if (mds->session)
         write_uuid(dst, mds->session->uuid);
-    else {
-        errno = EINVAL;
-        return -1;
-    }
+    else
+        write_uuid(dst, NULL_UUID);
     write_u32(dst, mds->last_sent);
     write_u32(dst, mds->acknowledged_at);
     write_u32(dst, mds->released_at);
     write_u32(dst, mds->completed_at);
     write_u8(dst, mds->client_reason);
+    
+    if (mds->session == NULL) {
+        errno = ENOENT;
+        return -1;
+    }
 
     return 0;
 }
@@ -2840,6 +2844,7 @@ static int read_mds(struct message_delivery_state *mds, const char **src, size_t
     uint32_t tmp_u32;
     uint8_t tmp_u8;
     int rc;
+    errno = EINVAL;
 
     rc = read_u16(&mds->packet_identifier, src, bytes_remaining);
     if (rc == -1) goto fail;
@@ -2886,9 +2891,10 @@ fail:
     return -1;
 }
 
-[[maybe_unused]] static int deserialise_message(const struct message **ret, void *buffer, size_t *bytes_remaining)
+[[maybe_unused]] static int deserialise_message(const struct message **ret, const void *buffer,
+        size_t *bytes_remaining)
 {
-    const char **src = buffer;
+    const char *src = buffer;
     uint32_t tmp_u32;
     uint8_t tmp_u8;
     uint16_t tmp_u16;
@@ -2898,44 +2904,43 @@ fail:
 
     *ret = NULL;
 
-    rc = read_uuid(tmp_uuid, src, bytes_remaining);
+    rc = read_uuid(tmp_uuid, &src, bytes_remaining);
     if (rc == -1 || is_null_uuid(tmp_uuid)) goto fail;
 
     if ((out = alloc_message(tmp_uuid)) == NULL)
         goto fail;
 
-    rc = read_u32(&tmp_u32, src, bytes_remaining); out->payload_len = tmp_u32;
+    rc = read_u32(&tmp_u32, &src, bytes_remaining); out->payload_len = tmp_u32;
     if (rc == -1) goto fail;
-    rc = read_u8(&tmp_u8, src, bytes_remaining); out->format = tmp_u8;
+    rc = read_u8(&tmp_u8, &src, bytes_remaining); out->format = tmp_u8;
     if (rc == -1) goto fail;
-    rc = read_u8(&tmp_u8, src, bytes_remaining); out->qos = tmp_u8;
+    rc = read_u8(&tmp_u8, &src, bytes_remaining); out->qos = tmp_u8;
     if (rc == -1) goto fail;
-    rc = read_u8(&tmp_u8, src, bytes_remaining); out->retain = tmp_u8;
+    rc = read_u8(&tmp_u8, &src, bytes_remaining); out->retain = tmp_u8;
     if (rc == -1) goto fail;
-    rc = read_u8(&tmp_u8, src, bytes_remaining); out->type = (message_type_t)tmp_u8;
+    rc = read_u8(&tmp_u8, &src, bytes_remaining); out->type = (message_type_t)tmp_u8;
     if (rc == -1) goto fail;
 
-    if ( 
+    if (
             (out->payload_len > MAX_PACKET_LENGTH) ||
             (out->qos > 2) ||
-            (out->type >= MSG_TYPE_MAX) 
+            (out->type >= MSG_TYPE_MAX)
        ) {
         errno = EINVAL;
         goto fail;
     }
 
-        errno = 
-
-    rc = read_uuid(tmp_uuid, src, bytes_remaining);
+    rc = read_uuid(tmp_uuid, &src, bytes_remaining);
     if (rc == -1) goto fail;
     if (is_null_uuid(tmp_uuid))
         out->sender = NULL;
     else if ((out->sender = find_session_by_uuid(tmp_uuid)) == NULL) {
-        errno = ENOENT;
-        goto fail;
+        out->sender = NULL;
+        //errno = ENOENT;
+        //goto fail;
     }
 
-    rc = read_uuid(tmp_uuid, src, bytes_remaining);
+    rc = read_uuid(tmp_uuid, &src, bytes_remaining);
     if (rc == -1) goto fail;
     if (is_null_uuid(tmp_uuid))
         out->topic = NULL;
@@ -2945,9 +2950,11 @@ fail:
     }
 
     if (out->qos) {
-        rc = read_mds(&out->sender_status, src, bytes_remaining, out, false);
-        if (rc == -1) goto fail;
-        rc = read_u16(&tmp_u16, src, bytes_remaining); out->num_message_delivery_states = tmp_u16;
+        rc = read_mds(&out->sender_status, &src, bytes_remaining, out, false);
+        if (rc == -1 && errno != ENOENT)
+            goto fail;
+
+        rc = read_u16(&tmp_u16, &src, bytes_remaining); out->num_message_delivery_states = tmp_u16;
         if (rc == -1) goto fail;
 
         out->delivery_states = calloc(out->num_message_delivery_states,
@@ -2956,14 +2963,30 @@ fail:
         if (out->delivery_states == NULL)
             goto fail;
 
-        for (unsigned idx = 0; idx < out->num_message_delivery_states; idx++)
+        unsigned actual_num_mds = out->num_message_delivery_states;
+
+        for (unsigned idx = 0; actual_num_mds && idx < out->num_message_delivery_states; idx++)
         {
+again:
             if ((out->delivery_states[idx] = alloc_message_delivery_state(NULL, NULL, true)) == NULL)
                 goto fail;
 
-            rc = read_mds(out->delivery_states[idx], src, bytes_remaining, out, true);
-            if (rc == -1) goto fail;
+            rc = read_mds(out->delivery_states[idx], &src, bytes_remaining, out, true);
+
+            if (rc == -1 && errno != ENOENT) 
+                goto fail;
+            else if (rc == -1) {
+                /* Handle the scenario that the session is missing, etc. */
+                if (free_message_delivery_state(out->delivery_states[idx]) == -1)
+                    warn("deserialise_message: free_message_delivery_state");
+                out->delivery_states[idx] = NULL;
+                actual_num_mds--;
+                if (actual_num_mds)
+                    goto again;
+            }
         }
+
+        out->num_message_delivery_states = actual_num_mds;
     }
 
     if (out->payload_len) {
@@ -2974,7 +2997,7 @@ fail:
 
         if ((out->payload = malloc(out->payload_len)) == NULL)
             goto fail;
-        rc = read_bytes((void *)out->payload, src, bytes_remaining, out->payload_len);
+        rc = read_bytes((void *)out->payload, &src, bytes_remaining, out->payload_len);
         if (rc == -1) goto fail;
     } else
         out->payload = NULL;
@@ -3013,12 +3036,12 @@ fail:
     write_uuid(&dst, msg->topic ? msg->topic->uuid : NULL_UUID);
 
     if (msg->qos) {
-        if (write_mds(&dst, &msg->sender_status) == -1)
+        if (write_mds(&dst, &msg->sender_status) == -1 && errno != ENOENT)
             return -1;
         write_u16(&dst, msg->num_message_delivery_states);
 
         for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
-            if (write_mds(&dst, msg->delivery_states[idx]) == -1)
+            if (write_mds(&dst, msg->delivery_states[idx]) == -1 && errno != ENOENT)
                 return -1;
     }
 
@@ -3059,6 +3082,86 @@ fail:
     return 0;
 }
 
+
+static void link_topics(void)
+{
+    pthread_rwlock_wrlock(&global_topics_lock);
+    for (struct topic *topic = global_topic_list; topic; topic = topic->next)
+    {
+        if (topic->state != TOPIC_NEW)
+            continue;
+
+        if (topic->retained_msg_link == false)
+            continue;
+
+        if ((topic->retained_message = find_message_by_uuid(topic->retained_msg_uuid)) == NULL) {
+            warn("link_topics: unable to find retained message for topic <%s>",
+                    (const char *)topic->name);
+            continue;
+        }
+
+        memcpy(topic->retained_msg_uuid, NULL_UUID, UUID_SIZE);
+        topic->retained_msg_link = false;
+        topic->state = TOPIC_ACTIVE;
+
+    }
+    pthread_rwlock_unlock(&global_topics_lock);
+}
+
+static int deserialise_topic(const struct topic **ret, const void *buffer,
+        size_t *bytes_remaining)
+{
+    const char *src = buffer;
+    uint16_t tmp_u16;
+    uint8_t tmp_uuid[UUID_SIZE];
+    uint8_t *tmp_str;
+    int rc;
+    struct topic *out;
+
+    out = NULL;
+    tmp_str = NULL;
+    *ret = NULL;
+
+    rc = read_uuid(tmp_uuid, &src, bytes_remaining);
+    if (rc == -1 || is_null_uuid(tmp_uuid)) goto fail;
+
+    rc = read_u16(&tmp_u16, &src, bytes_remaining);
+    if (rc == -1) goto fail;
+
+    if ((tmp_str = malloc(tmp_u16 + 1)) == NULL)
+        goto fail;
+
+    tmp_str[tmp_u16] = '\0';
+
+    rc = read_bytes(tmp_str, &src, bytes_remaining, tmp_u16);
+    if (rc == -1) goto fail;
+
+    if ((out = alloc_topic(tmp_str, tmp_uuid)) == NULL)
+        goto fail;
+
+    rc = read_uuid(tmp_uuid, &src, bytes_remaining);
+    if (rc == -1) goto fail;
+
+    if (!is_null_uuid(tmp_uuid)) {
+        memcpy(out->retained_msg_uuid, tmp_uuid, UUID_SIZE);
+        out->retained_msg_link = true;
+        out->state = TOPIC_NEW;
+    } else
+        out->state = TOPIC_ACTIVE;
+
+    free(tmp_str);
+    *ret = out;
+    return 0;
+
+fail:
+    if (tmp_str)
+        free(tmp_str);
+    if (out)
+        free_topic(out);
+
+    return -1;
+}
+
 /**
  * buffer must be sized using size_message() first
  */
@@ -3067,14 +3170,15 @@ fail:
     char *dst = buffer;
 
     write_uuid(&dst, topic->uuid);
+    const size_t name_len = strlen((void *)topic->name);
+    write_u16(&dst, name_len);
+    write_bytes(&dst, topic->name, name_len);
+
     if (topic->retained_message)
         write_uuid(&dst, topic->retained_message->uuid);
     else
         write_uuid(&dst, NULL_UUID);
 
-    const size_t name_len = strlen((void *)topic->name);
-    write_u16(&dst, name_len);
-    write_bytes(&dst, topic->name, name_len);
 
     return 0;
 }
@@ -3082,10 +3186,13 @@ fail:
 [[gnu::nonnull]]
 static int save_message(const struct message *msg)
 {
+    /*
     struct message_save *save = NULL;
 
     assert(msg->uuid);
+    */
 
+    void *save = NULL;
     errno = EINVAL;
 
     pthread_rwlock_rdlock(&global_messages_lock);
@@ -3098,11 +3205,19 @@ static int save_message(const struct message *msg)
     dbg_printf("     save_message: saving message id=%d uuid=%s\n",
             msg->id, uuid_to_string(msg->uuid));
 
-    size_t size = sizeof(struct message_save) + msg->payload_len;
+    //size_t size = sizeof(struct message_save) + msg->payload_len;
+    const int size = size_message(msg);
+
+    if (size == -1)
+        goto fail;
 
     if ((save = malloc(size)) == NULL)
         goto fail;
 
+    if (serialise_message(msg, save) == -1)
+        goto fail;
+
+    /*
     save->id = msg->id;
     save->format = msg->format;
     save->payload_len = msg->payload_len;
@@ -3115,6 +3230,7 @@ static int save_message(const struct message *msg)
         memcpy(save->topic_uuid, msg->topic->uuid, UUID_SIZE);
     if (msg->payload)
         memcpy(&save->payload, msg->payload, msg->payload_len);
+        */
 
     datum key = {
         .dptr = (char *)msg->uuid,
@@ -3258,6 +3374,25 @@ static struct session *find_session(const struct client *client)
     }
     pthread_rwlock_unlock(&global_sessions_lock);
 
+    return NULL;
+}
+
+static struct session *find_session_by_uuid(const uint8_t uuid[static UUID_SIZE])
+{
+    pthread_rwlock_rdlock(&global_sessions_lock);
+    for (struct session *tmp = global_session_list; tmp; tmp = tmp->next)
+    {
+        if (tmp->state != SESSION_ACTIVE)
+            continue;
+
+        if (memcmp(tmp->uuid, uuid, UUID_SIZE))
+            continue;
+
+        pthread_rwlock_unlock(&global_sessions_lock);
+        return tmp;
+
+    }
+    pthread_rwlock_unlock(&global_sessions_lock);
     return NULL;
 }
 
@@ -4714,10 +4849,15 @@ done:
  * refcnt for non-retained messages should only be touched in enqueue_message
  * or dequeue_message
  */
-[[gnu::nonnull]]
-static struct message *register_message(const uint8_t *topic_name, int format,
-        uint32_t len, const void *payload, unsigned qos, struct session *sender,
-        bool retain, message_type_t type)
+[[gnu::nonnull, gnu::warn_unused_result]]
+static struct message *register_message(const uint8_t *topic_name,
+        int format,
+        uint32_t payload_len,
+        const void *payload,
+        unsigned qos,
+        struct session *sender,
+        bool retain,
+        message_type_t type)
 {
     struct topic *topic;
 
@@ -4725,7 +4865,7 @@ static struct message *register_message(const uint8_t *topic_name, int format,
     errno = 0;
 
     dbg_printf("[%2d] register_message: topic=<%s> format=%u len=%u qos=%u %spayload=%p\n",
-            sender->id, topic_name, format, len, qos,
+            sender->id, topic_name, format, payload_len, qos,
             retain ? BWHT "retain" CRESET " " : "",
             payload);
 
@@ -4741,14 +4881,16 @@ static struct message *register_message(const uint8_t *topic_name, int format,
         goto fail;
     }
 
-    msg->type = type;
-    msg->format = format;
-    msg->payload = payload;
-    msg->payload_len = len;
-    msg->qos = qos;
-    msg->sender = sender;
-    msg->state = MSG_NEW;
-    msg->retain = retain;
+    msg->format                = format;
+    msg->payload               = payload;
+    msg->payload_len           = payload_len;
+    msg->qos                   = qos;
+    msg->retain                = retain;
+    msg->sender                = sender;
+    msg->sender_status.message = msg;
+    msg->sender_status.session = sender;
+    msg->state                 = MSG_NEW;
+    msg->type                  = type;
 
     if (retain) {
         /* TODO retained_message locking ? */
@@ -6540,6 +6682,12 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
             goto fail;
         }
         dbg_cprintf("packet_ident=%u ", packet_identifier);
+    } else {
+        /* [MQTT-3.3.1-1] */
+        if (flag_dup) {
+            reason_code = MQTT_PROTOCOL_ERROR;
+            goto fail;
+        }
     }
 
     uint8_t payload_format = 0; /* TODO extract from properties */
@@ -6607,6 +6755,24 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         reason_code = MQTT_PROTOCOL_ERROR;
         goto fail;
     }
+
+    /* TODO does MQTT_FLAG_PUBLISH_DUP alter this at all? */
+    pthread_rwlock_rdlock(&global_messages_lock);
+    for (const struct message *msg = global_message_list; msg; msg = msg->next)
+    {
+        if (msg->state != MSG_ACTIVE)
+            continue;
+
+        if (msg->sender == NULL || msg->sender != client->session)
+            continue;
+
+        if (msg->sender_status.packet_identifier == packet_identifier) {
+            pthread_rwlock_unlock(&global_messages_lock);
+            reason_code = MQTT_PACKET_IDENTIFIER_IN_USE;
+            goto fail;
+        }
+    }
+    pthread_rwlock_unlock(&global_messages_lock);
 
     struct message *msg;
     if ((msg = register_message(topic_name, payload_format, packet->payload_len,
@@ -6833,7 +6999,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
     dbg_printf("[%2d] handle_cp_subscribe: packet_identifier=%u\n",
             client->session->id, packet->packet_identifier);
 
-    if (packet->properties && packet->property_count && 
+    if (packet->properties && packet->property_count &&
             get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_SUBSCRIPTION_IDENTIFIER, &prop) == 0) {
         subscription_identifier = prop->byte4;
@@ -8811,9 +8977,16 @@ shit_fd:
 
 static int load_message(datum /* key */, datum content)
 {
-    const struct message_save *save = (void *)content.dptr;
-    struct message *msg;
+    //const struct message_save *save = (void *)content.dptr;
+    const void *save = (void *)content.dptr;
+    size_t bytes_remaining = content.dsize;
 
+    const struct message *msg = NULL;
+
+    if (deserialise_message(&msg, save, &bytes_remaining) == -1)
+        goto fail;
+
+    /*
     if ((msg = alloc_message(save->uuid)) == NULL)
         return -1;
 
@@ -8830,6 +9003,7 @@ static int load_message(datum /* key */, datum content)
     msg->type = save->type;
 
     msg->state = MSG_ACTIVE;
+    */
 
     dbg_printf("     open_databases: loaded saved message with uuid=%s\n",
             uuid_to_string(msg->uuid));
@@ -8837,8 +9011,8 @@ static int load_message(datum /* key */, datum content)
     return 0;
 fail:
     if (msg) {
-        msg->state = MSG_DEAD;
-        free_message(msg, true);
+        ((struct message *)msg)->state = MSG_DEAD;
+        free_message((void *)msg, true);
     }
     return -1;
 }
@@ -8916,9 +9090,8 @@ static int open_databases(void)
             if (tmp_content.dptr == NULL)
                 goto skip;
 
-            /* TODO message_save.payload is variable so < not != but this then
-             * makes others more error prone ... */
-            if ((size_t)tmp_content.dsize < database_init[idx].size) {
+            if (database_init[idx].size &&
+                    (size_t)tmp_content.dsize < database_init[idx].size) {
                 logger(LOG_ERR, NULL,
                         "open_databases: content.dsize mismatch in <%s> (got %d, expected %lu)",
                         database_init[idx].filename,
@@ -8939,6 +9112,8 @@ skip:
             tmp_key = dbm_nextkey(dbm);
         }
     }
+
+    link_topics();
 
     return 0;
 
