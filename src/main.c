@@ -53,6 +53,9 @@ static int64_t timems(void);
 #include "raft.h"
 #endif
 #include "debug.h"
+#ifdef TESTS
+#include "mqtt_test_api.h"
+#endif
 
 #define MAX(a,b) (((a)>(b)) ? (a) : (b))
 #define MIN(a,b) (((a)<(b)) ? (a) : (b))
@@ -3736,9 +3739,14 @@ static int is_valid_utf8(const uint8_t *str)
             bytes = 1;
         else if ((*ptr & 0xe0) == 0xc0)
             bytes = 2;
-        else if ((*ptr & 0xf0) == 0xe0)
+        else if ((*ptr & 0xf0) == 0xe0) {
+            /* surrogates U+D800..U+DFFF */
+            if (ptr[1] == '\0' || ptr[2] == '\0')
+                return -1;
+            if (*ptr == 0xed && (ptr[1] & 0xe0) == 0xa0)
+                return -1;
             bytes = 3;
-        else
+        } else
             return -1;
 
         ptr++;
@@ -5828,7 +5836,11 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     memcpy(ptr, remlen, remlen_len);
     ptr += remlen_len;
 
-    *ptr = 0;           /* Connect Ack Flags */
+    /* Session Present only valid on success */
+    if (reason_code == MQTT_SUCCESS)
+        *ptr = client->connect_response_flags;
+    else
+        *ptr = 0;
     ptr++;
 
     *ptr = reason_code; /* Connect Reason Code */
@@ -5848,7 +5860,8 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
     }
 
     free(packet);
-    free_properties(tmp_connack_props, num_tmp_connack_props);
+    if (tmp_connack_props)
+        free_properties(tmp_connack_props, num_tmp_connack_props);
 
 #if 0
     /* TODO check caller has called close_socket() correctly */
@@ -9126,6 +9139,7 @@ fail:
  * external functions
  */
 
+#ifndef TESTS
 int main(int argc, char *argv[])
 {
     errno = 0;
@@ -9488,3 +9502,42 @@ shit_usage:
     show_usage(stderr, argv[0]);
     exit(EXIT_FAILURE);
 }
+#endif
+
+#ifdef TESTS
+static int mqtt_register_session_test(struct session *session)
+{
+#ifdef FEATURE_RAFT
+    return register_session(session, true);
+#else
+    return register_session(session);
+#endif
+}
+
+const struct mqtt_test_api mqtt_test_api = {
+    .encode_var_byte = encode_var_byte,
+    .read_var_byte = read_var_byte,
+    .read_binary = read_binary,
+    .read_utf8 = read_utf8,
+    .is_valid_utf8 = is_valid_utf8,
+    .is_valid_connection_id = is_valid_connection_id,
+    .is_valid_topic_name = is_valid_topic_name,
+    .is_valid_topic_filter = is_valid_topic_filter,
+    .topic_match = topic_match,
+    .parse_properties = parse_properties,
+    .build_properties = build_properties,
+    .get_properties_size = get_properties_size,
+    .get_property_value = get_property_value,
+    .free_properties = free_properties,
+    .parse_incoming = parse_incoming,
+    .send_cp_puback = send_cp_puback,
+    .send_cp_pubrec = send_cp_pubrec,
+    .send_cp_pubrel = send_cp_pubrel,
+    .send_cp_pubcomp = send_cp_pubcomp,
+    .send_cp_suback = send_cp_suback,
+    .send_cp_unsuback = send_cp_unsuback,
+    .alloc_session = alloc_session,
+    .register_session = mqtt_register_session_test,
+    .free_session = free_session,
+};
+#endif

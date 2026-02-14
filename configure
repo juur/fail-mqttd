@@ -586,6 +586,7 @@ sed_escape()
 
 ARGS=$(cat <<- __END
 	s#@@DEPS@@#$(sed_escape "${DEPS}")#;
+	s#@@FEATURE_RAFT@@#$(sed_escape "${FEATURE_RAFT}")#;
 	s#@@BINDIR@@#$(sed_escape "${BINDIR}")#;
 	s#@@DOCDIR@@#$(sed_escape "${DOCDIR}")#;
 	s#@@CC@@#$(sed_escape "${CC}")#;

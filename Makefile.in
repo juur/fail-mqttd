@@ -58,16 +58,22 @@ prod_only_SRCS    := raft_impl.c
 
 all_SRCS          := $(main_SRCS) @@EXTRASRCS@@
 all_SRCS          := $(addprefix $(srcdir)/src/,$(all_SRCS))
-test_SRCS         := $(wildcard $(srcdir)/tests/test_*.c)
-test_CORE_SRCS    := $(filter-out $(prod_only_SRCS),$(raft_SRCS))
-test_SUPPORT_SRCS := $(wildcard $(srcdir)/tests/raft_*.c)
+test_SRCS              := $(wildcard $(srcdir)/tests/test_*.c)
+FEATURE_RAFT           := @@FEATURE_RAFT@@
+ifneq ($(FEATURE_RAFT),1)
+test_SRCS              := $(filter-out $(srcdir)/tests/test_raft%.c,$(test_SRCS))
+endif
+raft_TEST_CORE_SRCS    := $(filter-out $(prod_only_SRCS),$(raft_SRCS))
+raft_TEST_SUPPORT_SRCS := $(wildcard $(srcdir)/tests/raft_*.c)
+mqtt_TEST_CORE_SRCS    := main.c constants.c
 
 all_HEADERS       := $(wildcard $(srcdir)/include/*.h)
 
 package_OBJS      := $(addprefix $(objdir)/,$(notdir $(all_SRCS:.c=.o)))
-test_OBJS         := $(addprefix $(objdir)/tests/,$(notdir $(test_SRCS:.c=.o)))
-test_CORE_OBJS    := $(addprefix $(objdir)/,$(notdir $(test_CORE_SRCS:.c=.test.o)))
-test_SUPPORT_OBJS := $(addprefix $(objdir)/tests/,$(notdir $(test_SUPPORT_SRCS:.c=.o)))
+test_OBJS               := $(addprefix $(objdir)/tests/,$(notdir $(test_SRCS:.c=.o)))
+raft_TEST_CORE_OBJS     := $(addprefix $(objdir)/,$(notdir $(raft_TEST_CORE_SRCS:.c=.test.o)))
+raft_TEST_SUPPORT_OBJS  := $(addprefix $(objdir)/tests/,$(notdir $(raft_TEST_SUPPORT_SRCS:.c=.o)))
+mqtt_TEST_CORE_OBJS     := $(addprefix $(objdir)/,$(notdir $(mqtt_TEST_CORE_SRCS:.c=.test.o)))
 
 test_BINS         := $(addprefix $(objdir)/,$(notdir $(test_SRCS:.c=)))
 package_BIN       := $(objdir)/$(progprefix)$(PACKAGE)
@@ -129,7 +135,10 @@ $(objdir)/doc/$(PACKAGE).8: $(package_BIN) | $(objdir)/doc
 $(package_BIN): $(package_OBJS)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(objdir)/test_%: $(objdir)/tests/test_%.o $(test_CORE_OBJS) $(test_SUPPORT_OBJS)
+$(objdir)/test_raft%: $(objdir)/tests/test_raft%.o $(raft_TEST_CORE_OBJS) $(raft_TEST_SUPPORT_OBJS)
+	$(CC) $^ $(LDFLAGS) $(CHECK_LIBS) -o $@
+
+$(objdir)/test_mqtt%: $(objdir)/tests/test_mqtt%.o $(mqtt_TEST_CORE_OBJS)
 	$(CC) $^ $(LDFLAGS) $(CHECK_LIBS) -o $@
 
 .PHONY: install uninstall
@@ -155,8 +164,8 @@ distclean: clean
 		$(objdir)/fail-mqttd.service
 
 mostlyclean:
-	-$(RM) $(package_OBJS) $(package_BIN) $(test_OBJS) $(test_CORE_OBJS) \
-		$(test_SUPPORT_OBJS) $(test_BINS)
+	-$(RM) $(package_OBJS) $(package_BIN) $(test_OBJS) $(raft_TEST_CORE_OBJS) \
+		$(raft_TEST_SUPPORT_OBJS) $(mqtt_TEST_CORE_OBJS) $(test_BINS)
 	-$(RM) -f $(objdir)/*.gcda $(objdir)/*.gcno
 	-$(RM) -f $(objdir)/tests/*.gcda $(objdir)/tests/*.gcno
 
@@ -201,7 +210,8 @@ endif
 
 ifeq ($(DEPS),1)
 -include $(all_SRCS:$(srcdir)/src/%.c=$(objdir)/.d/%.d)
--include $(test_CORE_SRCS:$(srcdir)/%.c=$(objdir)/.d/tests/%.d)
--include $(test_SUPPORT_SRCS:$(srcdir)/tests/%.c=$(objdir)/.d/tests/%.d)
+-include $(raft_TEST_CORE_SRCS:$(srcdir)/%.c=$(objdir)/.d/tests/%.d)
+-include $(raft_TEST_SUPPORT_SRCS:$(srcdir)/tests/%.c=$(objdir)/.d/tests/%.d)
+-include $(mqtt_TEST_CORE_SRCS:%.c=$(objdir)/.d/tests/%.test.d)
 endif
 # :vim se noexpandtab
