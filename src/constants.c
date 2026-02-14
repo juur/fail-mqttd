@@ -260,3 +260,14 @@ const char *const reason_codes_str[MQTT_REASON_CODE_MAX] =
     [MQTT_SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED] = "SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED",
     [MQTT_WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED] = "WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED",
 };
+
+const char *const mqtt_type_str[T_MAX] = {
+    [T_NULL]         = "NULL",
+    [T_CLIENT]       = "CLIENT",
+    [T_MESSAGE]      = "MESSAGE",
+    [T_MDS]          = "MDS",
+    [T_PACKET]       = "PACKET",
+    [T_SESSION]      = "SESSION",
+    [T_SUBSCRIPTION] = "SUBSCRIPTION",
+    [T_TOPIC]        = "TOPIC",
+};

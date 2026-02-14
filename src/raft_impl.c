@@ -50,6 +50,85 @@ static const struct raft_impl_limits raft_log_settings[RAFT_MAX_LOG] ={
     [RAFT_LOG_UNREGISTER_SESSION] = { RAFT_LOG_UNREGISTER_SESSION_SIZE , RAFT_LOG_UNREGISTER_SESSION_SIZE } ,
 };
 
+/* helper functions */
+
+static inline void write_u32(struct send_state *out, const uint32_t val)
+{
+    memcpy(out->ptr, &val, sizeof(val));
+    out->ptr += sizeof(val);
+}
+
+static inline void write_u16(struct send_state *out, const uint16_t val)
+{
+    memcpy(out->ptr, &val, sizeof(val));
+    out->ptr += sizeof(val);
+}
+
+static inline void write_str(struct send_state *out, const void *src, size_t len)
+{
+    memcpy(out->ptr, src, len);
+    out->ptr += len;
+    *(out->ptr++) = '\0';
+}
+
+static inline void write_uuid(struct send_state *out, const uint8_t *src)
+{
+    memcpy(out->ptr, src, UUID_SIZE);
+    out->ptr += UUID_SIZE;
+}
+
+
+static int read_u16(uint16_t *dest, const uint8_t **ptr, size_t *bytes_remaining)
+{
+    memcpy(dest, *ptr, sizeof(*dest));
+    *dest = ntohs(*dest);
+    (*ptr) += sizeof(*dest);
+    (*bytes_remaining) -= sizeof(*dest);
+
+    return 0;
+}
+
+static int read_u32(uint32_t *dest, const uint8_t **ptr, size_t *bytes_remaining)
+{
+    memcpy(dest, *ptr, sizeof(*dest));
+    *dest = ntohl(*dest);
+    (*ptr) += sizeof(*dest);
+    (*bytes_remaining) -= sizeof(*dest);
+
+    return 0;
+}
+
+static int read_uuid(uint8_t dest[static UUID_SIZE], const uint8_t **ptr, size_t *bytes_remaining)
+{
+    if (*bytes_remaining < UUID_SIZE) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    memcpy(dest, *ptr, UUID_SIZE);
+    (*ptr) += UUID_SIZE;
+    (*bytes_remaining) -= UUID_SIZE;
+
+    return 0;
+}
+
+static int read_str(uint8_t **string, const uint8_t **ptr, size_t length, size_t *bytes_remaining)
+{
+    if (*bytes_remaining < length) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    if ((*string = (void *)strndup((void *)*ptr, length)) == NULL)
+        return -1;
+
+    *bytes_remaining -= length;
+    *ptr += length;
+    return 0;
+}
+
+/* implementation */
+
 static int free_log(struct raft_log *lg, raft_log_t event)
 {
     union raft_log_options *entry = &lg->opt;
@@ -246,31 +325,6 @@ static int register_topic_size_send(struct raft_log *lg, struct send_state *out,
     return 0;
 }
 
-static inline void write_u32(struct send_state *out, const uint32_t val)
-{
-    memcpy(out->ptr, &val, sizeof(val));
-    out->ptr += sizeof(val);
-}
-
-static inline void write_u16(struct send_state *out, const uint16_t val)
-{
-    memcpy(out->ptr, &val, sizeof(val));
-    out->ptr += sizeof(val);
-}
-
-static inline void write_str(struct send_state *out, const void *src, size_t len)
-{
-    memcpy(out->ptr, src, len);
-    out->ptr += len;
-    *(out->ptr++) = '\0';
-}
-
-static inline void write_uuid(struct send_state *out, const uint8_t *src)
-{
-    memcpy(out->ptr, src, UUID_SIZE);
-    out->ptr += UUID_SIZE;
-}
-
 static int unregister_topic_fill_send(struct send_state *out, const struct raft_log * /* lg */, raft_log_t /*event*/)
 {
     write_uuid(out, out->arg_uuid);
@@ -333,55 +387,6 @@ static raft_status_t unregister_topic_process_packet(size_t *bytes_remaining, co
 
 fail:
     return -1;
-}
-
-static int read_u16(uint16_t *dest, const uint8_t **ptr, size_t *bytes_remaining)
-{
-    memcpy(dest, *ptr, sizeof(*dest));
-    *dest = ntohs(*dest);
-    (*ptr) += sizeof(*dest);
-    (*bytes_remaining) -= sizeof(*dest);
-
-    return 0;
-}
-
-static int read_u32(uint32_t *dest, const uint8_t **ptr, size_t *bytes_remaining)
-{
-    memcpy(dest, *ptr, sizeof(*dest));
-    *dest = ntohl(*dest);
-    (*ptr) += sizeof(*dest);
-    (*bytes_remaining) -= sizeof(*dest);
-
-    return 0;
-}
-
-static int read_uuid(uint8_t dest[static UUID_SIZE], const uint8_t **ptr, size_t *bytes_remaining)
-{
-    if (*bytes_remaining < UUID_SIZE) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-
-    memcpy(dest, *ptr, UUID_SIZE);
-    (*ptr) += UUID_SIZE;
-    (*bytes_remaining) -= UUID_SIZE;
-
-    return 0;
-}
-
-static int read_str(uint8_t **string, const uint8_t **ptr, size_t length, size_t *bytes_remaining)
-{
-    if (*bytes_remaining < length) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-
-    if ((*string = (void *)strndup((void *)*ptr, length)) == NULL)
-        return -1;
-
-    *bytes_remaining -= length;
-    *ptr += length;
-    return 0;
 }
 
 static raft_status_t register_session_process_packet(size_t *bytes_remaining, const uint8_t **ptr,

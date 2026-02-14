@@ -49,7 +49,9 @@ static int64_t timems(void);
 #define RAFT_API_SOURCE_SELF
 
 #include "mqtt.h"
+#ifdef FEATURE_RAFT
 #include "raft.h"
+#endif
 #include "debug.h"
 
 #define MAX(a,b) (((a)>(b)) ? (a) : (b))
@@ -83,14 +85,14 @@ static int64_t timems(void);
 # define RETURN_TYPE int
 #endif
 
-typedef int (*control_func_t)(struct client *, struct packet *, const void *);
-
 /*
  * misc. globals
  */
 
-static uint8_t global_hwaddr[8];
+static constexpr unsigned MAC_ADDR_LEN = 6;
+
 _Atomic bool running;
+static uint8_t global_hwaddr[MAC_ADDR_LEN];
 static int global_mother_fd = -1;
 #ifdef FEATURE_OM
 static int global_om_fd = -1;
@@ -112,29 +114,30 @@ static _Atomic id_t mds_id          = 1;
  * magic numbers
  */
 
-static const unsigned  MAX_PACKETS           = 0x100;
-static const unsigned  MAX_CLIENTS           = 0x100;
-static const unsigned  MAX_TOPICS            = 0x1000;
-static const unsigned  MAX_MESSAGES          = 0x100000;
-static const unsigned  MAX_PACKET_LENGTH     = 0x1000000U;
-static const unsigned  MAX_MESSAGES_PER_TICK = 0x100;
-static const unsigned  MAX_PROPERTIES        = 0x10;
-static const unsigned  MAX_RECEIVE_PUBS      = 0x10;
-static const unsigned  MAX_SESSIONS          = 0x100;
-static const unsigned  MAX_TOPIC_ALIAS       = 0x20;
-static const unsigned  MIN_KEEP_ALIVE        = 60;
-static const unsigned  MAX_CLIENTID_LEN      = 0x100;
+static constexpr unsigned  MAX_PACKETS           = 0x100;
+static constexpr unsigned  MAX_CLIENTS           = 0x100;
+static constexpr unsigned  MAX_TOPICS            = 0x1000;
+static constexpr unsigned  MAX_MESSAGES          = 0x100000;
+static constexpr unsigned  MAX_PACKET_LENGTH     = 0x1000000U;
+static constexpr unsigned  MAX_MESSAGES_PER_TICK = 0x100;
+static constexpr unsigned  MAX_PROPERTIES        = 0x10;
+static constexpr unsigned  MAX_RECEIVE_PUBS      = 0x10;
+static constexpr unsigned  MAX_SESSIONS          = 0x100;
+static constexpr unsigned  MAX_TOPIC_ALIAS       = 0x20;
+static constexpr unsigned  MIN_KEEP_ALIVE        = 60;
+static constexpr unsigned  MAX_CLIENTID_LEN      = 0x100;
 
-static const uint32_t  MAX_SUB_IDENTIFIER    = 0xfffffff;
-static const uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
+static constexpr uint32_t  MAX_SUB_IDENTIFIER    = 0xfffffff;
+static constexpr uint64_t  UUID_EPOCH_OFFSET     = 0x01B21DD213814000ULL;
 
-static const char  *const PID_FILE              = RUNSTATEDIR "/fail-mqttd.pid";
-static const char  *const DEF_DB_PATH           = LOCALSTATEDIR "/fail-mqttd/";
-static const char         SHARED_PREFIX[]       = {'$','s','h','a','r','e','d','/'};
-static const size_t       SHARED_PREFIX_LENGTH  = sizeof(SHARED_PREFIX);
-static const char         PROTOCOL_NAME[]       = {'M','Q','T','T'};
-static const size_t       PROTOCOL_NAME_LEN     = sizeof(PROTOCOL_NAME);
-static const uint8_t      PROTOCOL_VERSION      = 5;
+static const char *const PID_FILE                = RUNSTATEDIR "/fail-mqttd.pid";
+static const char *const DEF_DB_PATH             = LOCALSTATEDIR "/fail-mqttd/";
+
+static constexpr char     SHARED_PREFIX[]        = {'$','s','h','a','r','e','d','/'};
+static constexpr size_t   SHARED_PREFIX_LENGTH   = sizeof(SHARED_PREFIX);
+static constexpr char     PROTOCOL_NAME[]        = {'M','Q','T','T'};
+static constexpr size_t   PROTOCOL_NAME_LEN      = sizeof(PROTOCOL_NAME);
+static constexpr uint8_t  PROTOCOL_VERSION       = 5;
 
 /*
  * global lists and associated locks & counts
@@ -238,6 +241,9 @@ static const struct {
  * forward declarations
  */
 
+[[gnu::nonnull]] static bool is_null_uuid(const uint8_t uuid[static UUID_SIZE]);
+[[gnu::nonnull, gnu::warn_unused_result]] struct session *find_session_by_uuid(const uint8_t uuid[static UUID_SIZE]);
+[[gnu::nonnull, gnu::warn_unused_result]] struct topic *find_topic_by_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull]] static void handle_outbound(struct client *client);
 [[gnu::nonnull]] static void set_outbound(struct client *client, const uint8_t *buf, unsigned len);
 [[gnu::nonnull]] static void close_session(struct session *session
@@ -256,7 +262,7 @@ static const struct {
 [[gnu::nonnull(3),gnu::format(printf,3,4)]] void logger(int priority,
         const struct client *client, const char *format, ...);
 [[gnu::nonnull(1),gnu::warn_unused_result]] struct topic *register_topic(const uint8_t *name,
-        const uint8_t uuid[const UUID_SIZE] RAFT_API_SOURCE_SELF);
+        const uint8_t uuid[UUID_SIZE] RAFT_API_SOURCE_SELF);
 [[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe_from_topics(struct session *session,
         const struct topic_sub_request *request);
 [[gnu::nonnull]] static int unsubscribe_session_from_all(struct session *session);
@@ -657,7 +663,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected,
 #define log_io_error(m,r,e,d,c) _log_io_error(m,r,e,d,c,__FILE__,__func__,__LINE__)
 
 #if defined(FEATURE_DEBUG) || defined(FEATURE_RAFT_DEBUG)
-const char *uuid_to_string(const uint8_t uuid[const static UUID_SIZE])
+const char *uuid_to_string(const uint8_t uuid[static UUID_SIZE])
 {
     static char buf[37];
 
@@ -674,6 +680,75 @@ const char *uuid_to_string(const uint8_t uuid[const static UUID_SIZE])
              uuid[13], uuid[14], uuid[15]);
 
      return buf;
+}
+#endif
+
+#ifdef FEATURE_DEBUG
+void dump_all_clients(void)
+{
+    pthread_rwlock_rdlock(&global_clients_lock);
+    for (struct client *clnt = global_client_list; clnt; clnt = clnt->next)
+        dump_client(clnt);
+    pthread_rwlock_unlock(&global_clients_lock);
+}
+
+void dump_all_sessions(void)
+{
+    pthread_rwlock_rdlock(&global_sessions_lock);
+    for (struct session *session = global_session_list; session; session = session->next)
+        dump_session(session);
+    pthread_rwlock_unlock(&global_sessions_lock);
+}
+
+void dump_all_messages(void)
+{
+    pthread_rwlock_rdlock(&global_messages_lock);
+    for (struct message *msg = global_message_list; msg; msg = msg->next)
+        dump_message(msg);
+    pthread_rwlock_unlock(&global_messages_lock);
+}
+
+void dump_all_packets(void)
+{
+    pthread_rwlock_rdlock(&global_packets_lock);
+    for (struct packet *pkt = global_packet_list; pkt; pkt = pkt->next)
+        dump_packet(pkt);
+    pthread_rwlock_unlock(&global_packets_lock);
+}
+
+void dump_all_topics(void)
+{
+    pthread_rwlock_rdlock(&global_topics_lock);
+    for (struct topic *topic = global_topic_list; topic; topic = topic->next)
+        dump_topic(topic);
+    pthread_rwlock_unlock(&global_topics_lock);
+}
+
+void dump_all_mds(void)
+{
+    pthread_rwlock_rdlock(&global_mds_lock);
+    for (struct message_delivery_state *mds = global_mds_list; mds; mds = mds->next)
+        dump_mds(mds);
+    pthread_rwlock_unlock(&global_mds_lock);
+}
+
+void dump_all_subscriptions(void)
+{
+    pthread_rwlock_rdlock(&global_subscriptions_lock);
+    for (struct subscription *sub = global_subscription_list; sub; sub = sub->next)
+        dump_subscription(sub);
+    pthread_rwlock_unlock(&global_subscriptions_lock);
+}
+
+void dump_all(void)
+{
+    dump_all_clients();
+    dump_all_sessions();
+    dump_all_messages();
+    dump_all_packets();
+    dump_all_topics();
+    dump_all_mds();
+    dump_all_subscriptions();
 }
 #endif
 
@@ -734,10 +809,10 @@ void sock_nonblock(int fd)
  * UUID helpers
  */
 
-static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
+static int get_first_hwaddr(uint8_t out[static MAC_ADDR_LEN], size_t out_length)
 {
     struct ifaddrs *ifaddr;
-    int copy_len;
+    unsigned copy_len;
     const struct sockaddr_ll *sock;
 
     if (getifaddrs(&ifaddr) == -1) {
@@ -760,6 +835,7 @@ static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
             continue;
 
         copy_len = sock->sll_halen < out_length ? sock->sll_halen : out_length;
+        assert(copy_len <= MAC_ADDR_LEN);
         memcpy(out, sock->sll_addr, copy_len);
 
         freeifaddrs(ifaddr);
@@ -771,7 +847,7 @@ static int get_first_hwaddr(uint8_t out[static 6], size_t out_length)
     return -1;
 }
 
-static int generate_uuid(uint8_t hwaddr[const static 6], uint8_t out[UUID_SIZE])
+static int generate_uuid(uint8_t hwaddr[static MAC_ADDR_LEN], uint8_t out[static UUID_SIZE])
 {
     struct uuid_build uuid;
     struct timespec tp;
@@ -811,7 +887,7 @@ static int generate_uuid(uint8_t hwaddr[const static 6], uint8_t out[UUID_SIZE])
     out[8] = (uuid.clk_seq_hi_res);
     out[9] = (uuid.clk_seq_low);
 
-    memcpy(&out[10], hwaddr, 6);
+    memcpy(&out[10], hwaddr, MAC_ADDR_LEN);
 
     return 0;
 }
@@ -1248,6 +1324,12 @@ static int mds_detach_and_free(struct message_delivery_state *mds,
     errno = 0;
     int rc = 0;
 
+    if (mds->read_only) {
+        warn("mds_detach_and_free: attempt to free read_only MDS");
+        errno = EPERM;
+        return -1;
+    }
+
     dbg_printf(BGRN "     mds_detach_and_free: called on mds %d (message %d, session %d)" CRESET "\n",
             mds->id,
             mds->message ? mds->message->id : -1U,
@@ -1569,7 +1651,7 @@ static int free_message_delivery_state(struct message_delivery_state *mds)
 {
     assert(mds != NULL);
 
-    if ((mds)->deleted) {
+    if (mds->state == MDS_DELETED) {
         warnx("free_message_delivery_state: is deleted: mds=%p id=%u", mds, mds->id);
         errno = EFAULT;
         abort();
@@ -1601,7 +1683,7 @@ static int free_message_delivery_state(struct message_delivery_state *mds)
     if((mds)->message)
         abort();
 
-    (mds)->deleted = true;
+    mds->state = MDS_DELETED;
 
     free(mds);
     mds = NULL;
@@ -2033,32 +2115,52 @@ static void free_session(struct session *session, bool need_lock)
     free(session);
 }
 
-[[gnu::malloc, gnu::nonnull, gnu::warn_unused_result]]
-static struct message_delivery_state *alloc_message_delivery_state(
+[[gnu::nonnull]]
+static void attach_mds(struct message_delivery_state *mds,
         struct message *message, struct session *session)
+{
+    INC_REFCNT(&session->refcnt);
+    mds->session = session;
+    INC_REFCNT(&message->refcnt);
+    mds->message = message;
+
+    pthread_rwlock_wrlock(&global_mds_lock);
+    mds->state = MDS_ACTIVE;
+    mds->next = global_mds_list;
+    global_mds_list = mds;
+    num_mds++;
+    pthread_rwlock_unlock(&global_mds_lock);
+}
+
+[[gnu::malloc, gnu::warn_unused_result]]
+static struct message_delivery_state *alloc_message_delivery_state(
+        struct message *message, struct session *session, bool detached)
 {
     struct message_delivery_state *ret;
 
     if ((ret = calloc(1, sizeof(struct message_delivery_state))) == NULL)
         goto fail;
 
-    INC_REFCNT(&session->refcnt); /* mds_detach_and_free */
-    ret->session = session;
+    ret->state = MDS_NEW;
 
-    INC_REFCNT(&message->refcnt); /* mds_detach_and_free */
-    ret->message = message;
+    if (detached == false && (message == NULL || session == NULL)) {
+        errno = EINVAL;
+        return NULL;
+    }
 
     ret->id = mds_id++;
 
-    dbg_printf("     alloc_message_delivery_state: session=%d[%u] message=%u[%u]\n",
-            session->id, session->refcnt,
-            message->id, message->refcnt);
+    if (detached) {
+        dbg_printf("     alloc_message_delivery_state: detached\n");
+    } else {
+        dbg_printf("     alloc_message_delivery_state: session=%d[%u] message=%u[%u]\n",
+                session->id, session->refcnt,
+                message->id, message->refcnt);
+    }
 
-    pthread_rwlock_wrlock(&global_mds_lock);
-    ret->next = global_mds_list;
-    global_mds_list = ret;
-    num_mds++;
-    pthread_rwlock_unlock(&global_mds_lock);
+    if (!detached)
+        attach_mds(ret, message, session);
+
     return ret;
 
 fail:
@@ -2125,7 +2227,7 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]]
+    [[gnu::nonnull]]
 static int add_session_to_shared_sub(struct subscription *sub,
         struct session *session, uint8_t qos)
 {
@@ -2368,7 +2470,7 @@ static struct packet *alloc_packet(struct client *owner, packet_type_t direction
 }
 
 [[gnu::malloc, gnu::warn_unused_result]]
-static struct message *alloc_message(const uint8_t uuid[const UUID_SIZE])
+static struct message *alloc_message(const uint8_t uuid[UUID_SIZE])
 {
     struct message *ret = NULL;
 
@@ -2384,6 +2486,7 @@ static struct message *alloc_message(const uint8_t uuid[const UUID_SIZE])
 
     ret->state = MSG_NEW;
     ret->sender_status.read_only = true;
+    ret->sender_status.state = MDS_ACTIVE;
 
     if (uuid == NULL && generate_uuid(global_hwaddr, ret->uuid) == -1)
         goto fail;
@@ -2466,6 +2569,515 @@ fail:
 /*
  * persistence functions
  */
+
+static inline void write_u32(char **out, uint32_t val)
+{
+    val = htonl(val);
+    memcpy(*out, &val, sizeof(val));
+    *out += sizeof(val);
+}
+
+static inline void write_u16(char **out, uint16_t val)
+{
+    val = htons(val);
+    memcpy(*out, &val, sizeof(val));
+    *out += sizeof(val);
+}
+
+static inline void write_u8(char **out, uint8_t val)
+{
+    memcpy(*out, &val, sizeof(val));
+    *out += sizeof(val);
+}
+
+static inline void write_bytes(char **out, const void *src, size_t len)
+{
+    memcpy(*out, src, len);
+    *out += len;
+}
+
+static inline void write_uuid(char **out, const uint8_t *src)
+{
+    memcpy(*out, src, UUID_SIZE);
+    *out += UUID_SIZE;
+}
+
+static inline int read_u32(uint32_t *out, const char **in, size_t *bytes_remaining)
+{
+    if (*bytes_remaining < sizeof(uint32_t)) {
+        errno = ENOSPC;
+        return -1;
+    }
+
+    memcpy(out, *in, sizeof(uint32_t));
+    *out = ntohl(*out);
+
+    *in += sizeof(uint32_t);
+    *bytes_remaining -= sizeof(uint32_t);
+
+    return 0;
+}
+
+static inline int read_u16(uint16_t *out, const char **in, size_t *bytes_remaining)
+{
+    if (*bytes_remaining < sizeof(uint16_t)) {
+        errno = ENOSPC;
+        return -1;
+    }
+
+    memcpy(out, *in, sizeof(uint16_t));
+    *out = ntohs(*out);
+
+    *in += sizeof(uint16_t);
+    *bytes_remaining -= sizeof(uint16_t);
+
+    return 0;
+}
+
+static inline int read_u8(uint8_t *out, const char **in, size_t *bytes_remaining)
+{
+    if (*bytes_remaining < sizeof(uint8_t)) {
+        errno = ENOSPC;
+        return -1;
+    }
+
+    *out = **in;
+
+    *in += sizeof(uint8_t);
+    *bytes_remaining -= sizeof(uint8_t);
+
+    return 0;
+}
+
+static inline int read_uuid(uint8_t out[static UUID_SIZE], const char **in, size_t *bytes_remaining)
+{
+    if (*bytes_remaining < UUID_SIZE) {
+        errno = ENOSPC;
+        return -1;
+    }
+
+    memcpy(out, *in, UUID_SIZE);
+
+    *in += UUID_SIZE;
+    *bytes_remaining -= UUID_SIZE;
+
+    return 0;
+}
+
+static inline int read_bytes(uint8_t *out, const char **in, size_t *bytes_remaining, size_t len)
+{
+    if (*bytes_remaining < len) {
+        errno = ENOSPC;
+        return -1;
+    }
+
+    memcpy(out, *in, len);
+
+    *in += len;
+    *bytes_remaining -= len;
+
+    return 0;
+}
+
+[[maybe_unused]] static int size_topic(const struct topic *topic)
+{
+    int ret = 0;
+
+    if (topic->state != TOPIC_ACTIVE) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret += sizeof(topic->uuid);
+    ret += sizeof(topic->retained_message->uuid);
+    ret += sizeof(uint16_t); /* name_length */
+    const size_t name_len = strlen((void *)topic->name);
+    if (name_len > UINT16_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    ret += name_len;
+
+    return ret;
+}
+
+[[maybe_unused]] static int size_message(const struct message *msg)
+{
+    int ret = 0;
+
+    if (msg->deleted || msg->state != MSG_ACTIVE) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret += sizeof(msg->uuid);
+
+    ret += sizeof((uint32_t)msg->payload_len);
+    ret += sizeof((uint8_t)msg->format);
+    ret += sizeof((uint8_t)msg->qos);
+    ret += sizeof((uint8_t)msg->retain);
+    ret += sizeof((uint8_t)msg->type);
+
+    /* the abscence of a sender is implied by NULL_UUID */
+    ret += sizeof(msg->sender->uuid);
+    /* the abscence of a topic is implied by NULL_UUID */
+    ret += sizeof(msg->topic->uuid);
+
+    if (msg->payload_len > UINT32_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    if (msg->qos > 0) {
+        static constexpr int mds_size =
+          sizeof((uint16_t)msg->sender_status.packet_identifier)
+        + sizeof(msg->sender_status.session->uuid)
+        + sizeof((uint32_t)msg->sender_status.last_sent)
+        + sizeof((uint32_t)msg->sender_status.acknowledged_at)
+        + sizeof((uint32_t)msg->sender_status.released_at)
+        + sizeof((uint32_t)msg->sender_status.completed_at)
+        + sizeof((uint8_t)msg->sender_status.client_reason);
+
+        if (msg->num_message_delivery_states > UINT16_MAX) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        ret += mds_size; /* sender_status */
+        ret += sizeof((uint16_t)msg->num_message_delivery_states);
+        ret += mds_size * msg->num_message_delivery_states;
+    }
+
+    ret += msg->payload_len;
+
+    return ret;
+}
+
+[[maybe_unused]] static int size_session(const struct session *s)
+{
+    int ret = 0;
+
+    if (s->state != SESSION_ACTIVE) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ret += sizeof(s->uuid);
+    ret += sizeof((uint32_t)s->last_connected);
+    ret += sizeof((uint32_t)s->expiry_interval);
+    ret += sizeof((uint8_t)s->request_response_information);
+    ret += sizeof((uint8_t)s->request_problem_information);
+    ret += sizeof(uint16_t); /* client_id_length */
+
+    /* Cannot be NULL */
+    const size_t client_id_length = strlen((void *)s->client_id);
+    if (client_id_length > UINT16_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    ret += client_id_length;
+
+    if (s->num_subscriptions > UINT16_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    ret += sizeof((uint16_t)s->num_subscriptions);
+
+    static constexpr int sub_size_fixed =
+      sizeof((uint8_t)s->subscriptions[0]->type)
+    + sizeof(uint16_t) /* topic_filter_length */
+    + sizeof((uint8_t)s->subscriptions[0]->option)
+    + sizeof((uint32_t)s->subscriptions[0]->subscription_identifier);
+
+    for (unsigned idx = 0; idx < s->num_subscriptions; idx++)
+    {
+        if (s->subscriptions[idx] == NULL || s->subscriptions[idx]->topic_filter == NULL) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        ret += sub_size_fixed;
+
+        const size_t topic_filter_len = strlen((void *)s->subscriptions[idx]->topic_filter);
+        if (topic_filter_len > UINT16_MAX) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+
+        ret += topic_filter_len;
+    }
+
+    return ret;
+}
+
+static constexpr uint8_t NULL_UUID[UUID_SIZE] = { 0 };
+
+/**
+ * only to be called from a serialise_ function
+ */
+static int write_mds(char **dst, const struct message_delivery_state *mds)
+{
+    write_u16(dst, mds->packet_identifier);
+    if (mds->session)
+        write_uuid(dst, mds->session->uuid);
+    else {
+        errno = EINVAL;
+        return -1;
+    }
+    write_u32(dst, mds->last_sent);
+    write_u32(dst, mds->acknowledged_at);
+    write_u32(dst, mds->released_at);
+    write_u32(dst, mds->completed_at);
+    write_u8(dst, mds->client_reason);
+
+    return 0;
+}
+
+[[gnu::nonnull]]
+static int read_mds(struct message_delivery_state *mds, const char **src, size_t *bytes_remaining, struct message *msg, bool attach)
+{
+    uint8_t tmp_uuid[UUID_SIZE];
+    uint32_t tmp_u32;
+    uint8_t tmp_u8;
+    int rc;
+
+    rc = read_u16(&mds->packet_identifier, src, bytes_remaining);
+    if (rc == -1) goto fail;
+
+    rc = read_uuid(tmp_uuid, src, bytes_remaining);
+    if (rc == -1) goto fail;
+
+    rc = read_u32(&tmp_u32, src, bytes_remaining); mds->last_sent = tmp_u32;
+    if (rc == -1) goto fail;
+
+    rc = read_u32(&tmp_u32, src, bytes_remaining); mds->acknowledged_at = tmp_u32;
+    if (rc == -1) goto fail;
+
+    rc = read_u32(&tmp_u32, src, bytes_remaining); mds->released_at = tmp_u32;
+    if (rc == -1) goto fail;
+
+    rc = read_u32(&tmp_u32, src, bytes_remaining); mds->completed_at = tmp_u32;
+    if (rc == -1) goto fail;
+
+    rc = read_u8(&tmp_u8, src, bytes_remaining); mds->client_reason = (reason_code_t)tmp_u8;
+    if (rc == -1) goto fail;
+
+    struct session *session;
+
+    if (memcmp(tmp_uuid, NULL_UUID, UUID_SIZE) == 0) {
+        goto no_session;
+    } else {
+        if ((session = find_session_by_uuid(tmp_uuid)) == NULL) {
+no_session:
+            errno = ENOENT;
+            return -1;
+        }
+    }
+
+
+    if (attach)
+        attach_mds(mds, msg, session);
+    else {
+        mds->session = session;
+    }
+
+    return 0;
+fail:
+    return -1;
+}
+
+[[maybe_unused]] static int deserialise_message(const struct message **ret, void *buffer, size_t *bytes_remaining)
+{
+    const char **src = buffer;
+    uint32_t tmp_u32;
+    uint8_t tmp_u8;
+    uint16_t tmp_u16;
+    uint8_t tmp_uuid[UUID_SIZE];
+    int rc;
+    struct message *out = NULL;
+
+    *ret = NULL;
+
+    rc = read_uuid(tmp_uuid, src, bytes_remaining);
+    if (rc == -1 || is_null_uuid(tmp_uuid)) goto fail;
+
+    if ((out = alloc_message(tmp_uuid)) == NULL)
+        goto fail;
+
+    rc = read_u32(&tmp_u32, src, bytes_remaining); out->payload_len = tmp_u32;
+    if (rc == -1) goto fail;
+    rc = read_u8(&tmp_u8, src, bytes_remaining); out->format = tmp_u8;
+    if (rc == -1) goto fail;
+    rc = read_u8(&tmp_u8, src, bytes_remaining); out->qos = tmp_u8;
+    if (rc == -1) goto fail;
+    rc = read_u8(&tmp_u8, src, bytes_remaining); out->retain = tmp_u8;
+    if (rc == -1) goto fail;
+    rc = read_u8(&tmp_u8, src, bytes_remaining); out->type = (message_type_t)tmp_u8;
+    if (rc == -1) goto fail;
+
+    if ( 
+            (out->payload_len > MAX_PACKET_LENGTH) ||
+            (out->qos > 2) ||
+            (out->type >= MSG_TYPE_MAX) 
+       ) {
+        errno = EINVAL;
+        goto fail;
+    }
+
+        errno = 
+
+    rc = read_uuid(tmp_uuid, src, bytes_remaining);
+    if (rc == -1) goto fail;
+    if (is_null_uuid(tmp_uuid))
+        out->sender = NULL;
+    else if ((out->sender = find_session_by_uuid(tmp_uuid)) == NULL) {
+        errno = ENOENT;
+        goto fail;
+    }
+
+    rc = read_uuid(tmp_uuid, src, bytes_remaining);
+    if (rc == -1) goto fail;
+    if (is_null_uuid(tmp_uuid))
+        out->topic = NULL;
+    else if ((out->topic = find_topic_by_uuid(tmp_uuid)) == NULL) {
+        errno = ENOENT;
+        goto fail;
+    }
+
+    if (out->qos) {
+        rc = read_mds(&out->sender_status, src, bytes_remaining, out, false);
+        if (rc == -1) goto fail;
+        rc = read_u16(&tmp_u16, src, bytes_remaining); out->num_message_delivery_states = tmp_u16;
+        if (rc == -1) goto fail;
+
+        out->delivery_states = calloc(out->num_message_delivery_states,
+                sizeof(struct message_delivery_state *));
+
+        if (out->delivery_states == NULL)
+            goto fail;
+
+        for (unsigned idx = 0; idx < out->num_message_delivery_states; idx++)
+        {
+            if ((out->delivery_states[idx] = alloc_message_delivery_state(NULL, NULL, true)) == NULL)
+                goto fail;
+
+            rc = read_mds(out->delivery_states[idx], src, bytes_remaining, out, true);
+            if (rc == -1) goto fail;
+        }
+    }
+
+    if (out->payload_len) {
+        if (out->payload_len > *bytes_remaining) {
+            errno = EOVERFLOW;
+            goto fail;
+        }
+
+        if ((out->payload = malloc(out->payload_len)) == NULL)
+            goto fail;
+        rc = read_bytes((void *)out->payload, src, bytes_remaining, out->payload_len);
+        if (rc == -1) goto fail;
+    } else
+        out->payload = NULL;
+
+    out->state = MSG_ACTIVE;
+    *ret = out;
+    return 0;
+
+fail:
+    if (out) {
+        out->state = MSG_DEAD;
+        free_message(out, true);
+    }
+    *ret = NULL;
+    return -1;
+}
+
+/**
+ * buffer must be sized using size_message() first
+ */
+[[maybe_unused]] static int serialise_message(const struct message *msg, void *buffer)
+{
+    char *dst = buffer;
+
+    write_uuid(&dst, msg->uuid);
+
+    write_u32(&dst, msg->payload_len);
+    write_u8(&dst, msg->format);
+    write_u8(&dst, msg->qos);
+    write_u8(&dst, msg->retain);
+    write_u8(&dst, msg->type);
+
+    write_uuid(&dst, msg->sender ? msg->sender->uuid : NULL_UUID);
+
+    /* we need to store even for no retain, so QoS>0 works */
+    write_uuid(&dst, msg->topic ? msg->topic->uuid : NULL_UUID);
+
+    if (msg->qos) {
+        if (write_mds(&dst, &msg->sender_status) == -1)
+            return -1;
+        write_u16(&dst, msg->num_message_delivery_states);
+
+        for (unsigned idx = 0; idx < msg->num_message_delivery_states; idx++)
+            if (write_mds(&dst, msg->delivery_states[idx]) == -1)
+                return -1;
+    }
+
+    write_bytes(&dst, msg->payload, msg->payload_len);
+
+    return 0;
+}
+
+/**
+ * buffer must be sized using size_session() first
+ */
+[[maybe_unused]] static int serialise_session(const struct session *s, void *buffer)
+{
+    char *dst = buffer;
+
+    write_uuid(&dst, s->uuid);
+    write_u32(&dst, s->last_connected);
+    write_u32(&dst, s->expiry_interval);
+    write_u8(&dst, s->request_response_information);
+    write_u8(&dst, s->request_problem_information);
+
+    const size_t client_id_len = strlen((void *)s->client_id);
+    write_u16(&dst, client_id_len);
+    write_bytes(&dst, s->client_id, client_id_len);
+
+    write_u16(&dst, s->num_subscriptions);
+
+    for (unsigned idx = 0; idx < s->num_subscriptions; idx++)
+    {
+        write_u8(&dst, s->subscriptions[idx]->type);
+        const size_t topic_filter_len = strlen((void *)s->subscriptions[idx]->topic_filter);
+        write_u16(&dst, topic_filter_len);
+        write_bytes(&dst, s->subscriptions[idx]->topic_filter, topic_filter_len);
+        write_u8(&dst, s->subscriptions[idx]->option);
+        write_u32(&dst, s->subscriptions[idx]->subscription_identifier);
+    }
+
+    return 0;
+}
+
+/**
+ * buffer must be sized using size_message() first
+ */
+[[maybe_unused]] static int serialise_topic(const struct topic *topic, void *buffer)
+{
+    char *dst = buffer;
+
+    write_uuid(&dst, topic->uuid);
+    if (topic->retained_message)
+        write_uuid(&dst, topic->retained_message->uuid);
+    else
+        write_uuid(&dst, NULL_UUID);
+
+    const size_t name_len = strlen((void *)topic->name);
+    write_u16(&dst, name_len);
+    write_bytes(&dst, topic->name, name_len);
+
+    return 0;
+}
 
 [[gnu::nonnull]]
 static int save_message(const struct message *msg)
@@ -3530,7 +4142,10 @@ static void free_all_message_delivery_states(void)
     for (mds = global_mds_list; mds; mds = next)
     {
         next = mds->next;
-        if (mds_detach_and_free(mds, false, false) == -1)
+        if (mds->state != MDS_ACTIVE) {
+            if (free_message_delivery_state(mds) == -1)
+                warn("free_all_message_delivery_states: free_message_delivery_state");
+        } else if (mds_detach_and_free(mds, false, false) == -1)
             warn("free_all_message_delivery_states: mds_detach_and_free");
     }
 }
@@ -3763,7 +4378,7 @@ static struct subscription *find_subscription(const struct session *session,
 }
 
 [[gnu::nonnull(1), gnu::warn_unused_result]]
-struct topic *register_topic(const uint8_t *name, const uint8_t uuid[const UUID_SIZE] RAFT_API_SOURCE_SELF)
+struct topic *register_topic(const uint8_t *name, const uint8_t uuid[UUID_SIZE] RAFT_API_SOURCE_SELF)
 {
     struct topic *ret;
 
@@ -3932,7 +4547,7 @@ static int enqueue_one_mds(struct message *msg, struct session *session)
 
     /* TODO lock the subscriber? */
 
-    if ((mds = alloc_message_delivery_state(msg, session)) == NULL) {
+    if ((mds = alloc_message_delivery_state(msg, session, false)) == NULL) {
         warn("enqueue_message: alloc_message_delivery_state");
         /* TODO ???? */
         return -1;
@@ -4384,6 +4999,7 @@ static int unsubscribe_from_topics(struct session *session,
 [[gnu::nonnull]]
 static int subscribe_to_one_topic(struct session *session,
         uint8_t *reason_code,
+        bool *added,
         const uint8_t *topic_filter,
         uint32_t subscription_identifier,
         uint8_t options,
@@ -4396,6 +5012,7 @@ static int subscribe_to_one_topic(struct session *session,
     subscription_type_t type = SUB_NON_SHARED;
 
     errno = 0;
+    *added = false;
 
     if (*reason_code > MQTT_GRANTED_QOS_2) {
         dbg_printf("[%d] subscribe_to_topics: reason code is %u\n",
@@ -4453,7 +5070,8 @@ not_shared:
         }
 
         session->subscriptions[sub_idx] = new_sub;
-        session->num_subscriptions++;
+        //session->num_subscriptions++;
+        *added = true;
         existing_sub = new_sub;
 
         goto force_existing;
@@ -4524,6 +5142,7 @@ static int subscribe_to_topics(struct session *session,
 {
     struct subscription **tmp_subs = NULL;
     size_t sub_size;
+    unsigned base, added = 0;
 
     errno = 0;
 
@@ -4532,8 +5151,11 @@ static int subscribe_to_topics(struct session *session,
     /* Grow the session subscription array by the number of new subscriptions */
     /* TODO if any of the requests are _updates_ this leaves holes in the
      * subscriptions[] array of the session */
-    sub_size = sizeof(struct subscription *) * (session->num_subscriptions +
-            request->num_topics);
+    //sub_size = sizeof(struct subscription *) * (session->num_subscriptions +
+    //        request->num_topics);
+
+    base = session->num_subscriptions;
+    sub_size = sizeof(struct subscription *) * (base + request->num_topics);
 
     if ((tmp_subs = realloc(session->subscriptions, sub_size)) == NULL) {
         /* Ensure we acknowledged our failures */
@@ -4551,20 +5173,27 @@ static int subscribe_to_topics(struct session *session,
 
         /* TODO: this will result in 'gaps' in session->subscriptions[] */
         if (request->topics[idx] == NULL) {
-            session->subscriptions[session->num_subscriptions + idx] = NULL;
+            //session->subscriptions[session->num_subscriptions + idx] = NULL;
+            session->subscriptions[base + idx] = NULL;
             continue;
         }
 
+        bool did_add = false;
         if (subscribe_to_one_topic(session, &request->reason_codes[idx],
+                    &did_add,
                     request->topics[idx],
                     request->subscription_identifier,
                     request->options[idx],
                     session->num_subscriptions + idx) == -1)
             goto fail;
+
+        if (did_add)
+            added++;
     }
 
-    dbg_printf("[%2d] subscribe_to_topics: num_subscriptions now %u [+%u]\n",
-            session->id, session->num_subscriptions, request->num_topics);
+    session->num_subscriptions = base + added;
+    dbg_printf("[%2d] subscribe_to_topics: num_subscriptions now %u [+%u/%u]\n",
+            session->id, session->num_subscriptions, added, request->num_topics);
 
     pthread_rwlock_unlock(&session->subscriptions_lock);
     return 0;
@@ -6860,7 +7489,11 @@ fail:
     if (will_payload)
         free(will_payload);
     if (client->session && client->session->state == SESSION_NEW)
+#ifdef FEATURE_RAFT
         close_session(client->session, false);
+#else
+        close_session(client->session);
+#endif
 
     if (errno == 0)
         errno = EINVAL;
@@ -6934,6 +7567,8 @@ fail:
 /*
  * control packet function lookup table
  */
+
+typedef int (*control_func_t)(struct client *, struct packet *, const void *);
 
 static const struct {
     const control_func_t func;
@@ -7369,7 +8004,11 @@ static void client_tick(void)
                     if (clnt->session->expiry_interval == 0) {
                         dbg_printf("[%2d] client_tick: expiring session instantly\n",
                                 clnt->session->id);
+#ifdef FEATURE_RAFT
                         close_session(clnt->session, true);
+#else
+                        close_session(clnt->session);
+#endif
                     } else if (clnt->session->expiry_interval == UINT_MAX) {
                         clnt->session->expires_at = LONG_MAX; /* "does not expire" */
                     } else {
@@ -7697,6 +8336,9 @@ static void close_session(struct session *session
 
     for (struct message_delivery_state *mds = global_mds_list ; mds ; mds = mds->next)
     {
+        if (mds->state != MDS_ACTIVE)
+            continue;
+
         if (mds->session != session)
             continue;
 
@@ -7773,7 +8415,11 @@ static void session_tick(void)
                     goto force_will;
                 }
 
+#ifdef FEATURE_RAFT
                 close_session(session, true);
+#else
+                close_session(session);
+#endif
                 session = NULL;
                 continue;
             }
@@ -8147,6 +8793,9 @@ shit_fd:
 #endif
     }
 
+#ifdef FEATURE_DEBUG
+    dump_all();
+#endif
     logger(LOG_INFO, NULL, "main_loop: terminated normally");
 
     errno = 0;
@@ -8191,7 +8840,7 @@ fail:
     return -1;
 }
 
-static bool is_null_uuid(const uint8_t uuid[const static 16])
+static bool is_null_uuid(const uint8_t uuid[static 16])
 {
     for (unsigned idx = 0; idx < 16; idx++)
         if (uuid[idx] != 0)

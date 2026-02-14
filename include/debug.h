@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 #ifdef FEATURE_DEBUG
 # define dbg_printf(...) { int64_t dbg_now = timems(); printf("%lu.%03lu: ", dbg_now / 1000, dbg_now % 1000); printf(__VA_ARGS__); }
@@ -56,4 +58,22 @@
 #include "mqtt.h"
 
 extern const char *uuid_to_string(const uint8_t uuid[const static UUID_SIZE]);
+
+void dump_client(const struct client *client);
+void dump_message(const struct message *message);
+void dump_mds(const struct message_delivery_state *mds);
+void dump_packet(const struct packet *packet);
+void dump_subscription(const struct subscription *subscription);
+void dump_session(const struct session *session);
+void dump_topic(const struct topic *topic);
+void dump_any(mqtt_type type, const void *ptr);
+
+void dump_all_clients(void);
+void dump_all_sessions(void);
+void dump_all_messages(void);
+void dump_all_packets(void);
+void dump_all_topics(void);
+void dump_all_mds(void);
+void dump_all_subscriptions(void);
+void dump_all(void);
 #endif

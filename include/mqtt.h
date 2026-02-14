@@ -243,6 +243,13 @@ typedef enum {
 } message_state_t;
 
 typedef enum {
+    MDS_NEW = 0,
+    MDS_ACTIVE,
+    MDS_DELETED,
+    MDS_STATE_MAX
+} mds_state_t;
+
+typedef enum {
     MSG_NORMAL = 0,
     MSG_WILL = 1,
     MSG_TYPE_MAX
@@ -328,12 +335,12 @@ struct subscription;
 
 struct message_delivery_state {
     struct message_delivery_state *next;
+    mds_state_t state;
     id_t id;
-    struct session *session;
-    struct message *message;
+    struct session *session; /* _Nonnull */
+    struct message *message; /* _Nonnull */
     bool read_only;
     uint16_t packet_identifier;
-    bool deleted;
 
                                 /*   QoS=1     |   QoS=2     */
     union {
@@ -578,5 +585,18 @@ extern const char *const reason_codes_str[MQTT_REASON_CODE_MAX];
 extern const char *const message_type_str[MSG_TYPE_MAX];
 extern const char *const subscription_type_str[SUB_TYPE_MAX];
 extern const char *const packet_dir_str[PACKET_DIR_MAX];
+
+typedef enum {
+    T_NULL = 0,
+    T_CLIENT,
+    T_MESSAGE,
+    T_MDS,
+    T_PACKET,
+    T_SESSION,
+    T_SUBSCRIPTION,
+    T_TOPIC,
+    T_MAX,
+} mqtt_type;
+
 #endif
 
