@@ -6557,7 +6557,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
 
     dbg_cprintf("\n");
 
-    if (get_property_value(packet->properties, packet->property_count,
+    if (packet->properties && packet->property_count && get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_SUBSCRIPTION_IDENTIFIER, &prop) == 0) {
         subscription_identifier = prop->byte4;
 
@@ -6568,7 +6568,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         }
     }
 
-    if (get_property_value(packet->properties, packet->property_count,
+    if (packet->properties && packet->property_count && get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_TOPIC_ALIAS, &prop) == 0) {
 
         /* Server -> Client so clnt_topic_aliases */
@@ -6833,7 +6833,8 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
     dbg_printf("[%2d] handle_cp_subscribe: packet_identifier=%u\n",
             client->session->id, packet->packet_identifier);
 
-    if (get_property_value(packet->properties, packet->property_count,
+    if (packet->properties && packet->property_count && 
+            get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_SUBSCRIPTION_IDENTIFIER, &prop) == 0) {
         subscription_identifier = prop->byte4;
 
@@ -7386,62 +7387,64 @@ create_new_session:
                 client->session->id);
     }
 
-    if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_SESSION_EXPIRY_INTERVAL, &prop) == 0) {
-        client->session->expiry_interval = prop->byte4;
-        dbg_printf("[%2d] handle_cp_connect: SESSION_EXPIRY_INTERVAL=%u\n", client->session->id, prop->byte4);
-    }
+    if (packet->properties && packet->property_count) {
+        if (get_property_value(packet->properties, packet->property_count,
+                    MQTT_PROP_SESSION_EXPIRY_INTERVAL, &prop) == 0) {
+            client->session->expiry_interval = prop->byte4;
+            dbg_printf("[%2d] handle_cp_connect: SESSION_EXPIRY_INTERVAL=%u\n", client->session->id, prop->byte4);
+        }
 
-    if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_REQUEST_RESPONSE_INFORMATION, &prop) == 0) {
-        client->session->request_response_information = prop->byte;
-        dbg_printf("[%2d] handle_cp_connect: REQUEST_RESPONSE_INFORMATION=%u\n", client->session->id, prop->byte);
-    }
+        if (get_property_value(packet->properties, packet->property_count,
+                    MQTT_PROP_REQUEST_RESPONSE_INFORMATION, &prop) == 0) {
+            client->session->request_response_information = prop->byte;
+            dbg_printf("[%2d] handle_cp_connect: REQUEST_RESPONSE_INFORMATION=%u\n", client->session->id, prop->byte);
+        }
 
-    if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_REQUEST_PROBLEM_INFORMATION, &prop) == 0) {
-        client->session->request_problem_information = prop->byte;
-        dbg_printf("[%2d] handle_cp_connect: REQUEST_PROBLEM_INFORMATION=%u\n", client->session->id, prop->byte);
-    }
+        if (get_property_value(packet->properties, packet->property_count,
+                    MQTT_PROP_REQUEST_PROBLEM_INFORMATION, &prop) == 0) {
+            client->session->request_problem_information = prop->byte;
+            dbg_printf("[%2d] handle_cp_connect: REQUEST_PROBLEM_INFORMATION=%u\n", client->session->id, prop->byte);
+        }
 
-    if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_AUTHENTICATION_METHOD, &prop) == 0) {
-        reason_code = MQTT_BAD_AUTHENTICATION_METHOD;
-        goto fail;
-    }
+        if (get_property_value(packet->properties, packet->property_count,
+                    MQTT_PROP_AUTHENTICATION_METHOD, &prop) == 0) {
+            reason_code = MQTT_BAD_AUTHENTICATION_METHOD;
+            goto fail;
+        }
 
-    if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_AUTHENTICATION_DATA, &prop) == 0) {
-        reason_code = MQTT_PROTOCOL_ERROR;
-        goto fail;
-    }
-
-    if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_MAXIMUM_PACKET_SIZE, &prop) == 0) {
-        client->maximum_packet_size = prop->byte4;
-        dbg_printf("[%2d] handle_cp_connect: MAXIMUM_PACKET_SIZE=%u\n", client->session->id, prop->byte4);
-    }
-
-    if (get_property_value(packet->properties, packet->property_count,
-                MQTT_PROP_TOPIC_ALIAS_MAXIMUM, &prop) == 0) {
-        dbg_printf("[%2d] handle_cp_connect: TOPIC_ALIAS_MAXIMUM=%u\n", client->session->id, prop->byte2);
-        if (prop->byte2 == 0) {
+        if (get_property_value(packet->properties, packet->property_count,
+                    MQTT_PROP_AUTHENTICATION_DATA, &prop) == 0) {
             reason_code = MQTT_PROTOCOL_ERROR;
             goto fail;
         }
 
-        if (prop->byte2 > MAX_TOPIC_ALIAS) {
-            reason_code = MQTT_UNSPECIFIED_ERROR;
-            goto fail;
+        if (get_property_value(packet->properties, packet->property_count,
+                    MQTT_PROP_MAXIMUM_PACKET_SIZE, &prop) == 0) {
+            client->maximum_packet_size = prop->byte4;
+            dbg_printf("[%2d] handle_cp_connect: MAXIMUM_PACKET_SIZE=%u\n", client->session->id, prop->byte4);
         }
 
-        if ((client->clnt_topic_aliases = calloc(1,
-                        sizeof(uint8_t *) * prop->byte2)) == NULL) {
-            reason_code = MQTT_UNSPECIFIED_ERROR;
-            goto fail;
-        }
+        if (get_property_value(packet->properties, packet->property_count,
+                    MQTT_PROP_TOPIC_ALIAS_MAXIMUM, &prop) == 0) {
+            dbg_printf("[%2d] handle_cp_connect: TOPIC_ALIAS_MAXIMUM=%u\n", client->session->id, prop->byte2);
+            if (prop->byte2 == 0) {
+                reason_code = MQTT_PROTOCOL_ERROR;
+                goto fail;
+            }
 
-        client->topic_alias_maximum = prop->byte2;
+            if (prop->byte2 > MAX_TOPIC_ALIAS) {
+                reason_code = MQTT_UNSPECIFIED_ERROR;
+                goto fail;
+            }
+
+            if ((client->clnt_topic_aliases = calloc(1,
+                            sizeof(uint8_t *) * prop->byte2)) == NULL) {
+                reason_code = MQTT_UNSPECIFIED_ERROR;
+                goto fail;
+            }
+
+            client->topic_alias_maximum = prop->byte2;
+        }
     }
 
     client->keep_alive_override = keep_alive_override;
@@ -7492,7 +7495,7 @@ fail:
 #ifdef FEATURE_RAFT
         close_session(client->session, false);
 #else
-        close_session(client->session);
+    close_session(client->session);
 #endif
 
     if (errno == 0)
@@ -7511,7 +7514,7 @@ fail:
     return -1;
 }
 
-[[gnu::nonnull]]
+    [[gnu::nonnull]]
 static int handle_cp_auth(struct client *client, struct packet *packet,
         const void *remain)
 {

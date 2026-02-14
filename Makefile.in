@@ -13,9 +13,9 @@ LEX              := @@LEX@@
 YACC             := @@YACC@@
 LFLAGS           := @@LFLAGS@@
 YFLAGS           := -d -t @@YFLAGS@@
-CFLAGS           := -std=c2x @@CFLAGS@@
+CFLAGS           := -std=c2x @@CFLAGS@@ @@SANITIZE_CFLAGS@@
 CPPFLAGS         := -DNDEBUG @@CPPFLAGS@@
-LDFLAGS          := -L$(srcdir)/src -L$(objdir) -L. @@LDFLAGS@@
+LDFLAGS          := -L$(srcdir)/src -L$(objdir) -L. @@LDFLAGS@@ @@SANITIZE_LDFLAGS@@
 CHECK_CFLAGS     := @@CHECK_CFLAGS@@
 CHECK_LIBS       := @@CHECK_LIBS@@
 CAT              ?= cat

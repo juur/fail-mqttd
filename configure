@@ -53,6 +53,8 @@ Optional features:
   --disable-openmetrics           disable Openmetrics HTTP service (default)
   --enable-multi-master           enable multi-master operation
   --disable-multi-master          disable multi-master operation (default)
+  --enable-sanitizers[=LIST]      enable sanitizers: all,address,undefined,leak,thread,memory,none
+  --disable-sanitizers            disable sanitizers (default)
 EOF
 }
 
@@ -72,6 +74,9 @@ FEATURE_RAFT_IMPL_DEBUG=0
 FEATURE_MULTI_MASTER=0
 FEATURE_RAFT=0
 FEATURE_OM=0
+SANITIZERS=none
+SANITIZE_CFLAGS=
+SANITIZE_LDFLAGS=
 SAVED_ARGS=$(printf '%q ' "$@")
 
 while :; do
@@ -119,6 +124,9 @@ while :; do
 		--disable-threads) FEATURE_THREADS=0 ;;
 		--enable-multi-master) FEATURE_MULTI_MASTER=1 ;;
 		--disable-multi-master) FEATURE_MULTI_MASTER=0 ;;
+		--enable-sanitizers=?*) SANITIZERS=${1#*=} ;;
+		--enable-sanitizers) SANITIZERS=all ;;
+		--disable-sanitizers) SANITIZERS=none ;;
 		*) [[ -n "${1-}" ]] && { echo "Unknown argument ${1-}" >&2; exit 1; } ;;
 	esac
 	shift || break
@@ -179,6 +187,74 @@ LDFLAGS=${LDFLAGS:-}
 TARGET=${TARGET:-}
 LFLAGS=${LFLAGS:-}
 YFLAGS=${YFLAGS:-}
+
+# Sanitizers
+san_addr=0
+san_undef=0
+san_leak=0
+san_thread=0
+san_mem=0
+
+if [[ "${SANITIZERS}" != "none" ]]; then
+	if [[ "${SANITIZERS}" == "all" ]]; then
+		san_addr=1
+		san_undef=1
+		san_leak=1
+	else
+		IFS=',' read -r -a _san_list <<<"${SANITIZERS}"
+		for s in "${_san_list[@]}"; do
+			case "${s}" in
+				address) san_addr=1 ;;
+				undefined) san_undef=1 ;;
+				leak) san_leak=1 ;;
+				thread) san_thread=1 ;;
+				memory) san_mem=1 ;;
+				none|"") ;;
+				*) echo "Unknown sanitizer: ${s}" >&2; exit 1 ;;
+			esac
+		done
+	fi
+fi
+
+if [[ "${san_thread}" -eq 1 && ( "${san_addr}" -eq 1 || "${san_undef}" -eq 1 || "${san_leak}" -eq 1 || "${san_mem}" -eq 1 ) ]]; then
+	echo "TSan is incompatible with ASan/UBSan/LSan/MSan" >&2
+	exit 1
+fi
+if [[ "${san_mem}" -eq 1 && ( "${san_addr}" -eq 1 || "${san_undef}" -eq 1 || "${san_leak}" -eq 1 || "${san_thread}" -eq 1 ) ]]; then
+	echo "MSan is incompatible with ASan/UBSan/LSan/TSan and needs instrumented libc" >&2
+	exit 1
+fi
+
+if [[ "${san_addr}" -eq 1 || "${san_undef}" -eq 1 || "${san_leak}" -eq 1 || "${san_thread}" -eq 1 || "${san_mem}" -eq 1 ]]; then
+	SANITIZE_CFLAGS="-fsanitize="
+	SANITIZE_LDFLAGS="-fsanitize="
+	sep=""
+	if [[ "${san_addr}" -eq 1 ]]; then
+		SANITIZE_CFLAGS+="${sep}address"
+		SANITIZE_LDFLAGS+="${sep}address"
+		sep=","
+	fi
+	if [[ "${san_undef}" -eq 1 ]]; then
+		SANITIZE_CFLAGS+="${sep}undefined"
+		SANITIZE_LDFLAGS+="${sep}undefined"
+		sep=","
+	fi
+	if [[ "${san_leak}" -eq 1 ]]; then
+		SANITIZE_CFLAGS+="${sep}leak"
+		SANITIZE_LDFLAGS+="${sep}leak"
+		sep=","
+	fi
+	if [[ "${san_thread}" -eq 1 ]]; then
+		SANITIZE_CFLAGS+="${sep}thread"
+		SANITIZE_LDFLAGS+="${sep}thread"
+		sep=","
+	fi
+	if [[ "${san_mem}" -eq 1 ]]; then
+		SANITIZE_CFLAGS+="${sep}memory"
+		SANITIZE_LDFLAGS+="${sep}memory"
+		sep=","
+	fi
+fi
 
 # Location of default tools
 
@@ -514,6 +590,7 @@ ARGS=$(cat <<- __END
 	s#@@DOCDIR@@#$(sed_escape "${DOCDIR}")#;
 	s#@@CC@@#$(sed_escape "${CC}")#;
 	s#@@CFLAGS@@#$(sed_escape "${CFLAGS}")#;
+	s#@@SANITIZE_CFLAGS@@#$(sed_escape "${SANITIZE_CFLAGS}")#;
 	s#@@CPPFLAGS@@#$(sed_escape "${CPPFLAGS}")#;
 	s#@@CXX@@#$(sed_escape "${CXX}")#;
 	s#@@AR@@#$(sed_escape "${AR}")#;
@@ -526,6 +603,7 @@ ARGS=$(cat <<- __END
 	s#@@EXECPREFIX@@#$(sed_escape "${EXECPREFIX}")#;
 	s#@@INFODIR@@#$(sed_escape "${INFODIR}")#;
 	s#@@LDFLAGS@@#$(sed_escape "${LDFLAGS}")#;
+	s#@@SANITIZE_LDFLAGS@@#$(sed_escape "${SANITIZE_LDFLAGS}")#;
 	s#@@LIBDIR@@#$(sed_escape "${LIBDIR}")#;
 	s#@@LIBEXECDIR@@#$(sed_escape "${LIBEXECDIR}")#;
 	s#@@LOCALEDIR@@#$(sed_escape "${LOCALEDIR}")#;
