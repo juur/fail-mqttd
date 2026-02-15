@@ -214,9 +214,9 @@ endif
 
 $(objdir)/%.test.o: $(srcdir)/src/%.c
 ifeq ($(DEPS),1)
-	$(CC) -c $(CFLAGS) $(CPPFLAGS) -DTESTS -MF $(objdir)/.d/tests/$*.test.d $< -o $@
+	$(CC) -c $(CFLAGS) $(CPPFLAGS) -DTESTS -Wno-unused-function -MF $(objdir)/.d/tests/$*.test.d $< -o $@
 else
-	$(CC) -c $(CFLAGS) $(CPPFLAGS) -DTESTS $< -o $@
+	$(CC) -c $(CFLAGS) $(CPPFLAGS) -DTESTS -Wno-unused-function $< -o $@
 endif
 
 ifeq ($(DEPS),1)
