@@ -204,6 +204,7 @@ static void setup_cluster(unsigned count)
 		init_entry_locks(&peers[idx]);
 		peers[idx].server_id = idx + 1;
 		peers[idx].peer_fd = -1;
+		peers[idx].vote_granted = NULL_ID;
 		peers[idx].address.s_addr = htonl(INADDR_LOOPBACK);
 		peers[idx].port = htons((in_port_t)(1883 + idx));
 	}
@@ -2495,7 +2496,7 @@ START_TEST(test_conformance_request_vote_reply_stale_term_ignored)
 
 	ck_assert_int_eq(raft_state.state, RAFT_STATE_CANDIDATE);
 	ck_assert(!peers[1].vote_responded);
-	ck_assert_uint_eq(peers[1].vote_granted, 0);
+	ck_assert_uint_eq(peers[1].vote_granted, NULL_ID);
 }
 END_TEST
 

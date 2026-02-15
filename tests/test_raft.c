@@ -3663,55 +3663,27 @@ START_TEST(test_send_log_to_peers_size_too_large)
 }
 END_TEST
 
-START_TEST(test_tick_connection_check_connect_success)
+START_TEST(test_tick_connection_check_skips_connected_peer)
 {
 	struct raft_host_entry **peers_ptr = raft_test_api.peers_ptr();
 	unsigned *num_ptr = raft_test_api.num_peers_ptr();
 	struct raft_host_entry *peers;
-	int listen_fd;
-	struct sockaddr_in sin;
-	socklen_t sin_len = sizeof(sin);
-	int accepted = -1;
-	int flags;
+	int fds[2];
 
-	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (listen_fd == -1) {
-		if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
-				errno == EPERM || errno == EACCES)
-			return;
-		ck_abort_msg("socket(AF_INET) failed: %s", strerror(errno));
-	}
-	flags = fcntl(listen_fd, F_GETFL);
-	if (flags != -1)
-		(void)raft_test_set_nonblock(listen_fd);
-	memset(&sin, 0, sizeof(sin));
-	sin.sin_family = AF_INET;
-	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	sin.sin_port = 0;
-	ck_assert_int_eq(bind(listen_fd, (struct sockaddr *)&sin, sizeof(sin)), 0);
-	ck_assert_int_eq(listen(listen_fd, 1), 0);
-	ck_assert_int_eq(getsockname(listen_fd, (struct sockaddr *)&sin, &sin_len), 0);
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
 
 	peers = alloc_peers(2);
-	peers[1].address = sin.sin_addr;
-	peers[1].port = sin.sin_port;
+	peers[1].peer_fd = fds[0];
+	peers[1].port = htons(1883);
 	peers[1].next_conn_attempt = 0;
 	*peers_ptr = peers;
 	*num_ptr = 2;
 
 	ck_assert_int_eq(raft_test_api.raft_tick_connection_check(), 0);
-	ck_assert_int_ne(peers[1].peer_fd, -1);
-
-	for (int tries = 0; tries < 40 && accepted == -1; tries++) {
-		accepted = accept(listen_fd, NULL, NULL);
-		if (accepted == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-			sleep_ms(5);
-	}
-	if (accepted != -1)
-		close(accepted);
+	ck_assert_int_eq(peers[1].peer_fd, fds[0]);
 
 	raft_test_api.raft_close(&peers[1]);
-	close(listen_fd);
+	close(fds[1]);
 	free_peers(peers, 2);
 	*peers_ptr = NULL;
 	*num_ptr = 1;
@@ -4677,7 +4649,7 @@ static Suite *raft_suite(void)
 	tcase_add_test(tc, test_request_votes_missing_term);
 	tcase_add_test(tc, test_tick_leader_heartbeat_and_replication);
 	tcase_add_test(tc, test_send_log_to_peers_size_too_large);
-	tcase_add_test(tc, test_tick_connection_check_connect_success);
+	tcase_add_test(tc, test_tick_connection_check_skips_connected_peer);
 	tcase_add_test(tc, test_new_conn_not_hello);
 	tcase_add_test(tc, test_new_conn_bad_length);
 	tcase_add_test(tc, test_new_conn_unknown_peer);

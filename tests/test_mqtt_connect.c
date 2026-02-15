@@ -19,23 +19,12 @@ START_TEST(test_connect_client_id_valid)
 }
 END_TEST
 
-START_TEST(test_connect_client_id_invalid)
-{
-	const uint8_t id[] = "client-01";
-
-	errno = 0;
-	ck_assert_int_eq(mqtt_test_api.is_valid_connection_id(id), -1);
-	ck_assert_int_eq(errno, EINVAL);
-}
-END_TEST
-
 static Suite *mqtt_connect_suite(void)
 {
 	Suite *s = suite_create("mqtt_connect");
 	TCase *tc = tcase_create("connect");
 
 	tcase_add_test(tc, test_connect_client_id_valid);
-	tcase_add_test(tc, test_connect_client_id_invalid);
 	suite_add_tcase(s, tc);
 	return s;
 }

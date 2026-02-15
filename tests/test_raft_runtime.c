@@ -15,6 +15,7 @@
 #include <time.h>
 
 #include "raft.h"
+#include "test_io.h"
 
 extern _Atomic bool running;
 extern uint8_t opt_raft_id;
@@ -49,15 +50,6 @@ START_TEST(test_raft_loop_single_pass)
 }
 END_TEST
 
-static void sleep_ms(unsigned ms)
-{
-	struct timespec ts;
-
-	ts.tv_sec = ms / 1000;
-	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-	(void)nanosleep(&ts, NULL);
-}
-
 static void handle_sigusr1(int signo)
 {
 	(void)signo;
@@ -85,10 +77,10 @@ START_TEST(test_raft_loop_eintr)
 
 	ck_assert_int_eq(pthread_create(&tid, NULL, raft_loop_thread, (void *)&runtime_impl), 0);
 
-	sleep_ms(30);
+	test_sleep_ms(30);
 	ck_assert_int_eq(pthread_kill(tid, SIGUSR1), 0);
 
-	sleep_ms(30);
+	test_sleep_ms(30);
 	atomic_store(&running, false);
 	ck_assert_int_eq(pthread_kill(tid, SIGUSR1), 0);
 	ck_assert_int_eq(pthread_join(tid, NULL), 0);
