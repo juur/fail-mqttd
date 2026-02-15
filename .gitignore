@@ -19,7 +19,7 @@ test*.sh
 state_save*
 save_state*
 ignore/
-test_*
+/test_*
 *.gcda
 *.gcno
 coverage/
