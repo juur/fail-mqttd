@@ -7,7 +7,9 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/types.h>
+#include <netinet/in.h>
 
 #include "mqtt.h"
 
@@ -36,6 +38,7 @@ struct mqtt_test_api {
 	void (*free_properties)(struct property (*props)[], unsigned count);
 
 	int (*parse_incoming)(struct client *client);
+	void (*tick)(void);
 
 	int (*send_cp_puback)(struct client *client, uint16_t packet_id,
 			reason_code_t reason_code);
@@ -56,6 +59,45 @@ struct mqtt_test_api {
 	void (*free_session)(struct session *session, bool need_lock);
 };
 
+struct mqtt_test_limits {
+	unsigned max_packets;
+	unsigned max_clients;
+	unsigned max_topics;
+	unsigned max_messages;
+	uint32_t max_packet_length;
+	unsigned max_messages_per_tick;
+	unsigned max_properties;
+	unsigned max_receive_pubs;
+	unsigned max_sessions;
+	unsigned max_topic_alias;
+	unsigned max_clientid_len;
+	uint32_t max_sub_identifier;
+};
+
+struct mqtt_test_options {
+	FILE **logfile;
+	bool *logstdout;
+	int *backlog;
+	int *loglevel;
+	bool *logsyslog;
+	bool *logfileappend;
+	bool *logfilesync;
+	bool *background;
+	const char **statepath;
+	in_port_t *port;
+	bool *database;
+	struct in_addr *listen;
+	uint8_t *raft_id;
+	bool *raft;
+	in_port_t *raft_port;
+	struct in_addr *raft_listen;
+	bool *openmetrics;
+	in_port_t *om_port;
+	struct in_addr *om_listen;
+};
+
 extern const struct mqtt_test_api mqtt_test_api;
+extern const struct mqtt_test_limits mqtt_test_limits;
+extern const struct mqtt_test_options mqtt_test_options;
 
 #endif

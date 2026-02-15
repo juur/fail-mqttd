@@ -11,7 +11,18 @@
 
 #include "mqtt_test_support.h"
 
-static const uint32_t mqtt_max_packet_length = 0x1000000U;
+static int saved_stderr_fd = -1;
+
+static void mqtt_silence_stderr(void)
+{
+	(void)mqtt_test_silence_stderr(&saved_stderr_fd);
+}
+
+static void mqtt_restore_stderr(void)
+{
+	mqtt_test_restore_stderr(saved_stderr_fd);
+	saved_stderr_fd = -1;
+}
 
 static void encode_var(uint32_t value, uint8_t out[static 4], int *out_len)
 {
@@ -85,7 +96,7 @@ START_TEST(test_parse_properties_invalid_for_connect)
 	errno = 0;
 	ck_assert_int_eq(mqtt_test_api.parse_properties(&parse_ptr, &bytes_left,
 				&out_props, &out_count, MQTT_CP_CONNECT), -1);
-	ck_assert_int_eq(errno, EINVAL);
+	ck_assert_int_eq(errno, EBADMSG);
 }
 END_TEST
 
@@ -103,7 +114,7 @@ START_TEST(test_parse_packet_too_large)
 	mqtt_test_init_client(&client, fds[0], &session);
 
 	ck_assert_int_ne(mqtt_test_write_packet_header(fds[1], MQTT_CP_CONNECT, 0,
-				mqtt_max_packet_length + 1U), -1);
+				mqtt_test_limits.max_packet_length + 1U), -1);
 	for (int i = 0; i < 4; i++) {
 		rc = mqtt_test_api.parse_incoming(&client);
 		if (rc != 0)
@@ -148,7 +159,7 @@ START_TEST(test_var_byte_decode_empty)
 
 	value = decode_var(buf, 0, &err);
 	ck_assert_uint_eq(value, 0);
-	ck_assert_int_eq(err, ERANGE);
+	ck_assert_int_eq(err, ENOSPC);
 }
 END_TEST
 
@@ -176,7 +187,7 @@ START_TEST(test_read_utf8_null_char)
 	errno = 0;
 	out = mqtt_test_api.read_utf8(&ptr, &bytes_left);
 	ck_assert_ptr_null(out);
-	ck_assert_int_eq(errno, EINVAL);
+	ck_assert_int_eq(errno, EILSEQ);
 }
 END_TEST
 
@@ -190,7 +201,7 @@ START_TEST(test_read_utf8_invalid)
 	errno = 0;
 	out = mqtt_test_api.read_utf8(&ptr, &bytes_left);
 	ck_assert_ptr_null(out);
-	ck_assert_int_eq(errno, EINVAL);
+	ck_assert_int_eq(errno, EILSEQ);
 }
 END_TEST
 
@@ -304,6 +315,8 @@ static Suite *mqtt_packets_suite(void)
 	Suite *s = suite_create("mqtt_packets");
 	TCase *tc = tcase_create("packets");
 
+	tcase_add_checked_fixture(tc, mqtt_silence_stderr, mqtt_restore_stderr);
+
 	tcase_add_test(tc, test_var_byte_round_trip);
 	tcase_add_test(tc, test_var_byte_min_bytes);
 	tcase_add_test(tc, test_var_byte_decode_empty);
@@ -326,9 +339,12 @@ int main(void)
 	Suite *s = mqtt_packets_suite();
 	SRunner *sr = srunner_create(s);
 	int failed;
+	struct mqtt_test_log_state log_state = {0};
 
+	(void)mqtt_test_log_to_null(&log_state);
 	srunner_run_all(sr, CK_ENV);
 	failed = srunner_ntests_failed(sr);
 	srunner_free(sr);
+	mqtt_test_restore_log(&log_state);
 	return failed == 0 ? 0 : 1;
 }

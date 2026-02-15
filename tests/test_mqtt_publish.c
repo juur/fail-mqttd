@@ -14,7 +14,18 @@
 
 #include "mqtt_test_support.h"
 
-extern bool opt_database;
+static int saved_stderr_fd = -1;
+
+static void mqtt_silence_stderr(void)
+{
+	(void)mqtt_test_silence_stderr(&saved_stderr_fd);
+}
+
+static void mqtt_restore_stderr(void)
+{
+	mqtt_test_restore_stderr(saved_stderr_fd);
+	saved_stderr_fd = -1;
+}
 
 static size_t build_publish_packet(uint8_t *out, size_t out_len, uint8_t flags,
 		const uint8_t *topic, const struct property *props,
@@ -232,6 +243,8 @@ static Suite *mqtt_publish_suite(void)
 	Suite *s = suite_create("mqtt_publish");
 	TCase *tc = tcase_create("publish");
 
+	tcase_add_checked_fixture(tc, mqtt_silence_stderr, mqtt_restore_stderr);
+
 	tcase_add_test(tc, test_topic_name_valid);
 	tcase_add_test(tc, test_topic_name_invalid_wildcards);
 	tcase_add_test(tc, test_publish_qos1_sends_puback);
@@ -246,11 +259,14 @@ int main(void)
 	Suite *s = mqtt_publish_suite();
 	SRunner *sr = srunner_create(s);
 	int failed;
+	struct mqtt_test_log_state log_state = {0};
 
-	opt_database = false;
+	*mqtt_test_options.database = false;
+	(void)mqtt_test_log_to_null(&log_state);
 
 	srunner_run_all(sr, CK_ENV);
 	failed = srunner_ntests_failed(sr);
 	srunner_free(sr);
+	mqtt_test_restore_log(&log_state);
 	return failed == 0 ? 0 : 1;
 }

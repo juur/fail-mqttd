@@ -8,7 +8,7 @@
 
 #include <check.h>
 
-#include "mqtt.h"
+#include "mqtt_test_support.h"
 
 START_TEST(test_property_strings_nonnull)
 {
@@ -43,9 +43,12 @@ int main(void)
 	Suite *s = mqtt_constants_suite();
 	SRunner *sr = srunner_create(s);
 	int failed;
+	struct mqtt_test_log_state log_state = {0};
 
+	(void)mqtt_test_log_to_null(&log_state);
 	srunner_run_all(sr, CK_ENV);
 	failed = srunner_ntests_failed(sr);
 	srunner_free(sr);
+	mqtt_test_restore_log(&log_state);
 	return failed == 0 ? 0 : 1;
 }

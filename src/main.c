@@ -661,7 +661,7 @@ static int _log_io_error(const char *msg, ssize_t rc, ssize_t expected,
 
     warnx(short_read_fmt, func, rc, expected, file, line, msg ? msg : "");
 
-    errno = ERANGE;
+    errno = EIO;
     return -1;
 }
 #define log_io_error(m,r,e,d,c) _log_io_error(m,r,e,d,c,__FILE__,__func__,__LINE__)
@@ -3670,7 +3670,7 @@ static uint32_t read_var_byte(const uint8_t **const ptr, size_t *bytes_left)
 
     do {
         if (*bytes_left == 0) {
-            errno = ERANGE;
+            errno = ENOSPC;
             warn("read_var_byte: bytes_left is 0");
             return 0;
         }
@@ -3681,7 +3681,7 @@ static uint32_t read_var_byte(const uint8_t **const ptr, size_t *bytes_left)
 
         if (multi > 128*128*128) {
             warn("invalid variable byte int");
-            errno = EINVAL;
+            errno = EOVERFLOW;
             return 0;
         }
 
@@ -3761,6 +3761,7 @@ next:
 static int is_valid_utf8(const uint8_t *str)
 {
     const uint8_t *ptr = str;
+    errno = EILSEQ;
 
     unsigned bytes;
 
@@ -3797,6 +3798,7 @@ static int is_valid_utf8(const uint8_t *str)
         }
     }
 
+    errno = 0;
     return 0;
 }
 
@@ -3837,7 +3839,7 @@ static uint8_t *read_utf8(const uint8_t **const ptr, size_t *bytes_left)
 
         for (unsigned idx = 0; idx < str_len; idx++) {
             if (string[idx] == '\0') {
-                errno = EINVAL;
+                errno = EILSEQ;
                 goto fail;
             }
         }
@@ -3893,7 +3895,7 @@ static ssize_t get_properties_size(const struct property (*props)[],
         ret++; /* Property Type */
 
         if (prop->ident >= MQTT_PROPERTY_IDENT_MAX) {
-            errno = ERANGE;
+            errno = EBADMSG;
             return -1;
         }
 
@@ -3977,7 +3979,7 @@ static int build_properties(const struct property (*props)[],
         prop = &(*props)[idx];
 
         if (prop->ident >= MQTT_PROPERTY_IDENT_MAX) {
-            errno = ERANGE;
+            errno = EBADMSG;
             goto fail;
         }
 
@@ -4102,7 +4104,7 @@ static int parse_properties(
         prop = &(*props)[num_props];
 
         if (ident >= MQTT_PROPERTY_IDENT_MAX) {
-            errno = EINVAL;
+            errno = EBADMSG;
             goto fail;
         }
         prop->ident = ident;
@@ -4117,7 +4119,7 @@ static int parse_properties(
                 warnx("parse_properties: %s:%s is invalid",
                         control_packet_str[cp_type],
                         property_str[prop->ident]);
-                errno = EINVAL;
+                errno = EBADMSG;
                 goto fail;
             }
 
@@ -4126,23 +4128,29 @@ static int parse_properties(
         switch (type)
         {
             case MQTT_TYPE_BYTE:
-                if (*bytes_left < 1)
+                if (*bytes_left < 1) {
+                    errno = ENOSPC;
                     goto fail;
+                }
                 prop->byte = **ptr;
                 skip = 1;
                 break;
 
             case MQTT_TYPE_2BYTE:
-                if (*bytes_left < sizeof(uint16_t))
+                if (*bytes_left < sizeof(uint16_t)) {
+                    errno = ENOSPC;
                     goto fail;
+                }
                 memcpy(&prop->byte2, *ptr, sizeof(uint16_t));
                 prop->byte2 = ntohs(prop->byte2);
                 skip = sizeof(uint16_t);
                 break;
 
             case MQTT_TYPE_4BYTE:
-                if (*bytes_left < sizeof(uint32_t))
+                if (*bytes_left < sizeof(uint32_t)) {
+                    errno = ENOSPC;
                     goto fail;
+                }
                 memcpy(&prop->byte4, *ptr, sizeof(uint32_t));
                 prop->byte4 = ntohl(prop->byte4);
                 skip = sizeof(uint32_t);
@@ -4161,8 +4169,10 @@ static int parse_properties(
                 break;
 
             case MQTT_TYPE_BINARY:
-                if (*bytes_left < sizeof(uint16_t))
+                if (*bytes_left < sizeof(uint16_t)) {
+                    errno = ENOSPC;
                     goto fail;
+                }
 
                 memcpy(&prop->binary.len, *ptr, sizeof(uint16_t));
                 *ptr += sizeof(uint16_t);
@@ -4170,8 +4180,10 @@ static int parse_properties(
                 prop->binary.len = ntohs(prop->binary.len);
 
                 if (prop->binary.len) {
-                    if (prop->binary.len > *bytes_left)
+                    if (prop->binary.len > *bytes_left) {
+                        errno = ENOSPC;
                         goto fail;
+                    }
 
                     if ((prop->binary.data = malloc(prop->binary.len)) == NULL)
                         goto fail;
@@ -7331,7 +7343,20 @@ static int handle_cp_connect(struct client *client, struct packet *packet,
 
     dbg_printf("     handle_cp_connect: begin from client %u\n", client->id);
 
-    if (client->state != CS_ACTIVE || client->protocol_version != 0) {
+    /* TODO: If CONNECT is received after a successful CONNACK on the same
+     * connection, close without sending another CONNACK (MQTT-3.2.0-2). */
+
+    if (client->state != CS_ACTIVE) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
+
+    /* MQTT-3.2.0-2: no extra CONNACK on a second CONNECT */
+    if (client->protocol_version != 0) {
+        if (client->session && client->session->client == client) {
+            close_client(client, MQTT_PROTOCOL_ERROR, true);
+            return -1;
+        }
         reason_code = MQTT_PROTOCOL_ERROR;
         goto fail;
     }
@@ -7973,7 +7998,7 @@ lenread:
                 hdr = (void *)client->header_buffer;
 
                 if (client->rl_multi > 128*128*128) {
-                    errno = ERANGE;
+                    errno = EOVERFLOW;
                     warn("var len overflow");
                     goto fail;
                 }
@@ -9571,6 +9596,7 @@ const struct mqtt_test_api mqtt_test_api = {
     .get_property_value = get_property_value,
     .free_properties = free_properties,
     .parse_incoming = parse_incoming,
+    .tick = tick,
     .send_cp_puback = send_cp_puback,
     .send_cp_pubrec = send_cp_pubrec,
     .send_cp_pubrel = send_cp_pubrel,
@@ -9580,5 +9606,46 @@ const struct mqtt_test_api mqtt_test_api = {
     .alloc_session = alloc_session,
     .register_session = mqtt_register_session_test,
     .free_session = free_session,
+};
+
+const struct mqtt_test_limits mqtt_test_limits = {
+    .max_packets = MAX_PACKETS,
+    .max_clients = MAX_CLIENTS,
+    .max_topics = MAX_TOPICS,
+    .max_messages = MAX_MESSAGES,
+    .max_packet_length = MAX_PACKET_LENGTH,
+    .max_messages_per_tick = MAX_MESSAGES_PER_TICK,
+    .max_properties = MAX_PROPERTIES,
+    .max_receive_pubs = MAX_RECEIVE_PUBS,
+    .max_sessions = MAX_SESSIONS,
+    .max_topic_alias = MAX_TOPIC_ALIAS,
+    .max_clientid_len = MAX_CLIENTID_LEN,
+    .max_sub_identifier = MAX_SUB_IDENTIFIER,
+};
+
+const struct mqtt_test_options mqtt_test_options = {
+    .logfile = &opt_logfile,
+    .logstdout = &opt_logstdout,
+    .backlog = &opt_backlog,
+    .loglevel = &opt_loglevel,
+    .logsyslog = &opt_logsyslog,
+    .logfileappend = &opt_logfileappend,
+    .logfilesync = &opt_logfilesync,
+    .background = &opt_background,
+    .statepath = &opt_statepath,
+    .port = &opt_port,
+    .database = &opt_database,
+    .listen = &opt_listen,
+#ifdef FEATURE_RAFT
+    .raft_id = &opt_raft_id,
+    .raft = &opt_raft,
+    .raft_port = &opt_raft_port,
+    .raft_listen = &opt_raft_listen,
+#endif
+#ifdef FEATURE_OM
+    .openmetrics = &opt_openmetrics,
+    .om_port = &opt_om_port,
+    .om_listen = &opt_om_listen,
+#endif
 };
 #endif

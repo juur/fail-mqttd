@@ -3525,7 +3525,7 @@ shit_packet: /* common with the packet read */
             packet.length = ntohl(packet.length);
 
             if (packet.length < RAFT_HDR_SIZE) {
-                errno = EINVAL;
+                errno = EBADMSG;
                 goto fail;
             }
 
@@ -3535,7 +3535,7 @@ shit_packet: /* common with the packet read */
             }
 
             if (packet.rpc >= RAFT_MAX_RPC) {
-                errno = EINVAL;
+                errno = EBADMSG;
                 goto fail;
             }
 

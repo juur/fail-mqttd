@@ -6,8 +6,11 @@
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +34,22 @@ static inline void mqtt_test_init_client(struct client *client, int fd,
 
 static inline void mqtt_test_cleanup_client(struct client *client)
 {
+	if (client->clnt_topic_aliases) {
+		if (client->topic_alias_maximum > 0) {
+			for (unsigned idx = 0; idx < client->topic_alias_maximum; idx++) {
+				if (client->clnt_topic_aliases[idx]) {
+					free((void *)client->clnt_topic_aliases[idx]);
+					client->clnt_topic_aliases[idx] = NULL;
+				}
+			}
+		}
+		free((void *)client->clnt_topic_aliases);
+		client->clnt_topic_aliases = NULL;
+	}
+	if (client->svr_topic_aliases) {
+		free((void *)client->svr_topic_aliases);
+		client->svr_topic_aliases = NULL;
+	}
 	if (client->packet_buf) {
 		free(client->packet_buf);
 		client->packet_buf = NULL;
@@ -107,6 +126,21 @@ static inline ssize_t mqtt_test_write_packet_header(int fd, control_packet_t typ
 static inline ssize_t mqtt_test_read_packet(int fd, uint8_t *buf, size_t buf_len)
 {
 	ssize_t rd;
+	struct pollfd pfd = {
+		.fd = fd,
+		.events = POLLIN,
+	};
+	int rc;
+
+	rc = poll(&pfd, 1, 1000);
+	if (rc == 0) {
+		errno = ETIMEDOUT;
+		return -1;
+	}
+	if (rc < 0)
+		return -1;
+	if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+		return -1;
 
 	rd = read(fd, buf, buf_len);
 	if (rd < 0)
@@ -177,6 +211,86 @@ static inline int mqtt_test_set_nonblock(int fd)
 static inline void mqtt_test_sleep_ms(unsigned ms)
 {
 	test_sleep_ms(ms);
+}
+
+static inline int mqtt_test_silence_stderr(int *saved_fd)
+{
+	int null_fd;
+	int dup_fd;
+
+	if (saved_fd == NULL)
+		return -1;
+
+	dup_fd = dup(fileno(stderr));
+	if (dup_fd == -1)
+		return -1;
+
+	null_fd = open("/dev/null", O_WRONLY);
+	if (null_fd == -1) {
+		close(dup_fd);
+		return -1;
+	}
+
+	if (dup2(null_fd, fileno(stderr)) == -1) {
+		close(null_fd);
+		close(dup_fd);
+		return -1;
+	}
+
+	close(null_fd);
+	*saved_fd = dup_fd;
+	return 0;
+}
+
+static inline void mqtt_test_restore_stderr(int saved_fd)
+{
+	if (saved_fd < 0)
+		return;
+
+	dup2(saved_fd, fileno(stderr));
+	close(saved_fd);
+}
+
+struct mqtt_test_log_state {
+	FILE *logfile;
+	bool logstdout;
+	bool logsyslog;
+};
+
+static inline int mqtt_test_log_to_null(struct mqtt_test_log_state *state)
+{
+	FILE *fp;
+
+	if (state == NULL)
+		return -1;
+
+	state->logfile = *mqtt_test_options.logfile;
+	state->logstdout = *mqtt_test_options.logstdout;
+	state->logsyslog = *mqtt_test_options.logsyslog;
+
+	fp = fopen("/dev/null", "w");
+	if (fp == NULL)
+		return -1;
+
+	*mqtt_test_options.logfile = fp;
+	*mqtt_test_options.logstdout = false;
+	*mqtt_test_options.logsyslog = false;
+	return 0;
+}
+
+static inline void mqtt_test_restore_log(struct mqtt_test_log_state *state)
+{
+	if (state == NULL)
+		return;
+
+	if (*mqtt_test_options.logfile &&
+			*mqtt_test_options.logfile != state->logfile) {
+		fclose(*mqtt_test_options.logfile);
+	}
+
+	*mqtt_test_options.logfile = state->logfile;
+	*mqtt_test_options.logstdout = state->logstdout;
+	*mqtt_test_options.logsyslog = state->logsyslog;
 }
 
 #endif
