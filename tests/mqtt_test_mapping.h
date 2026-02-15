@@ -77,6 +77,7 @@
 	X("MQTT-3.8.4-5", test_mqtt_3_8_4_5_suback_single_response) \
 	X("MQTT-3.8.4-6", test_mqtt_3_8_4_6_suback_reason_codes) \
 	X("MQTT-3.8.4-7", test_mqtt_3_8_4_6_suback_reason_codes) \
+	X("MQTT-3.8.4-8", test_mqtt_3_8_4_8_subscribe_qos_minimum) \
 	X("MQTT-3.9.3-1", test_mqtt_3_9_3_1_suback_reason_code_order) \
 	X("MQTT-3.9.3-2", test_mqtt_3_8_4_6_suback_reason_codes) \
 	X("MQTT-3.10.1-1", test_mqtt_2_1_3_1_unsubscribe_flags) \
@@ -91,8 +92,10 @@
 	X("MQTT-3.11.3-1", test_mqtt_3_11_3_1_unsuback_reason_code_order) \
 	X("MQTT-3.11.3-2", test_mqtt_3_11_3_1_unsuback_reason_code_order) \
 	X("MQTT-3.12.4-1", test_mqtt_3_12_4_1_pingresp_sent) \
+	X("MQTT-3.14.1-1", test_mqtt_3_14_1_1_disconnect_flags_invalid) \
 	X("MQTT-3.14.4-1", test_mqtt_3_14_4_1_disconnect_no_more_packets) \
 	X("MQTT-3.14.4-2", test_mqtt_3_14_4_2_disconnect_closes) \
+	X("MQTT-3.15.1-1", test_mqtt_3_15_1_1_auth_flags_invalid) \
 	X("MQTT-4.7.3-1", test_mqtt_4_7_3_1_topic_name)
 
 #define MQTT_POLICY_MAP(X) \

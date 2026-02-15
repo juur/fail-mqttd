@@ -2023,8 +2023,11 @@ static void free_client(struct client *client, bool needs_lock)
     free(client);
 }
 
+/**
+ * always locks the locks inside session
+ */
 [[gnu::nonnull]]
-static void free_session(struct session *session, bool need_lock)
+static void free_session(struct session *session, bool need_sessions_lock)
 {
     struct session *tmp;
 
@@ -2080,7 +2083,7 @@ static void free_session(struct session *session, bool need_lock)
         session->num_will_props = 0;
     }
 
-    if (need_lock)
+    if (need_sessions_lock)
         pthread_rwlock_wrlock(&global_sessions_lock);
     if (global_session_list == session) {
         global_session_list = session->next;
@@ -2101,7 +2104,7 @@ static void free_session(struct session *session, bool need_lock)
         session->client = NULL;
     }
 
-    if (need_lock)
+    if (need_sessions_lock)
         pthread_rwlock_unlock(&global_sessions_lock);
 
     if (session->client_id) {
@@ -2776,7 +2779,8 @@ static inline int read_bytes(uint8_t *out, const char **in, size_t *bytes_remain
         + sizeof((uint32_t)msg->sender_status.acknowledged_at)
         + sizeof((uint32_t)msg->sender_status.released_at)
         + sizeof((uint32_t)msg->sender_status.completed_at)
-        + sizeof((uint8_t)msg->sender_status.client_reason);
+        + sizeof((uint8_t)msg->sender_status.client_reason)
+        + sizeof((uint8_t)msg->sender_status.qos);
 
         if (msg->num_message_delivery_states > UINT16_MAX) {
             errno = EOVERFLOW;
@@ -2867,6 +2871,7 @@ static int write_mds(char **dst, const struct message_delivery_state *mds)
     write_u32(dst, mds->released_at);
     write_u32(dst, mds->completed_at);
     write_u8(dst, mds->client_reason);
+    write_u8(dst, mds->qos);
 
     if (mds->session == NULL) {
         errno = ENOENT;
@@ -2905,6 +2910,14 @@ static int read_mds(struct message_delivery_state *mds, const char **src, size_t
 
     rc = read_u8(&tmp_u8, src, bytes_remaining); mds->client_reason = (reason_code_t)tmp_u8;
     if (rc == -1) goto fail;
+
+    rc = read_u8(&tmp_u8, src, bytes_remaining); mds->qos = tmp_u8;
+    if (rc == -1) goto fail;
+
+    if (tmp_u8 > 2) {
+        errno = EINVAL;
+        goto fail;
+    }
 
     struct session *session;
 
@@ -4730,7 +4743,7 @@ fail:
 }
 
 [[gnu::nonnull]]
-static int enqueue_one_mds(struct message *msg, struct session *session)
+static int enqueue_one_mds(struct message *msg, struct session *session, uint8_t qos)
 {
     struct message_delivery_state *mds;
 
@@ -4743,6 +4756,8 @@ static int enqueue_one_mds(struct message *msg, struct session *session)
         /* TODO ???? */
         return -1;
     }
+
+    mds->qos = qos;
 
     if (add_to_delivery_state(
                 &msg->delivery_states,
@@ -4810,7 +4825,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
                         continue;
                     dbg_printf("     enqueue_message: selected session_id=%d\n",
                             matched_sub->shared.sessions[idx]->id);
-                    enqueue_one_mds(msg, matched_sub->shared.sessions[idx]);
+                    enqueue_one_mds(msg, matched_sub->shared.sessions[idx], MQTT_SUBOPT_QOS(matched_sub->option));
 
                     found = true;
                     break;
@@ -4823,7 +4838,7 @@ static int enqueue_message(struct topic *topic, struct message *msg)
 
                 dbg_printf("     enqueue_message: session=%p\n",
                         matched_sub->non_shared.session);
-                enqueue_one_mds(msg, matched_sub->non_shared.session);
+                enqueue_one_mds(msg, matched_sub->non_shared.session, MQTT_SUBOPT_QOS(matched_sub->option));
 
                 found = true;
                 break;
@@ -7191,7 +7206,7 @@ static int handle_cp_subscribe(struct client *client, struct packet *packet,
             dbg_printf("[%2d] handle_cp_subscribe: handling retain message\n",
                     client->session->id);
 
-            if (enqueue_one_mds(msg, client->session) == -1)
+            if (enqueue_one_mds(msg, client->session, MQTT_SUBOPT_QOS(request->options[idx])) == -1)
                 continue;
 
             dbg_printf("[%2d] handle_cp_subscribe: added retained message\n",
@@ -8389,10 +8404,13 @@ static void tick_msg(struct message *msg)
         INC_REFCNT(&msg->refcnt);
         packet->message = msg;
 
-        packet->type = MQTT_CP_PUBLISH;
-        packet->flags |= MQTT_FLAG_PUBLISH_QOS(msg->qos);
+        const int actual_qos = MIN(msg->qos, mds->qos);
 
-        if (msg->qos) {
+        packet->type = MQTT_CP_PUBLISH;
+        packet->flags |= MQTT_FLAG_PUBLISH_QOS(actual_qos);
+
+
+        if (actual_qos) {
             /* Allocate a packet_identifier if this is the first time */
             if (mds->packet_identifier == 0)
                 while (mds->packet_identifier == 0) /* wrap around handling */
@@ -8424,7 +8442,7 @@ static void tick_msg(struct message *msg)
         total_messages_accepted_at++;
 
         /* Unless we get a network error, just assume it works */
-        if (msg->qos == 0) {
+        if (actual_qos == 0) {
             mds->acknowledged_at = now;
             mds->completed_at = mds->acknowledged_at;
             mds->released_at = mds->acknowledged_at;

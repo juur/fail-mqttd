@@ -98,7 +98,7 @@ typedef enum {
 #define MQTT_SUBOPT_QOS1                 (1<<0)
 #define MQTT_SUBOPT_QOS2                 (1<<1)
 #define MQTT_SUBOPT_QOS_MASK             ((1<<0)|(1<<1))
-#define MQTT_SUBOPT_QOS(x)               ((x)&0x3)
+#define MQTT_SUBOPT_QOS(x)               ((x)&MQTT_SUBOPT_QOS_MASK)
 #define MQTT_SUBOPT_NO_LOCAL             (1<<2)
 #define MQTT_SUBOPT_RETAIN_AS_PUBLISHED  (1<<3)
 #define MQTT_SUBOPT_RETAIN_HANDLING_MASK ((1<<5)|(1<<4))
@@ -341,7 +341,7 @@ struct message_delivery_state {
     struct message *message; /* _Nonnull */
     bool read_only;
     uint16_t packet_identifier;
-
+    uint8_t qos;
                                 /*   QoS=1     |   QoS=2     */
     union {
       time_t last_sent;         /*   PUBLISH-> |   PUBLISH-> */
