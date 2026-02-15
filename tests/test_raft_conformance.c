@@ -26,6 +26,7 @@
 
 #include "raft.h"
 #include "raft_test_api.h"
+#include "raft_test_io.h"
 
 extern struct raft_state raft_state;
 extern const struct raft_impl *raft_impl;
@@ -376,19 +377,6 @@ static void assert_monotonicity(struct conformance_ctx *ctx)
 	ctx->last_commit = raft_state.commit_index;
 }
 
-static int read_full(int fd, uint8_t *buf, size_t len)
-{
-	size_t off = 0;
-
-	while (off < len) {
-		ssize_t rc = read(fd, buf + off, len - off);
-		if (rc <= 0)
-			return -1;
-		off += (size_t)rc;
-	}
-	return 0;
-}
-
 static int send_request_vote(uint32_t term, uint32_t candidate_id,
 		uint32_t last_log_index, uint32_t last_log_term,
 		raft_status_t *out_status, uint32_t *out_term, uint32_t *out_voted_for)
@@ -425,7 +413,7 @@ static int send_request_vote(uint32_t term, uint32_t candidate_id,
 	if (raft_test_api.raft_process_packet(&client, RAFT_REQUEST_VOTE) == -1)
 		goto fail;
 
-	if (read_full(fds[0], header, sizeof(header)) == -1)
+	if (raft_test_read_full(fds[0], header, sizeof(header)) == -1)
 		goto fail;
 
 	memcpy(&length, header + 4, sizeof(length));
@@ -433,7 +421,7 @@ static int send_request_vote(uint32_t term, uint32_t candidate_id,
 	ck_assert_uint_eq(length - RAFT_HDR_SIZE, RAFT_REQUEST_VOTE_REPLY_SIZE);
 	ck_assert_int_eq(header[0], RAFT_REQUEST_VOTE_REPLY);
 
-	if (read_full(fds[0], buf, RAFT_REQUEST_VOTE_REPLY_SIZE) == -1)
+	if (raft_test_read_full(fds[0], buf, RAFT_REQUEST_VOTE_REPLY_SIZE) == -1)
 		goto fail;
 
 	reply_status = buf[0];
@@ -499,7 +487,7 @@ static int send_client_request(uint32_t client_id, uint32_t sequence_num,
 	if (raft_test_api.raft_process_packet(&client, RAFT_CLIENT_REQUEST) == -1)
 		goto fail;
 
-	if (read_full(fds[0], header, sizeof(header)) == -1)
+	if (raft_test_read_full(fds[0], header, sizeof(header)) == -1)
 		goto fail;
 
 	memcpy(&length, header + 4, sizeof(length));
@@ -507,7 +495,7 @@ static int send_client_request(uint32_t client_id, uint32_t sequence_num,
 	ck_assert_uint_eq(length - RAFT_HDR_SIZE, RAFT_CLIENT_REQUEST_REPLY_SIZE);
 	ck_assert_int_eq(header[0], RAFT_CLIENT_REQUEST_REPLY);
 
-	if (read_full(fds[0], buf, RAFT_CLIENT_REQUEST_REPLY_SIZE) == -1)
+	if (raft_test_read_full(fds[0], buf, RAFT_CLIENT_REQUEST_REPLY_SIZE) == -1)
 		goto fail;
 
 	reply_status = buf[0];
@@ -575,7 +563,7 @@ static int send_append_entries_heartbeat(uint32_t term, uint32_t leader_id,
 	if (raft_test_api.raft_process_packet(&client, RAFT_APPEND_ENTRIES) == -1)
 		goto fail;
 
-	if (read_full(fds[0], header, sizeof(header)) == -1)
+	if (raft_test_read_full(fds[0], header, sizeof(header)) == -1)
 		goto fail;
 
 	memcpy(&length, header + 4, sizeof(length));
@@ -583,7 +571,7 @@ static int send_append_entries_heartbeat(uint32_t term, uint32_t leader_id,
 	ck_assert_uint_eq(length - RAFT_HDR_SIZE, RAFT_APPEND_ENTRIES_REPLY_SIZE);
 	ck_assert_int_eq(header[0], RAFT_APPEND_ENTRIES_REPLY);
 
-	if (read_full(fds[0], buf, RAFT_APPEND_ENTRIES_REPLY_SIZE) == -1)
+	if (raft_test_read_full(fds[0], buf, RAFT_APPEND_ENTRIES_REPLY_SIZE) == -1)
 		goto fail;
 
 	reply_status = buf[0];
@@ -657,7 +645,7 @@ static int send_append_entries_single(uint32_t term, uint32_t leader_id,
 	if (raft_test_api.raft_process_packet(&client, RAFT_APPEND_ENTRIES) == -1)
 		goto fail;
 
-	if (read_full(fds[0], header, sizeof(header)) == -1)
+	if (raft_test_read_full(fds[0], header, sizeof(header)) == -1)
 		goto fail;
 
 	memcpy(&length, header + 4, sizeof(length));
@@ -665,7 +653,7 @@ static int send_append_entries_single(uint32_t term, uint32_t leader_id,
 	ck_assert_uint_eq(length - RAFT_HDR_SIZE, RAFT_APPEND_ENTRIES_REPLY_SIZE);
 	ck_assert_int_eq(header[0], RAFT_APPEND_ENTRIES_REPLY);
 
-	if (read_full(fds[0], buf, RAFT_APPEND_ENTRIES_REPLY_SIZE) == -1)
+	if (raft_test_read_full(fds[0], buf, RAFT_APPEND_ENTRIES_REPLY_SIZE) == -1)
 		goto fail;
 
 	reply_status = buf[0];

@@ -1232,8 +1232,10 @@ fail:
         free(line);
     if (mem)
         fclose(mem);
-    if (in)
+    if (in) {
         fclose(in);
+        *fd = -1;
+    }
     if (buffer)
         free(buffer);
     if (http_uri)
@@ -2338,6 +2340,7 @@ fail:
 static struct session *alloc_session(struct client *client, const uint8_t uuid[UUID_SIZE])
 {
     struct session *ret;
+    bool sub_lock = false, ds_lock = false;
 
     if (num_sessions >= MAX_SESSIONS) {
         errno = ENOSPC;
@@ -2356,13 +2359,17 @@ static struct session *alloc_session(struct client *client, const uint8_t uuid[U
 
     if (pthread_rwlock_init(&ret->subscriptions_lock, NULL) != 0)
         goto fail;
+    sub_lock = true;
+
     if (pthread_rwlock_init(&ret->delivery_states_lock, NULL) != 0)
         goto fail;
+    ds_lock = true;
 
     if (client) {
         ret->client = client;
         client->session = ret;
-        ret->client_id = (void *)strdup((const char *)client->client_id);
+        if ((ret->client_id = (void *)strdup((const char *)client->client_id)) == NULL)
+            goto fail;
     }
 
     if (pthread_rwlock_wrlock(&global_sessions_lock) == -1) {
@@ -2381,10 +2388,21 @@ static struct session *alloc_session(struct client *client, const uint8_t uuid[U
     return ret;
 
 fail:
-    if (ret->client_id)
-        free((void *)ret->client_id);
-    if (ret)
+    if (ret) {
+        if (sub_lock)
+            pthread_rwlock_destroy(&ret->subscriptions_lock);
+        if (ds_lock)
+            pthread_rwlock_destroy(&ret->delivery_states_lock);
+        if (client)
+            client->session = NULL;
+
+        if (ret->client_id) {
+            free((void *)ret->client_id);
+            ret->client_id = NULL;
+        }
+
         free(ret);
+    }
 
     return NULL;
 }
@@ -2393,6 +2411,7 @@ fail:
 static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[UUID_SIZE])
 {
     struct topic *ret = NULL;
+    bool pq_lock = false;
 
     if (num_topics >= MAX_TOPICS) {
         errno = ENOSPC;
@@ -2412,7 +2431,9 @@ static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[UUID_SI
     if ((ret->name = (void *)strdup((char *)name)) == NULL)
         goto fail;
 
-    pthread_rwlock_init(&ret->pending_queue_lock, NULL);
+    if (pthread_rwlock_init(&ret->pending_queue_lock, NULL) != 0)
+        goto fail;
+    pq_lock = true;
 
     ret->id = topic_id++;
     num_topics++;
@@ -2422,8 +2443,13 @@ static struct topic *alloc_topic(const uint8_t *name, const uint8_t uuid[UUID_SI
     return ret;
 
 fail:
-    if (ret)
+    if (ret) {
+        if (ret->name)
+            free((void *)ret->name);
+        if (pq_lock)
+            pthread_rwlock_destroy(&ret->pending_queue_lock);
         free(ret);
+    }
 
     return NULL;
 }
@@ -2521,6 +2547,7 @@ fail:
 static struct client *alloc_client(void)
 {
     struct client *client;
+    bool ap_lock = false, po_lock = false;
 
     if (num_clients >= MAX_CLIENTS) {
         errno = ENOSPC;
@@ -2543,11 +2570,13 @@ static struct client *alloc_client(void)
     client->send_quota = MAX_RECEIVE_PUBS; /* [MQTT-4.9.0-1] */
     client->last_keep_alive = time(NULL);
 
-    if (pthread_rwlock_init(&client->active_packets_lock, NULL) == -1)
+    if (pthread_rwlock_init(&client->active_packets_lock, NULL) != 0)
         goto fail;
+    ap_lock = true;
 
-    if (pthread_rwlock_init(&client->po_lock, NULL) == -1)
+    if (pthread_rwlock_init(&client->po_lock, NULL) != 0)
         goto fail;
+    po_lock = true;
 
     pthread_rwlock_wrlock(&global_clients_lock);
     client->next = global_client_list;
@@ -2562,10 +2591,17 @@ static struct client *alloc_client(void)
     return client;
 
 fail:
-    if (client->svr_topic_aliases)
-        free(client->svr_topic_aliases);
-    if (client)
+    if (client) {
+        if (ap_lock)
+            pthread_rwlock_destroy(&client->active_packets_lock);
+        if (po_lock)
+            pthread_rwlock_destroy(&client->po_lock);
+        if (client->svr_topic_aliases) {
+            free(client->svr_topic_aliases);
+            client->svr_topic_aliases = NULL;
+        }
         free(client);
+    }
 
     return NULL;
 }
@@ -2831,7 +2867,7 @@ static int write_mds(char **dst, const struct message_delivery_state *mds)
     write_u32(dst, mds->released_at);
     write_u32(dst, mds->completed_at);
     write_u8(dst, mds->client_reason);
-    
+
     if (mds->session == NULL) {
         errno = ENOENT;
         return -1;
@@ -2976,7 +3012,7 @@ again:
 
             rc = read_mds(out->delivery_states[idx], &src, bytes_remaining, out, true);
 
-            if (rc == -1 && errno != ENOENT) 
+            if (rc == -1 && errno != ENOENT)
                 goto fail;
             else if (rc == -1) {
                 /* Handle the scenario that the session is missing, etc. */
@@ -3111,7 +3147,7 @@ static void link_topics(void)
     pthread_rwlock_unlock(&global_topics_lock);
 }
 
-static int deserialise_topic(const struct topic **ret, const void *buffer,
+[[maybe_unused]] static int deserialise_topic(const struct topic **ret, const void *buffer,
         size_t *bytes_remaining)
 {
     const char *src = buffer;
@@ -7164,6 +7200,11 @@ skip_retain_check:
     return rc;
 
 fail:
+    if (request && request->num_topics == 0 && request->topics &&
+            request->topics[0]) {
+        free((void *)request->topics[0]);
+        request->topics[0] = NULL;
+    }
     if (request)
         free_topic_subs(request);
     send_cp_disconnect(client, reason_code);
@@ -7674,7 +7715,7 @@ fail:
 #ifdef FEATURE_RAFT
         close_session(client->session, false);
 #else
-    close_session(client->session);
+        close_session(client->session);
 #endif
 
     if (errno == 0)

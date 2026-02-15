@@ -8,13 +8,10 @@
 
 #include <check.h>
 #include <errno.h>
-#include <pthread.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
-#include "mqtt_test_api.h"
+#include "mqtt_test_support.h"
+
+static const uint32_t mqtt_max_packet_length = 0x1000000U;
 
 static void encode_var(uint32_t value, uint8_t out[static 4], int *out_len)
 {
@@ -31,67 +28,6 @@ static uint32_t decode_var(const uint8_t *buf, size_t len, int *err)
 	value = mqtt_test_api.read_var_byte(&ptr, &bytes_left);
 	*err = errno;
 	return value;
-}
-
-static void init_client(struct client *client, int fd, struct session *session)
-{
-	memset(client, 0, sizeof(*client));
-	client->fd = fd;
-	client->session = session;
-	client->parse_state = READ_STATE_NEW;
-	client->state = CS_ACTIVE;
-	pthread_rwlock_init(&client->active_packets_lock, NULL);
-	pthread_rwlock_init(&client->po_lock, NULL);
-}
-
-static void cleanup_client(struct client *client)
-{
-	if (client->packet_buf) {
-		free(client->packet_buf);
-		client->packet_buf = NULL;
-	}
-	if (client->client_id) {
-		free((void *)client->client_id);
-		client->client_id = NULL;
-	}
-	if (client->username) {
-		free((void *)client->username);
-		client->username = NULL;
-	}
-	if (client->password) {
-		free((void *)client->password);
-		client->password = NULL;
-		client->password_len = 0;
-	}
-	pthread_rwlock_destroy(&client->active_packets_lock);
-	pthread_rwlock_destroy(&client->po_lock);
-}
-
-static ssize_t write_packet(int fd, control_packet_t type, uint8_t flags,
-		const uint8_t *payload, size_t payload_len)
-{
-	struct mqtt_fixed_header hdr = {0};
-	uint8_t len_buf[4];
-	int len_len;
-	uint8_t header_buf[1 + 4];
-	size_t offset = 0;
-
-	hdr.type = type;
-	hdr.flags = flags;
-	memcpy(header_buf, &hdr, sizeof(hdr));
-	offset += sizeof(hdr);
-
-	len_len = mqtt_test_api.encode_var_byte((uint32_t)payload_len, len_buf);
-	memcpy(header_buf + offset, len_buf, (size_t)len_len);
-	offset += (size_t)len_len;
-
-	if (write(fd, header_buf, offset) != (ssize_t)offset)
-		return -1;
-	if (payload_len > 0 && payload) {
-		if (write(fd, payload, payload_len) != (ssize_t)payload_len)
-			return -1;
-	}
-	return (ssize_t)(offset + payload_len);
 }
 
 START_TEST(test_var_byte_round_trip)
@@ -114,6 +50,73 @@ START_TEST(test_var_byte_round_trip)
 		ck_assert_uint_eq(decoded, values[i]);
 		ck_assert_uint_eq(bytes_left, 0);
 	}
+}
+END_TEST
+
+START_TEST(test_parse_properties_invalid_for_connect)
+{
+	struct property props[1];
+	uint8_t prop_buf[16];
+	uint8_t pkt_buf[32];
+	uint8_t *ptr = prop_buf;
+	const uint8_t *parse_ptr = pkt_buf;
+	size_t bytes_left;
+	ssize_t size;
+	int len;
+	struct property (*out_props)[];
+	unsigned out_count = 0;
+
+	out_props = NULL;
+
+	memset(props, 0, sizeof(props));
+	props[0].ident = MQTT_PROP_TOPIC_ALIAS;
+	props[0].byte2 = 1;
+
+	size = mqtt_test_api.get_properties_size(&props, 1);
+	ck_assert_int_gt((int)size, 0);
+
+	ck_assert_int_eq(mqtt_test_api.build_properties(&props, 1, &ptr), 0);
+	ck_assert_int_eq((int)(ptr - prop_buf), (int)size);
+
+	len = mqtt_test_api.encode_var_byte((uint32_t)size, pkt_buf);
+	memcpy(pkt_buf + len, prop_buf, (size_t)size);
+	bytes_left = (size_t)len + (size_t)size;
+
+	errno = 0;
+	ck_assert_int_eq(mqtt_test_api.parse_properties(&parse_ptr, &bytes_left,
+				&out_props, &out_count, MQTT_CP_CONNECT), -1);
+	ck_assert_int_eq(errno, EINVAL);
+}
+END_TEST
+
+START_TEST(test_parse_packet_too_large)
+{
+	int fds[2];
+	struct client client;
+	struct session session;
+	int rc = 0;
+
+	memset(&session, 0, sizeof(session));
+	session.id = 9;
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], &session);
+
+	ck_assert_int_ne(mqtt_test_write_packet_header(fds[1], MQTT_CP_CONNECT, 0,
+				mqtt_max_packet_length + 1U), -1);
+	for (int i = 0; i < 4; i++) {
+		rc = mqtt_test_api.parse_incoming(&client);
+		if (rc != 0)
+			break;
+	}
+	ck_assert_int_eq(rc, -1);
+	ck_assert_int_eq(client.state, CS_CLOSING);
+	ck_assert_int_eq(client.disconnect_reason, MQTT_PACKET_TOO_LARGE);
+
+	close(fds[1]);
+	if (client.fd != -1)
+		close(fds[0]);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -218,16 +221,16 @@ START_TEST(test_parse_pingreq_ok_no_handler)
 	session.id = 1;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 
-	ck_assert_int_ne(write_packet(fds[1], MQTT_CP_PINGREQ, 0, NULL, 0), -1);
+	ck_assert_int_ne(mqtt_test_write_packet(fds[1], MQTT_CP_PINGREQ, 0, NULL, 0), -1);
 	ck_assert_int_eq(mqtt_test_api.parse_incoming(&client), 0);
 	ck_assert_int_eq(client.parse_state, READ_STATE_NEW);
 	ck_assert_int_eq(client.state, CS_ACTIVE);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -241,16 +244,16 @@ START_TEST(test_parse_pingreq_invalid_flags)
 	session.id = 2;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 
-	ck_assert_int_ne(write_packet(fds[1], MQTT_CP_PINGREQ, 1, NULL, 0), -1);
+	ck_assert_int_ne(mqtt_test_write_packet(fds[1], MQTT_CP_PINGREQ, 1, NULL, 0), -1);
 	ck_assert_int_eq(mqtt_test_api.parse_incoming(&client), -1);
 	ck_assert_int_eq(client.state, CS_CLOSING);
 	ck_assert_int_eq(client.disconnect_reason, MQTT_MALFORMED_PACKET);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -260,16 +263,16 @@ START_TEST(test_parse_first_packet_not_connect)
 	struct client client;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], NULL);
+	mqtt_test_init_client(&client, fds[0], NULL);
 
-	ck_assert_int_ne(write_packet(fds[1], MQTT_CP_PINGREQ, 0, NULL, 0), -1);
+	ck_assert_int_ne(mqtt_test_write_packet(fds[1], MQTT_CP_PINGREQ, 0, NULL, 0), -1);
 	ck_assert_int_eq(mqtt_test_api.parse_incoming(&client), -1);
 	ck_assert_int_eq(client.state, CS_CLOSING);
 	ck_assert_int_eq(client.disconnect_reason, MQTT_MALFORMED_PACKET);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -283,16 +286,16 @@ START_TEST(test_parse_invalid_type_zero)
 	session.id = 3;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 
-	ck_assert_int_ne(write_packet(fds[1], 0, 0, NULL, 0), -1);
+	ck_assert_int_ne(mqtt_test_write_packet(fds[1], 0, 0, NULL, 0), -1);
 	ck_assert_int_eq(mqtt_test_api.parse_incoming(&client), -1);
 	ck_assert_int_eq(client.state, CS_CLOSING);
 	ck_assert_int_eq(client.disconnect_reason, MQTT_MALFORMED_PACKET);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -312,6 +315,8 @@ static Suite *mqtt_packets_suite(void)
 	tcase_add_test(tc, test_parse_pingreq_invalid_flags);
 	tcase_add_test(tc, test_parse_first_packet_not_connect);
 	tcase_add_test(tc, test_parse_invalid_type_zero);
+	tcase_add_test(tc, test_parse_properties_invalid_for_connect);
+	tcase_add_test(tc, test_parse_packet_too_large);
 	suite_add_tcase(s, tc);
 	return s;
 }

@@ -90,7 +90,7 @@ endif
 CPPFLAGS += -I$(objdir) -I$(srcdir)/src
 CPPFLAGS += -I$(srcdir)/include
 
-.PHONY: all check test coverage coverage-run
+.PHONY: all check test coverage coverage-run coverage-json coverage-json-run
 
 all: $(objdir)/.d $(package_BINS) man
 
@@ -112,6 +112,17 @@ coverage-run:
 	-$(MKDIR) $(objdir)/coverage/ 2>/dev/null
 	$(GCOVR) -r $(srcdir) -i $(call comma-separate,$(all_SRCS)) --print-summary --xml $(objdir)/coverage/coverage.xml \
 		--html-details $(objdir)/coverage/coverage.html $(GCOVR_EXCLUDES)
+
+coverage-json: clean
+	$(MAKE) coverage-json-run
+
+coverage-json-run:
+	$(MAKE) check \
+		CFLAGS="$(CFLAGS) $(COVERAGE_CFLAGS)" \
+		LDFLAGS="$(LDFLAGS) $(COVERAGE_LDFLAGS)"
+	-$(MKDIR) $(objdir)/coverage/ 2>/dev/null
+	$(GCOVR) -r $(srcdir) -i $(call comma-separate,$(all_SRCS)) --print-summary --json $(objdir)/coverage/coverage.json \
+		$(GCOVR_EXCLUDES)
 
 $(objdir)/doc:
 	@mkdir -p $(objdir)/doc 2>/dev/null

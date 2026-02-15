@@ -24,6 +24,7 @@
 
 #include "raft.h"
 #include "raft_test_api.h"
+#include "raft_test_io.h"
 
 extern struct raft_state raft_state;
 extern const struct raft_impl *raft_impl;
@@ -1367,25 +1368,6 @@ START_TEST(test_add_write_rejects_full_queue)
 }
 END_TEST
 
-static ssize_t fill_pipe_nonblocking(int fd, uint8_t *buf, size_t buf_len)
-{
-	ssize_t total = 0;
-	ssize_t rc;
-
-	for (;;) {
-		rc = write(fd, buf, buf_len);
-		if (rc > 0) {
-			total += rc;
-			continue;
-		}
-		if (rc == -1 && errno == EAGAIN)
-			break;
-		return -1;
-	}
-
-	return total;
-}
-
 START_TEST(test_try_write_partial_progress)
 {
 	struct raft_host_entry entry;
@@ -1396,10 +1378,10 @@ START_TEST(test_try_write_partial_progress)
 	ssize_t rc;
 
 	ck_assert_int_eq(pipe(fds), 0);
-	ck_assert_int_eq(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+	ck_assert_int_ne(raft_test_set_nonblock(fds[1]), -1);
 
 	memset(payload, 'A', sizeof(payload));
-	filled = fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
+	filled = raft_test_fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
 	ck_assert_int_ge(filled, 0);
 
 	rc = read(fds[0], scratch, sizeof(scratch));
@@ -1459,10 +1441,10 @@ START_TEST(test_try_write_eagain)
 	ssize_t filled;
 
 	ck_assert_int_eq(pipe(fds), 0);
-	ck_assert_int_eq(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+	ck_assert_int_ne(raft_test_set_nonblock(fds[1]), -1);
 
 	memset(scratch, 'A', sizeof(scratch));
-	filled = fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
+	filled = raft_test_fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
 	ck_assert_int_ge(filled, 0);
 
 	memset(&entry, 0, sizeof(entry));
@@ -2529,12 +2511,8 @@ START_TEST(test_recv_header_eagain)
 {
 	struct raft_host_entry client;
 	int fds[2];
-	int flags;
-
 	ck_assert_int_eq(pipe(fds), 0);
-	flags = fcntl(fds[0], F_GETFL, 0);
-	ck_assert_int_ne(flags, -1);
-	ck_assert_int_ne(fcntl(fds[0], F_SETFL, flags | O_NONBLOCK), -1);
+	ck_assert_int_ne(raft_test_set_nonblock(fds[0]), -1);
 
 	memset(&client, 0, sizeof(client));
 	init_entry_locks(&client);
@@ -2557,14 +2535,11 @@ START_TEST(test_recv_payload_eagain)
 {
 	struct raft_host_entry client;
 	int fds[2];
-	int flags;
 	uint8_t header[RAFT_HDR_SIZE];
 	uint8_t payload[RAFT_CLIENT_REQUEST_REPLY_SIZE];
 
 	ck_assert_int_eq(pipe(fds), 0);
-	flags = fcntl(fds[0], F_GETFL, 0);
-	ck_assert_int_ne(flags, -1);
-	ck_assert_int_ne(fcntl(fds[0], F_SETFL, flags | O_NONBLOCK), -1);
+	ck_assert_int_ne(raft_test_set_nonblock(fds[0]), -1);
 
 	memset(&client, 0, sizeof(client));
 	init_entry_locks(&client);
@@ -2950,10 +2925,10 @@ START_TEST(test_send_broadcast_try_write_eagain)
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, hello_fds), 0);
 	ck_assert_int_eq(pipe(fds), 0);
-	ck_assert_int_eq(fcntl(fds[1], F_SETFL, O_NONBLOCK), 0);
+	ck_assert_int_ne(raft_test_set_nonblock(fds[1]), -1);
 
 	memset(scratch, 'A', sizeof(scratch));
-	filled = fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
+	filled = raft_test_fill_pipe_nonblocking(fds[1], scratch, sizeof(scratch));
 	ck_assert_int_ge(filled, 0);
 
 	peers = alloc_peers(2);
@@ -3708,7 +3683,7 @@ START_TEST(test_tick_connection_check_connect_success)
 	}
 	flags = fcntl(listen_fd, F_GETFL);
 	if (flags != -1)
-		(void)fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
+		(void)raft_test_set_nonblock(listen_fd);
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
 	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);

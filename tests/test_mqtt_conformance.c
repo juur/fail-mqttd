@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <pthread.h>
 
-#include "mqtt_test_api.h"
+#include "mqtt_test_support.h"
 
 extern bool opt_database;
 
@@ -114,41 +114,6 @@ static void free_data(void)
 	free(g_doc_ids);
 }
 
-static void init_client(struct client *client, int fd, struct session *session)
-{
-	memset(client, 0, sizeof(*client));
-	client->fd = fd;
-	client->session = session;
-	client->parse_state = READ_STATE_NEW;
-	client->state = CS_ACTIVE;
-	pthread_rwlock_init(&client->active_packets_lock, NULL);
-	pthread_rwlock_init(&client->po_lock, NULL);
-}
-
-static void cleanup_client(struct client *client)
-{
-	if (client->packet_buf) {
-		free(client->packet_buf);
-		client->packet_buf = NULL;
-	}
-	if (client->client_id) {
-		free((void *)client->client_id);
-		client->client_id = NULL;
-	}
-	if (client->username) {
-		free((void *)client->username);
-		client->username = NULL;
-	}
-	if (client->password) {
-		free((void *)client->password);
-		client->password = NULL;
-		client->password_len = 0;
-	}
-
-	pthread_rwlock_destroy(&client->active_packets_lock);
-	pthread_rwlock_destroy(&client->po_lock);
-}
-
 static struct session *create_session(const char *client_id)
 {
 	struct client dummy;
@@ -168,80 +133,6 @@ static struct session *create_session(const char *client_id)
 	return session;
 }
 
-static ssize_t write_packet(int fd, control_packet_t type, uint8_t flags,
-		const uint8_t *payload, size_t payload_len)
-{
-	struct mqtt_fixed_header hdr = {0};
-	uint8_t len_buf[4];
-	int len_len;
-	uint8_t header_buf[1 + 4];
-	size_t offset = 0;
-
-	hdr.type = type;
-	hdr.flags = flags;
-	memcpy(header_buf, &hdr, sizeof(hdr));
-	offset += sizeof(hdr);
-
-	len_len = mqtt_test_api.encode_var_byte((uint32_t)payload_len, len_buf);
-	memcpy(header_buf + offset, len_buf, (size_t)len_len);
-	offset += (size_t)len_len;
-
-	if (write(fd, header_buf, offset) != (ssize_t)offset)
-		return -1;
-	if (payload_len > 0 && payload) {
-		if (write(fd, payload, payload_len) != (ssize_t)payload_len)
-			return -1;
-	}
-	return (ssize_t)(offset + payload_len);
-}
-
-static ssize_t read_packet(int fd, uint8_t *buf, size_t buf_len)
-{
-	ssize_t rd;
-
-	rd = read(fd, buf, buf_len);
-	if (rd < 0)
-		return -1;
-	return rd;
-}
-
-static int decode_remaining_length(const uint8_t *buf, size_t len, size_t *out_len, size_t *out_consumed)
-{
-	const uint8_t *ptr = buf;
-	size_t bytes_left = len;
-	uint32_t value;
-
-	errno = 0;
-	value = mqtt_test_api.read_var_byte(&ptr, &bytes_left);
-	if (value == 0 && errno)
-		return -1;
-	*out_len = value;
-	*out_consumed = (size_t)(ptr - buf);
-	return 0;
-}
-
-static int read_packet_id(const uint8_t *buf, size_t len, uint16_t *out_id)
-{
-	size_t rl_len = 0;
-	size_t rl_consumed = 0;
-	size_t offset;
-	uint16_t tmp;
-
-	if (len < 2)
-		return -1;
-
-	if (decode_remaining_length(buf + 1, len - 1, &rl_len, &rl_consumed) == -1)
-		return -1;
-
-	offset = 1 + rl_consumed;
-	if (offset + sizeof(uint16_t) > len)
-		return -1;
-
-	memcpy(&tmp, buf + offset, sizeof(uint16_t));
-	*out_id = ntohs(tmp);
-	return 0;
-}
-
 static int read_connack_flags(int fd, uint8_t *out_flags)
 {
 	uint8_t buf[64];
@@ -250,14 +141,15 @@ static int read_connack_flags(int fd, uint8_t *out_flags)
 	size_t rl_consumed = 0;
 	size_t offset;
 
-	rd = read_packet(fd, buf, sizeof(buf));
+	rd = mqtt_test_read_packet(fd, buf, sizeof(buf));
 	if (rd < 0)
 		return -1;
 	if (rd < 4)
 		return -1;
 	if (buf[0] != (uint8_t)(MQTT_CP_CONNACK << 4))
 		return -1;
-	if (decode_remaining_length(buf + 1, (size_t)rd - 1, &rl_len, &rl_consumed) == -1)
+	if (mqtt_test_decode_remaining_length(buf + 1, (size_t)rd - 1, &rl_len,
+				&rl_consumed) == -1)
 		return -1;
 
 	offset = 1 + rl_consumed;
@@ -265,6 +157,33 @@ static int read_connack_flags(int fd, uint8_t *out_flags)
 		return -1;
 
 	*out_flags = buf[offset];
+	return 0;
+}
+
+static int read_connack_reason(int fd, uint8_t *out_reason)
+{
+	uint8_t buf[64];
+	ssize_t rd;
+	size_t rl_len = 0;
+	size_t rl_consumed = 0;
+	size_t offset;
+
+	rd = mqtt_test_read_packet(fd, buf, sizeof(buf));
+	if (rd < 0)
+		return -1;
+	if (rd < 5)
+		return -1;
+	if (buf[0] != (uint8_t)(MQTT_CP_CONNACK << 4))
+		return -1;
+	if (mqtt_test_decode_remaining_length(buf + 1, (size_t)rd - 1, &rl_len,
+				&rl_consumed) == -1)
+		return -1;
+
+	offset = 1 + rl_consumed;
+	if (offset + 2 > (size_t)rd)
+		return -1;
+
+	*out_reason = buf[offset + 1];
 	return 0;
 }
 
@@ -325,19 +244,163 @@ static size_t build_connect_packet(uint8_t *out, size_t out_len, uint8_t connect
 	return remaining;
 }
 
-static int drive_parse(struct client *client)
+static size_t build_connect_packet_props(uint8_t *out, size_t out_len, uint8_t connect_flags,
+		const struct property *props, unsigned num_props,
+		const char *client_id, const char *username, const char *password)
 {
-	int rc = 0;
+	uint8_t payload[256];
+	uint8_t prop_buf[128];
+	uint8_t *ptr = payload;
+	uint8_t *prop_ptr = prop_buf;
+	uint16_t tmp16;
+	uint8_t remlen[4];
+	int remlen_len;
+	size_t payload_len;
+	size_t remaining;
+	size_t prop_len = 0;
+	int prop_len_len;
 
-	for (int i = 0; i < 8; i++) {
-		rc = mqtt_test_api.parse_incoming(client);
-		if (rc != 0)
-			return rc;
-		if (client->parse_state == READ_STATE_NEW)
-			return 0;
+	tmp16 = htons(4);
+	memcpy(ptr, &tmp16, sizeof(tmp16));
+	ptr += sizeof(tmp16);
+	memcpy(ptr, "MQTT", 4);
+	ptr += 4;
+	*ptr++ = 5;
+	*ptr++ = connect_flags;
+	tmp16 = htons(0);
+	memcpy(ptr, &tmp16, sizeof(tmp16));
+	ptr += sizeof(tmp16);
+
+	if (num_props) {
+		ck_assert_int_eq(mqtt_test_api.build_properties(
+				(const struct property (*)[])props, num_props, &prop_ptr), 0);
+		prop_len = (size_t)(prop_ptr - prop_buf);
 	}
 
-	return rc;
+	prop_len_len = mqtt_test_api.encode_var_byte((uint32_t)prop_len, remlen);
+	memcpy(ptr, remlen, (size_t)prop_len_len);
+	ptr += (size_t)prop_len_len;
+	if (prop_len) {
+		memcpy(ptr, prop_buf, prop_len);
+		ptr += prop_len;
+	}
+
+	tmp16 = htons((uint16_t)strlen(client_id));
+	memcpy(ptr, &tmp16, sizeof(tmp16));
+	ptr += sizeof(tmp16);
+	memcpy(ptr, client_id, strlen(client_id));
+	ptr += strlen(client_id);
+
+	if (connect_flags & MQTT_CONNECT_FLAG_USERNAME) {
+		tmp16 = htons((uint16_t)strlen(username));
+		memcpy(ptr, &tmp16, sizeof(tmp16));
+		ptr += sizeof(tmp16);
+		memcpy(ptr, username, strlen(username));
+		ptr += strlen(username);
+	}
+
+	if (connect_flags & MQTT_CONNECT_FLAG_PASSWORD) {
+		tmp16 = htons((uint16_t)strlen(password));
+		memcpy(ptr, &tmp16, sizeof(tmp16));
+		ptr += sizeof(tmp16);
+		memcpy(ptr, password, strlen(password));
+		ptr += strlen(password);
+	}
+
+	payload_len = (size_t)(ptr - payload);
+
+	remlen_len = mqtt_test_api.encode_var_byte((uint32_t)payload_len, remlen);
+	remaining = 1 + (size_t)remlen_len + payload_len;
+	if (remaining > out_len)
+		return 0;
+
+	out[0] = (uint8_t)(MQTT_CP_CONNECT << 4);
+	memcpy(out + 1, remlen, (size_t)remlen_len);
+	memcpy(out + 1 + remlen_len, payload, payload_len);
+	return remaining;
+}
+
+static size_t build_publish_packet(uint8_t *out, size_t out_len, uint8_t flags,
+		const uint8_t *topic, const uint8_t *payload, size_t payload_len,
+		uint16_t packet_id)
+{
+	uint8_t var_buf[256];
+	uint8_t *ptr = var_buf;
+	uint16_t topic_len = 0;
+	uint16_t tmp16;
+	uint8_t remlen[4];
+	int remlen_len;
+	size_t var_len;
+
+	if (topic)
+		topic_len = (uint16_t)strlen((const char *)topic);
+
+	tmp16 = htons(topic_len);
+	memcpy(ptr, &tmp16, sizeof(tmp16));
+	ptr += sizeof(tmp16);
+	if (topic_len) {
+		memcpy(ptr, topic, topic_len);
+		ptr += topic_len;
+	}
+
+	if (GET_QOS(flags)) {
+		tmp16 = htons(packet_id);
+		memcpy(ptr, &tmp16, sizeof(tmp16));
+		ptr += sizeof(tmp16);
+	}
+
+	*ptr++ = 0; /* properties length */
+
+	if (payload_len) {
+		memcpy(ptr, payload, payload_len);
+		ptr += payload_len;
+	}
+
+	var_len = (size_t)(ptr - var_buf);
+	remlen_len = mqtt_test_api.encode_var_byte((uint32_t)var_len, remlen);
+
+	if (1 + (size_t)remlen_len + var_len > out_len)
+		return 0;
+
+	out[0] = (uint8_t)(MQTT_CP_PUBLISH << 4) | flags;
+	memcpy(out + 1, remlen, (size_t)remlen_len);
+	memcpy(out + 1 + remlen_len, var_buf, var_len);
+	return 1 + (size_t)remlen_len + var_len;
+}
+
+static size_t build_subscribe_packet(uint8_t *out, size_t out_len,
+		uint16_t packet_id, const uint8_t *filter, uint8_t options)
+{
+	uint8_t payload[128];
+	uint8_t *ptr = payload;
+	uint16_t tmp16;
+	uint8_t remlen[4];
+	int remlen_len;
+	size_t payload_len;
+	size_t remaining;
+
+	tmp16 = htons(packet_id);
+	memcpy(ptr, &tmp16, sizeof(tmp16));
+	ptr += sizeof(tmp16);
+	*ptr++ = 0; /* properties length */
+
+	tmp16 = htons((uint16_t)strlen((const char *)filter));
+	memcpy(ptr, &tmp16, sizeof(tmp16));
+	ptr += sizeof(tmp16);
+	memcpy(ptr, filter, strlen((const char *)filter));
+	ptr += strlen((const char *)filter);
+	*ptr++ = options;
+
+	payload_len = (size_t)(ptr - payload);
+	remlen_len = mqtt_test_api.encode_var_byte((uint32_t)payload_len, remlen);
+	remaining = 1 + (size_t)remlen_len + payload_len;
+	if (remaining > out_len)
+		return 0;
+
+	out[0] = (uint8_t)(MQTT_CP_SUBSCRIBE << 4) | MQTT_FLAG_SUBSCRIBE;
+	memcpy(out + 1, remlen, (size_t)remlen_len);
+	memcpy(out + 1 + remlen_len, payload, payload_len);
+	return remaining;
 }
 
 START_TEST(test_conformance_table_loaded)
@@ -421,17 +484,17 @@ START_TEST(test_mqtt_2_2_1_3)
 	*ptr++ = 0x00; /* options */
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 	client.is_auth = true;
 
-	ck_assert_int_ne(write_packet(fds[1], MQTT_CP_SUBSCRIBE, MQTT_FLAG_SUBSCRIBE,
+	ck_assert_int_ne(mqtt_test_write_packet(fds[1], MQTT_CP_SUBSCRIBE, MQTT_FLAG_SUBSCRIBE,
 				payload, (size_t)(ptr - payload)), -1);
-	ck_assert_int_eq(drive_parse(&client), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
 	ck_assert_int_eq(client.state, CS_CLOSING);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -446,16 +509,16 @@ START_TEST(test_mqtt_2_1_3_1)
 	session.id = 12;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 	client.is_auth = true;
 
-	ck_assert_int_ne(write_packet(fds[1], MQTT_CP_PINGREQ, 1, NULL, 0), -1);
-	ck_assert_int_eq(drive_parse(&client), -1);
+	ck_assert_int_ne(mqtt_test_write_packet(fds[1], MQTT_CP_PINGREQ, 1, NULL, 0), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
 	ck_assert_int_eq(client.state, CS_CLOSING);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -466,15 +529,15 @@ START_TEST(test_mqtt_3_1_0_1)
 	struct client client;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], NULL);
+	mqtt_test_init_client(&client, fds[0], NULL);
 
-	ck_assert_int_ne(write_packet(fds[1], MQTT_CP_PINGREQ, 0, NULL, 0), -1);
-	ck_assert_int_eq(drive_parse(&client), -1);
+	ck_assert_int_ne(mqtt_test_write_packet(fds[1], MQTT_CP_PINGREQ, 0, NULL, 0), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
 	ck_assert_int_eq(client.state, CS_CLOSING);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -498,15 +561,15 @@ START_TEST(test_mqtt_3_1_2_3)
 	ck_assert_int_gt((int)packet_len, 0);
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], NULL);
+	mqtt_test_init_client(&client, fds[0], NULL);
 
 	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
-	ck_assert_int_eq(drive_parse(&client), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
 	ck_assert_int_eq(client.state, CS_CLOSING);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -527,10 +590,10 @@ START_TEST(test_mqtt_3_2_2_2)
 	ck_assert_int_gt((int)packet_len, 0);
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], NULL);
+	mqtt_test_init_client(&client, fds[0], NULL);
 
 	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
-	ck_assert_int_eq(drive_parse(&client), 0);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), 0);
 
 	ck_assert_int_eq(read_connack_flags(fds[1], &flags), 0);
 	ck_assert_int_eq(flags & MQTT_CONNACK_FLAG_SESSION_PRESENT, 0);
@@ -541,7 +604,108 @@ START_TEST(test_mqtt_3_2_2_2)
 		mqtt_test_api.free_session(client.session, true);
 		client.session = NULL;
 	}
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
+}
+END_TEST
+
+START_TEST(test_mqtt_connect_auth_method_rejected)
+{
+	uint8_t packet[256];
+	size_t packet_len;
+	uint8_t reason = 0;
+	int fds[2];
+	struct client client;
+	struct property props[1];
+
+	memset(props, 0, sizeof(props));
+	props[0].ident = MQTT_PROP_AUTHENTICATION_METHOD;
+	props[0].utf8_string = (unsigned char *)"x";
+
+	packet_len = build_connect_packet_props(packet, sizeof(packet),
+			MQTT_CONNECT_FLAG_USERNAME | MQTT_CONNECT_FLAG_PASSWORD,
+			props, 1, "am1", "u", "p");
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], NULL);
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+
+	ck_assert_int_eq(read_connack_reason(fds[1], &reason), 0);
+	ck_assert_int_eq(reason, MQTT_BAD_AUTHENTICATION_METHOD);
+
+	close(fds[1]);
+	close(fds[0]);
+	mqtt_test_cleanup_client(&client);
+}
+END_TEST
+
+START_TEST(test_mqtt_connect_auth_data_rejected)
+{
+	uint8_t packet[256];
+	size_t packet_len;
+	uint8_t reason = 0;
+	int fds[2];
+	struct client client;
+	struct property props[1];
+	uint8_t blob[1] = {0x01};
+
+	memset(props, 0, sizeof(props));
+	props[0].ident = MQTT_PROP_AUTHENTICATION_DATA;
+	props[0].binary.data = blob;
+	props[0].binary.len = sizeof(blob);
+
+	packet_len = build_connect_packet_props(packet, sizeof(packet),
+			MQTT_CONNECT_FLAG_USERNAME | MQTT_CONNECT_FLAG_PASSWORD,
+			props, 1, "ad1", "u", "p");
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], NULL);
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+
+	ck_assert_int_eq(read_connack_reason(fds[1], &reason), 0);
+	ck_assert_int_eq(reason, MQTT_PROTOCOL_ERROR);
+
+	close(fds[1]);
+	close(fds[0]);
+	mqtt_test_cleanup_client(&client);
+}
+END_TEST
+
+START_TEST(test_mqtt_connect_topic_alias_max_zero)
+{
+	uint8_t packet[256];
+	size_t packet_len;
+	uint8_t reason = 0;
+	int fds[2];
+	struct client client;
+	struct property props[1];
+
+	memset(props, 0, sizeof(props));
+	props[0].ident = MQTT_PROP_TOPIC_ALIAS_MAXIMUM;
+	props[0].byte2 = 0;
+
+	packet_len = build_connect_packet_props(packet, sizeof(packet),
+			MQTT_CONNECT_FLAG_USERNAME | MQTT_CONNECT_FLAG_PASSWORD,
+			props, 1, "ta0", "u", "p");
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], NULL);
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+
+	ck_assert_int_eq(read_connack_reason(fds[1], &reason), 0);
+	ck_assert_int_eq(reason, MQTT_PROTOCOL_ERROR);
+
+	close(fds[1]);
+	close(fds[0]);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -561,10 +725,10 @@ START_TEST(test_mqtt_3_2_2_3_no_session)
 	ck_assert_int_gt((int)packet_len, 0);
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], NULL);
+	mqtt_test_init_client(&client, fds[0], NULL);
 
 	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
-	ck_assert_int_eq(drive_parse(&client), 0);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), 0);
 
 	ck_assert_int_eq(read_connack_flags(fds[1], &flags), 0);
 	ck_assert_int_eq(flags & MQTT_CONNACK_FLAG_SESSION_PRESENT, 0);
@@ -575,7 +739,7 @@ START_TEST(test_mqtt_3_2_2_3_no_session)
 		mqtt_test_api.free_session(client.session, true);
 		client.session = NULL;
 	}
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -597,10 +761,10 @@ START_TEST(test_mqtt_3_1_2_5_existing_session)
 	ck_assert_int_gt((int)packet_len, 0);
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], NULL);
+	mqtt_test_init_client(&client, fds[0], NULL);
 
 	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
-	ck_assert_int_eq(drive_parse(&client), 0);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), 0);
 
 	ck_assert_int_eq(read_connack_flags(fds[1], &flags), 0);
 	int present = (flags & MQTT_CONNACK_FLAG_SESSION_PRESENT) != 0;
@@ -611,7 +775,7 @@ START_TEST(test_mqtt_3_1_2_5_existing_session)
 		mqtt_test_api.free_session(client.session, true);
 		client.session = NULL;
 	}
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 
 	ck_assert_int_ne(present, 0);
 }
@@ -636,10 +800,10 @@ START_TEST(test_mqtt_3_1_2_4_clean_start_discards_session)
 	ck_assert_int_gt((int)packet_len, 0);
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], NULL);
+	mqtt_test_init_client(&client, fds[0], NULL);
 
 	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
-	ck_assert_int_eq(drive_parse(&client), 0);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), 0);
 
 	ck_assert_int_eq(read_connack_flags(fds[1], &flags), 0);
 	ck_assert_int_eq(flags & MQTT_CONNACK_FLAG_SESSION_PRESENT, 0);
@@ -650,7 +814,7 @@ START_TEST(test_mqtt_3_1_2_4_clean_start_discards_session)
 		mqtt_test_api.free_session(client.session, true);
 		client.session = NULL;
 	}
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -669,10 +833,10 @@ START_TEST(test_mqtt_3_1_2_6_no_existing_session)
 	ck_assert_int_gt((int)packet_len, 0);
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], NULL);
+	mqtt_test_init_client(&client, fds[0], NULL);
 
 	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
-	ck_assert_int_eq(drive_parse(&client), 0);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), 0);
 	ck_assert_ptr_nonnull(client.session);
 
 	close(fds[1]);
@@ -681,11 +845,11 @@ START_TEST(test_mqtt_3_1_2_6_no_existing_session)
 		mqtt_test_api.free_session(client.session, true);
 		client.session = NULL;
 	}
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
-START_TEST(test_mqtt_2_2_1_2_qos0_packet_id_rejected)
+START_TEST(test_mqtt_2_2_1_2_qos0_packet_id_treated_as_payload)
 {
 	/* QoS 0 PUBLISH must not include Packet Identifier. */
 	uint8_t payload[64];
@@ -709,16 +873,16 @@ START_TEST(test_mqtt_2_2_1_2_qos0_packet_id_rejected)
 	ptr += sizeof(fake_packet_id);
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 	client.is_auth = true;
 
-	ck_assert_int_ne(write_packet(fds[1], MQTT_CP_PUBLISH, 0, payload,
+	ck_assert_int_ne(mqtt_test_write_packet(fds[1], MQTT_CP_PUBLISH, 0, payload,
 				(size_t)(ptr - payload)), -1);
-	int rc = drive_parse(&client);
+	int rc = mqtt_test_drive_parse(&client);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 	pthread_rwlock_destroy(&session.subscriptions_lock);
 	pthread_rwlock_destroy(&session.delivery_states_lock);
 
@@ -731,6 +895,111 @@ START_TEST(test_mqtt_2_2_1_2_qos0_packet_id_rejected)
 }
 END_TEST
 
+START_TEST(test_mqtt_publish_qos_invalid)
+{
+	uint8_t packet[128];
+	size_t packet_len;
+	int fds[2];
+	struct client client;
+	struct session session;
+
+	memset(&session, 0, sizeof(session));
+	session.id = 31;
+	ck_assert_int_eq(pthread_rwlock_init(&session.subscriptions_lock, NULL), 0);
+	ck_assert_int_eq(pthread_rwlock_init(&session.delivery_states_lock, NULL), 0);
+
+	packet_len = build_publish_packet(packet, sizeof(packet),
+			MQTT_FLAG_PUBLISH_QOS_MASK, (const uint8_t *)"a", NULL, 0, 0);
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], &session);
+	client.is_auth = true;
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+	ck_assert_int_eq(client.state, CS_CLOSING);
+	ck_assert_int_eq(client.disconnect_reason, MQTT_PROTOCOL_ERROR);
+
+	close(fds[1]);
+	if (client.fd != -1)
+		close(fds[0]);
+	mqtt_test_cleanup_client(&client);
+	pthread_rwlock_destroy(&session.subscriptions_lock);
+	pthread_rwlock_destroy(&session.delivery_states_lock);
+}
+END_TEST
+
+START_TEST(test_mqtt_publish_qos0_dup_rejected)
+{
+	uint8_t packet[128];
+	size_t packet_len;
+	int fds[2];
+	struct client client;
+	struct session session;
+
+	memset(&session, 0, sizeof(session));
+	session.id = 32;
+	ck_assert_int_eq(pthread_rwlock_init(&session.subscriptions_lock, NULL), 0);
+	ck_assert_int_eq(pthread_rwlock_init(&session.delivery_states_lock, NULL), 0);
+
+	packet_len = build_publish_packet(packet, sizeof(packet),
+			MQTT_FLAG_PUBLISH_DUP, (const uint8_t *)"a", NULL, 0, 0);
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], &session);
+	client.is_auth = true;
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+	ck_assert_int_eq(client.state, CS_CLOSING);
+	ck_assert_int_eq(client.disconnect_reason, MQTT_PROTOCOL_ERROR);
+
+	close(fds[1]);
+	if (client.fd != -1)
+		close(fds[0]);
+	mqtt_test_cleanup_client(&client);
+	pthread_rwlock_destroy(&session.subscriptions_lock);
+	pthread_rwlock_destroy(&session.delivery_states_lock);
+}
+END_TEST
+
+START_TEST(test_mqtt_publish_qos1_packet_id_zero)
+{
+	uint8_t packet[128];
+	size_t packet_len;
+	int fds[2];
+	struct client client;
+	struct session session;
+
+	memset(&session, 0, sizeof(session));
+	session.id = 33;
+	ck_assert_int_eq(pthread_rwlock_init(&session.subscriptions_lock, NULL), 0);
+	ck_assert_int_eq(pthread_rwlock_init(&session.delivery_states_lock, NULL), 0);
+
+	packet_len = build_publish_packet(packet, sizeof(packet),
+			MQTT_FLAG_PUBLISH_QOS1, (const uint8_t *)"a", NULL, 0, 0);
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], &session);
+	client.is_auth = true;
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+	ck_assert_int_eq(client.state, CS_CLOSING);
+	ck_assert_int_eq(client.disconnect_reason, MQTT_PROTOCOL_ERROR);
+
+	close(fds[1]);
+	if (client.fd != -1)
+		close(fds[0]);
+	mqtt_test_cleanup_client(&client);
+	pthread_rwlock_destroy(&session.subscriptions_lock);
+	pthread_rwlock_destroy(&session.delivery_states_lock);
+}
+END_TEST
+
 START_TEST(test_mqtt_2_2_1_5_puback)
 {
 	/* PUBACK must contain the same Packet Identifier. */
@@ -740,22 +1009,24 @@ START_TEST(test_mqtt_2_2_1_5_puback)
 	int fds[2];
 	struct client client;
 	struct session session;
+	ssize_t rd;
 
 	memset(&session, 0, sizeof(session));
 	session.id = 20;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 	client.is_auth = true;
 
 	ck_assert_int_eq(mqtt_test_api.send_cp_puback(&client, packet_id, MQTT_SUCCESS), 0);
-	ck_assert_int_gt((int)read_packet(fds[1], buf, sizeof(buf)), 0);
-	ck_assert_int_eq(read_packet_id(buf, sizeof(buf), &parsed_id), 0);
+	rd = mqtt_test_read_packet(fds[1], buf, sizeof(buf));
+	ck_assert_int_gt((int)rd, 0);
+	ck_assert_int_eq(mqtt_test_read_packet_id(buf, (size_t)rd, &parsed_id), 0);
 	ck_assert_uint_eq(parsed_id, packet_id);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -770,6 +1041,7 @@ START_TEST(test_mqtt_2_2_1_6_suback)
 	struct session session;
 	struct topic_sub_request request;
 	uint8_t reason_codes[1] = { MQTT_GRANTED_QOS_0 };
+	ssize_t rd;
 
 	memset(&session, 0, sizeof(session));
 	session.id = 21;
@@ -778,17 +1050,18 @@ START_TEST(test_mqtt_2_2_1_6_suback)
 	request.reason_codes = reason_codes;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 	client.is_auth = true;
 
 	ck_assert_int_eq(mqtt_test_api.send_cp_suback(&client, packet_id, &request), 0);
-	ck_assert_int_gt((int)read_packet(fds[1], buf, sizeof(buf)), 0);
-	ck_assert_int_eq(read_packet_id(buf, sizeof(buf), &parsed_id), 0);
+	rd = mqtt_test_read_packet(fds[1], buf, sizeof(buf));
+	ck_assert_int_gt((int)rd, 0);
+	ck_assert_int_eq(mqtt_test_read_packet_id(buf, (size_t)rd, &parsed_id), 0);
 	ck_assert_uint_eq(parsed_id, packet_id);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -803,6 +1076,7 @@ START_TEST(test_mqtt_2_2_1_6_unsuback)
 	struct session session;
 	struct topic_sub_request request;
 	uint8_t reason_codes[1] = { MQTT_SUCCESS };
+	ssize_t rd;
 
 	memset(&session, 0, sizeof(session));
 	session.id = 22;
@@ -811,17 +1085,18 @@ START_TEST(test_mqtt_2_2_1_6_unsuback)
 	request.reason_codes = reason_codes;
 
 	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-	init_client(&client, fds[0], &session);
+	mqtt_test_init_client(&client, fds[0], &session);
 	client.is_auth = true;
 
 	ck_assert_int_eq(mqtt_test_api.send_cp_unsuback(&client, packet_id, &request), 0);
-	ck_assert_int_gt((int)read_packet(fds[1], buf, sizeof(buf)), 0);
-	ck_assert_int_eq(read_packet_id(buf, sizeof(buf), &parsed_id), 0);
+	rd = mqtt_test_read_packet(fds[1], buf, sizeof(buf));
+	ck_assert_int_gt((int)rd, 0);
+	ck_assert_int_eq(mqtt_test_read_packet_id(buf, (size_t)rd, &parsed_id), 0);
 	ck_assert_uint_eq(parsed_id, packet_id);
 
 	close(fds[1]);
 	close(fds[0]);
-	cleanup_client(&client);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -840,6 +1115,126 @@ START_TEST(test_mqtt_4_7_3_1_topic_filter)
 	const uint8_t filter[] = "a/#/b";
 
 	ck_assert_int_eq(mqtt_test_api.is_valid_topic_filter(filter), -1);
+}
+END_TEST
+
+START_TEST(test_mqtt_subscribe_reserved_bits_rejected)
+{
+	uint8_t packet[128];
+	size_t packet_len;
+	int fds[2];
+	struct client client;
+	struct session session;
+
+	memset(&session, 0, sizeof(session));
+	session.id = 40;
+
+	packet_len = build_subscribe_packet(packet, sizeof(packet), 1,
+			(const uint8_t *)"a/b", MQTT_SUBOPT_RESERVED_MASK);
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], &session);
+	client.is_auth = true;
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+	ck_assert_int_eq(client.state, CS_CLOSING);
+	ck_assert_int_eq(client.disconnect_reason, MQTT_MALFORMED_PACKET);
+
+	close(fds[1]);
+	close(fds[0]);
+	mqtt_test_cleanup_client(&client);
+}
+END_TEST
+
+START_TEST(test_mqtt_subscribe_qos3_rejected)
+{
+	uint8_t packet[128];
+	size_t packet_len;
+	int fds[2];
+	struct client client;
+	struct session session;
+
+	memset(&session, 0, sizeof(session));
+	session.id = 41;
+
+	packet_len = build_subscribe_packet(packet, sizeof(packet), 1,
+			(const uint8_t *)"a/b", MQTT_SUBOPT_QOS_MASK);
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], &session);
+	client.is_auth = true;
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+	ck_assert_int_eq(client.state, CS_CLOSING);
+	ck_assert_int_eq(client.disconnect_reason, MQTT_MALFORMED_PACKET);
+
+	close(fds[1]);
+	close(fds[0]);
+	mqtt_test_cleanup_client(&client);
+}
+END_TEST
+
+START_TEST(test_mqtt_subscribe_retain_handling3_rejected)
+{
+	uint8_t packet[128];
+	size_t packet_len;
+	int fds[2];
+	struct client client;
+	struct session session;
+
+	memset(&session, 0, sizeof(session));
+	session.id = 42;
+
+	packet_len = build_subscribe_packet(packet, sizeof(packet), 1,
+			(const uint8_t *)"a/b", MQTT_SUBOPT_RETAIN_HANDLING_MASK);
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], &session);
+	client.is_auth = true;
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+	ck_assert_int_eq(client.state, CS_CLOSING);
+	ck_assert_int_eq(client.disconnect_reason, MQTT_MALFORMED_PACKET);
+
+	close(fds[1]);
+	close(fds[0]);
+	mqtt_test_cleanup_client(&client);
+}
+END_TEST
+
+START_TEST(test_mqtt_subscribe_shared_no_local_rejected)
+{
+	uint8_t packet[128];
+	size_t packet_len;
+	int fds[2];
+	struct client client;
+	struct session session;
+
+	memset(&session, 0, sizeof(session));
+	session.id = 43;
+
+	packet_len = build_subscribe_packet(packet, sizeof(packet), 1,
+			(const uint8_t *)"$shared/g/a", MQTT_SUBOPT_NO_LOCAL);
+	ck_assert_int_gt((int)packet_len, 0);
+
+	ck_assert_int_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	mqtt_test_init_client(&client, fds[0], &session);
+	client.is_auth = true;
+
+	ck_assert_int_ne(write(fds[1], packet, packet_len), -1);
+	ck_assert_int_eq(mqtt_test_drive_parse(&client), -1);
+	ck_assert_int_eq(client.state, CS_CLOSING);
+	ck_assert_int_eq(client.disconnect_reason, MQTT_MALFORMED_PACKET);
+
+	close(fds[1]);
+	close(fds[0]);
+	mqtt_test_cleanup_client(&client);
 }
 END_TEST
 
@@ -865,12 +1260,22 @@ static Suite *mqtt_conformance_suite(void)
 	tcase_add_test(tc_req, test_mqtt_3_1_2_5_existing_session);
 	tcase_add_test(tc_req, test_mqtt_3_1_2_4_clean_start_discards_session);
 	tcase_add_test(tc_req, test_mqtt_3_1_2_6_no_existing_session);
+	tcase_add_test(tc_req, test_mqtt_connect_auth_method_rejected);
+	tcase_add_test(tc_req, test_mqtt_connect_auth_data_rejected);
+	tcase_add_test(tc_req, test_mqtt_connect_topic_alias_max_zero);
 	tcase_add_test(tc_req, test_mqtt_2_2_1_5_puback);
 	tcase_add_test(tc_req, test_mqtt_2_2_1_6_suback);
 	tcase_add_test(tc_req, test_mqtt_2_2_1_6_unsuback);
-	tcase_add_test(tc_req, test_mqtt_2_2_1_2_qos0_packet_id_rejected);
+	tcase_add_test(tc_req, test_mqtt_2_2_1_2_qos0_packet_id_treated_as_payload);
+	tcase_add_test(tc_req, test_mqtt_publish_qos_invalid);
+	tcase_add_test(tc_req, test_mqtt_publish_qos0_dup_rejected);
+	tcase_add_test(tc_req, test_mqtt_publish_qos1_packet_id_zero);
 	tcase_add_test(tc_req, test_mqtt_4_7_3_1_topic_name);
 	tcase_add_test(tc_req, test_mqtt_4_7_3_1_topic_filter);
+	tcase_add_test(tc_req, test_mqtt_subscribe_reserved_bits_rejected);
+	tcase_add_test(tc_req, test_mqtt_subscribe_qos3_rejected);
+	tcase_add_test(tc_req, test_mqtt_subscribe_retain_handling3_rejected);
+	tcase_add_test(tc_req, test_mqtt_subscribe_shared_no_local_rejected);
 	suite_add_tcase(s, tc_req);
 	return s;
 }
