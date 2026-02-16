@@ -40,7 +40,7 @@ extern pthread_rwlock_t global_topics_lock;
 extern bool opt_database;
 extern struct raft_state raft_state;
 
-#define RAFT_LOG_MAX_PAYLOAD_SIZE   0x100000
+enum { RAFT_LOG_MAX_PAYLOAD_SIZE = 0x100000 };
 
 static const struct raft_impl_limits raft_log_settings[RAFT_MAX_LOG] ={
     [RAFT_LOG_NOOP]               = { 0, 0 },

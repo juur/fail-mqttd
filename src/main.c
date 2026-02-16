@@ -6896,7 +6896,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         msg->sender_status.acknowledged_at = now;
         msg->sender_status.released_at = now;
         msg->sender_status.completed_at = now;
-    } if (qos == 1) {
+    } else if (qos == 1) {
         if (send_cp_puback(client, packet_identifier,
                     msg->delivery_states ? MQTT_SUCCESS : MQTT_NO_MATCHING_SUBSCRIBERS) == -1) {
             reason_code = MQTT_UNSPECIFIED_ERROR;

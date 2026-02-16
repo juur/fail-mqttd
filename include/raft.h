@@ -138,7 +138,7 @@ struct raft_packet {
     uint32_t length;
 };
 
-#define RAFT_HDR_SIZE   (1+1+1+1+4)
+enum { RAFT_HDR_SIZE = (1 + 1 + 1 + 1 + 4) };
 
 /**
  * RAFT_HELLO
@@ -150,7 +150,7 @@ struct raft_packet {
  * u16 mqtt-port in_port_t
  */
 
-#define RAFT_HELLO_SIZE (4 + 1 + 4 + 2)
+enum { RAFT_HELLO_SIZE = (4 + 1 + 4 + 2) };
 
 struct raft_host_entry {
     /* candidateVar = */
@@ -324,7 +324,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * 0..n  log_entries[1]
  */
 
-#define RAFT_CLIENT_REQUEST_SIZE (4 + 4 + 1 + 1 + 2)
+enum { RAFT_CLIENT_REQUEST_SIZE = (4 + 4 + 1 + 1 + 2) };
 
 /**
  * RAFT_APPEND_ENTRIES
@@ -338,7 +338,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   num_entries
  * 0..n  log_entries[num_entries] (see: RAFT_LOG_*)
  */
-#define RAFT_APPEND_ENTRIES_FIXED_SIZE  (6 * 4)
+enum { RAFT_APPEND_ENTRIES_FIXED_SIZE = (6 * 4) };
 
 
 /**
@@ -349,7 +349,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   current_term
  * u32   new_match_index
  */
-#define RAFT_APPEND_ENTRIES_REPLY_SIZE (1+4+4)
+enum { RAFT_APPEND_ENTRIES_REPLY_SIZE = (1 + 4 + 4) };
 
 /**
  * RAFT_REQUEST_VOTE_REPLY
@@ -359,7 +359,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   term
  * u32   voted_for
  */
-#define RAFT_REQUEST_VOTE_REPLY_SIZE (1+4+4)
+enum { RAFT_REQUEST_VOTE_REPLY_SIZE = (1 + 4 + 4) };
 
 /**
  * RAFT_CLIENT_REQUEST_REPLY
@@ -373,7 +373,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * //u8[]  result[result_length]
  */
 
-#define RAFT_CLIENT_REQUEST_REPLY_SIZE (1+1+4+4/*+2*/)
+enum { RAFT_CLIENT_REQUEST_REPLY_SIZE = (1 + 1 + 4 + 4 /*+2*/) };
 
 /** RAFT_REQUEST_VOTE
  *
@@ -383,7 +383,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   last_log_index
  * u32   last_log_term
  */
-#define RAFT_REQUEST_VOTE_SIZE (4+4+4+4)
+enum { RAFT_REQUEST_VOTE_SIZE = (4 + 4 + 4 + 4) };
 
 /** RAFT_REGISTER_CLIENT_REPLY
  *
@@ -392,14 +392,14 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   client_id
  * u32   leader_hint
  */
-#define RAFT_REGISTER_CLIENT_REPLY_SIZE (1+4+4)
+enum { RAFT_REGISTER_CLIENT_REPLY_SIZE = (1 + 4 + 4) };
 
 /** RAFT_REGISTER_CLIENT_SIZE
  *
  * Header
  * TBC
  */
-#define RAFT_REGISTER_CLIENT_SIZE (0)
+enum { RAFT_REGISTER_CLIENT_SIZE = 0 };
 
 /** RAFT_INSTALL_SNAPSHOT
  *
@@ -415,7 +415,7 @@ extern const char *const raft_log_str[RAFT_MAX_LOG];
  * u32   data_length
  * u8[]  data
  */
-#define RAFT_INSTALL_SNAPSHOT_FIXED_SIZE (4+4+4+4+4+8)
+enum { RAFT_INSTALL_SNAPSHOT_FIXED_SIZE = (4 + 4 + 4 + 4 + 4 + 8) };
 
 /**
  * RAFT_LOG_*
