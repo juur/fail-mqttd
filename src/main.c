@@ -47,6 +47,8 @@
 static int64_t timems(void);
 
 #define RAFT_API_SOURCE_SELF
+#define RAFT_API_TRUE
+#define RAFT_API_FALSE
 
 #include "mqtt.h"
 #ifdef FEATURE_RAFT
@@ -247,14 +249,11 @@ static const struct {
 [[gnu::nonnull]] static bool is_null_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull, gnu::warn_unused_result]] static struct session *find_session_by_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull, gnu::warn_unused_result]] struct topic *find_topic_by_uuid(const uint8_t uuid[static UUID_SIZE]);
+[[gnu::nonnull]] static struct topic *find_topic(const uint8_t *name, bool active_only, bool need_lock);
 [[gnu::nonnull, gnu::warn_unused_result]] struct message *find_message_by_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull]] static void handle_outbound(struct client *client);
 [[gnu::nonnull]] static void set_outbound(struct client *client, const uint8_t *buf, unsigned len);
-[[gnu::nonnull]] static void close_session(struct session *session
-#ifdef FEATURE_RAFT
-        , bool source_self
-#endif
-        );
+[[gnu::nonnull]] static void close_session(struct session *session RAFT_API_SOURCE_SELF);
 [[gnu::nonnull]] static void close_client(struct client *client, reason_code_t reason, bool disconnect);
 [[gnu::nonnull, gnu::warn_unused_result]] static int unsubscribe(struct subscription *sub, struct session *session);
 [[gnu::nonnull, gnu::warn_unused_result]] static int dequeue_message(struct message *msg);
@@ -3154,7 +3153,11 @@ static void link_topics(void)
 
         memcpy(topic->retained_msg_uuid, NULL_UUID, UUID_SIZE);
         topic->retained_msg_link = false;
+#ifdef FEATURE_RAFT
+        topic->state = TOPIC_PREACTIVE;
+#else
         topic->state = TOPIC_ACTIVE;
+#endif
 
     }
     pthread_rwlock_unlock(&global_topics_lock);
@@ -3174,6 +3177,7 @@ static void link_topics(void)
     tmp_str = NULL;
     *ret = NULL;
 
+    errno = ENOENT;
     rc = read_uuid(tmp_uuid, &src, bytes_remaining);
     if (rc == -1 || is_null_uuid(tmp_uuid)) goto fail;
 
@@ -3188,7 +3192,14 @@ static void link_topics(void)
     rc = read_bytes(tmp_str, &src, bytes_remaining, tmp_u16);
     if (rc == -1) goto fail;
 
-    if ((out = alloc_topic(tmp_str, tmp_uuid)) == NULL)
+    if (find_topic(tmp_str, false, true) != NULL) {
+        logger(LOG_WARNING, NULL, "deserialise_topic: duplicate topic for %s",
+                tmp_str);
+        errno = EEXIST;
+        goto fail;
+    }
+
+    if ((out = register_topic(tmp_str, tmp_uuid)) == NULL)
         goto fail;
 
     rc = read_uuid(tmp_uuid, &src, bytes_remaining);
@@ -3198,8 +3209,7 @@ static void link_topics(void)
         memcpy(out->retained_msg_uuid, tmp_uuid, UUID_SIZE);
         out->retained_msg_link = true;
         out->state = TOPIC_NEW;
-    } else
-        out->state = TOPIC_ACTIVE;
+    }
 
     free(tmp_str);
     *ret = out;
@@ -3317,6 +3327,7 @@ fail:
 [[gnu::nonnull]]
 int save_topic(const struct topic *topic)
 {
+    void *save = NULL;
     errno = EINVAL;
 
     pthread_rwlock_rdlock(&global_topics_lock);
@@ -3333,9 +3344,21 @@ int save_topic(const struct topic *topic)
             topic->retained_message ? uuid_to_string(topic->retained_message->uuid) : ""
             );
 
-    struct topic_save save;
-    memset(&save, 0, sizeof(save));
+    //struct topic_save save;
+    //memset(&save, 0, sizeof(save));
 
+    const int size = size_topic(topic);
+
+    if (size == -1)
+        goto fail;
+
+    if ((save = malloc(size)) == NULL)
+        goto fail;
+
+    if (serialise_topic(topic, save) == -1)
+        goto fail;
+
+    /*
     save.id = topic->id;
     memcpy(save.uuid, topic->uuid, UUID_SIZE);
     strncpy(save.name, (char *)topic->name, sizeof(save.name) - 1);
@@ -3343,7 +3366,7 @@ int save_topic(const struct topic *topic)
         memcpy(save.retained_message_uuid, topic->retained_message->uuid, UUID_SIZE);
         dbg_printf("     save_topic: set retained_message_uuid to %s\n",
                 uuid_to_string(save.retained_message_uuid));
-    }
+    }*/
 
     datum key = {
         .dptr = (char *)topic->uuid,
@@ -3351,8 +3374,8 @@ int save_topic(const struct topic *topic)
     };
 
     datum content = {
-        .dptr = (char *)&save,
-        .dsize = sizeof(save),
+        .dptr = (void *)save,
+        .dsize = size,
     };
 
     if (topic->retained_message)
@@ -3367,19 +3390,20 @@ int save_topic(const struct topic *topic)
         dbm_clearerr(topic_dbm);
     }
 
+    free(save);
+
     pthread_rwlock_unlock(&global_topics_lock);
     return 0;
 
 fail:
+    if (save)
+        free(save);
+
     pthread_rwlock_unlock(&global_topics_lock);
     return -1;
 }
 
-static int register_session(struct session *session
-#ifdef FEATURE_RAFT
-        , bool source_self
-#endif
-        )
+static int register_session(struct session *session RAFT_API_SOURCE_SELF)
 {
     pthread_rwlock_wrlock(&global_sessions_lock);
     if (session->state != SESSION_NEW) {
@@ -4515,11 +4539,7 @@ static struct topic *find_or_register_topic(const uint8_t *name)
         if ((tmp_name = (void *)strdup((const char *)name)) == NULL)
             goto fail;
 
-#ifdef FEATURE_RAFT
-        if ((topic = register_topic(tmp_name, NULL, true)) == NULL) {
-#else
-        if ((topic = register_topic(tmp_name, NULL)) == NULL) {
-#endif
+        if ((topic = register_topic(tmp_name, NULL RAFT_API_TRUE)) == NULL) {
             warn("find_or_register_topic: register_topic <%s>", tmp_name);
             goto fail;
         }
@@ -5935,7 +5955,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
 #endif
 
     dbg_printf("[%2d] send_cp_connack: <" NRED "CONNACK" CRESET "> done\n",
-            client->session->id);
+            client->session ? client->session->id : -1U);
     return 0;
 
 fail:
@@ -7604,11 +7624,7 @@ create_new_session:
             /* ... we don't want to re-use it */
             dbg_printf(BWHT"[  ] handle_cp_connect: clean existing session [%d]"CRESET"\n",
                     client->session->id);
-#ifdef FEATURE_RAFT
-            close_session(client->session, true);
-#else
-            close_session(client->session);
-#endif
+            close_session(client->session RAFT_API_TRUE);
             client->session = NULL;
             goto create_new_session;
         }
@@ -7716,11 +7732,7 @@ create_new_session:
     }
     pthread_rwlock_unlock(&global_sessions_lock);
 
-#ifdef FEATURE_RAFT
-    register_session(client->session, true);
-#else
-    register_session(client->session);
-#endif
+    register_session(client->session RAFT_API_TRUE);
 
     logger(LOG_DEBUG, client, "handle_cp_connect: session established%s%s%s",
             reconnect ? " (reconnect)" : "",
@@ -7752,11 +7764,7 @@ fail:
     if (will_payload)
         free(will_payload);
     if (client->session && client->session->state == SESSION_NEW)
-#ifdef FEATURE_RAFT
-        close_session(client->session, false);
-#else
-        close_session(client->session);
-#endif
+        close_session(client->session RAFT_API_FALSE);
 
     if (errno == 0)
         errno = EINVAL;
@@ -8267,11 +8275,7 @@ static void client_tick(void)
                     if (clnt->session->expiry_interval == 0) {
                         dbg_printf("[%2d] client_tick: expiring session instantly\n",
                                 clnt->session->id);
-#ifdef FEATURE_RAFT
-                        close_session(clnt->session, true);
-#else
-                        close_session(clnt->session);
-#endif
+                        close_session(clnt->session RAFT_API_TRUE);
                     } else if (clnt->session->expiry_interval == UINT_MAX) {
                         clnt->session->expires_at = LONG_MAX; /* "does not expire" */
                     } else {
@@ -8337,7 +8341,7 @@ static void tick_msg(struct message *msg)
 
     /* This handles the case the message has no target */
     if (msg->delivery_states == NULL && (msg->qos != 2 || msg->sender_status.completed_at)) {
-        dbg_printf("     tick_msg: dequeue_message due to no delivery states %d\n", msg->id);
+        dbg_printf(NGRN "     tick_msg: dequeue_message due to no delivery states %d"CRESET"\n", msg->id);
         if (msg->topic) {
             if (dequeue_message(msg) == -1)
                 warn("tick_msg: dequeue_message failed");
@@ -8408,7 +8412,6 @@ static void tick_msg(struct message *msg)
 
         packet->type = MQTT_CP_PUBLISH;
         packet->flags |= MQTT_FLAG_PUBLISH_QOS(actual_qos);
-
 
         if (actual_qos) {
             /* Allocate a packet_identifier if this is the first time */
@@ -8503,8 +8506,10 @@ again:
             mds = NULL;
         }
 
-        /* We can't just dequeue() and MSG_DEAD if any mds are not completed_at */
-        if (msg->topic && msg->num_message_delivery_states == 0) {
+        /* We can't just dequeue() and MSG_DEAD if any mds are not completed_at.
+         * Also have to consider QoS==2 for the sender */
+        if (msg->topic && msg->num_message_delivery_states == 0 &&
+                (msg->qos != 2 || msg->sender_status.completed_at)) {
             dbg_printf(NGRN"     tick_msg: dequeue"CRESET"\n");
             if (dequeue_message(msg) == -1) {
                 warn("tick_msg: dequeue_message failed");
@@ -8587,11 +8592,7 @@ static void message_tick(void)
 
 /* Sessions */
 
-static void close_session(struct session *session
-#ifdef FEATURE_RAFT
-        , bool source_self
-#endif
-        )
+static void close_session(struct session *session RAFT_API_SOURCE_SELF)
 {
     dbg_printf(BMAG "     close_session: id=%d state=%s client=%d client_id=<%s>" CRESET "\n",
             session->id, session_state_str[session->state],
@@ -8631,10 +8632,6 @@ static void close_session(struct session *session
     session->state = SESSION_DELETE;
 #endif
 }
-
-#ifdef FEATURE_RAFT
-
-#endif
 
 /*
  * Tick functions
@@ -8681,11 +8678,7 @@ static void session_tick(void)
                     goto force_will;
                 }
 
-#ifdef FEATURE_RAFT
-                close_session(session, true);
-#else
-                close_session(session);
-#endif
+                close_session(session RAFT_API_TRUE);
                 session = NULL;
                 continue;
             }
@@ -8829,9 +8822,6 @@ static RETURN_TYPE openmetrics_loop(void *start_args)
 
     return 0;
 }
-#endif
-
-#ifdef FEATURE_RAFT
 #endif
 
 static RETURN_TYPE main_loop(void *start_args)
@@ -9059,7 +9049,7 @@ shit_fd:
 #endif
     }
 
-#ifdef FEATURE_DEBUG
+#if defined(FEATURE_DEBUG) && !defined(TESTS)
     dump_all();
 #endif
     logger(LOG_INFO, NULL, "main_loop: terminated normally");
@@ -9124,23 +9114,25 @@ static bool is_null_uuid(const uint8_t uuid[static 16])
 
 static int load_topic(datum /* key */, datum content)
 {
-    const struct topic_save *save = (void *)content.dptr;
-    struct topic *topic = NULL;
+    //const struct topic_save *save = (void *)content.dptr;
+    const void *save = (void *)content.dptr;
+    const struct topic *topic = NULL;
+    size_t bytes_remaining = content.dsize;
 
-    if (find_topic((void *)save->name, false, true) != NULL) {
-        logger(LOG_WARNING, NULL, "open_databases: duplicate topic for %s",
-                save->name);
-        errno = EEXIST;
-        return -1;
-    }
+    if (deserialise_topic(&topic, save, &bytes_remaining) == -1)
+        goto fail;
 
+    /* FIXME - see deserialise_topic() */
+/*
 #ifdef FEATURE_RAFT
     if ((topic = register_topic((void *)save->name, save->uuid, false)) == NULL)
 #else
         if ((topic = register_topic((void *)save->name, save->uuid)) == NULL)
 #endif
             return -1;
+*/
 
+/* TODO check this is no longer needed
     if (!is_null_uuid(save->retained_message_uuid)) {
         dbg_printf("     open_databases: retained_message_uuid=%s\n",
                 uuid_to_string(save->retained_message_uuid));
@@ -9156,14 +9148,21 @@ static int load_topic(datum /* key */, datum content)
             dbg_printf("     load_topic: set retained message\n");
         }
     }
+    */
 
-    topic->state = TOPIC_ACTIVE;
+    // this depends on FEATURE_RAFT
+    //((struct topic *)topic)->state = TOPIC_ACTIVE;
 
     logger(LOG_INFO, NULL,
             "open_databases: registered previously saved topic <%s>",
             topic->name);
 
     return 0;
+
+fail:
+    if (topic)
+        free_topic((void *)topic);
+    return -1;
 }
 
 static int open_databases(void)
@@ -9421,11 +9420,7 @@ int main(int argc, char *argv[])
             logger(LOG_WARNING, NULL,
                     "main: command line topic creation: topic <%s> already exists, skipping",
                     argv[optind]);
-#ifdef FEATURE_RAFT
-        } else if (register_topic((const uint8_t *)argv[optind], NULL, false) == NULL) {
-#else
-        } else if (register_topic((const uint8_t *)argv[optind], NULL) == NULL) {
-#endif
+        } else if (register_topic((const uint8_t *)argv[optind], NULL RAFT_API_FALSE) == NULL) {
             logger(LOG_WARNING, NULL,
                     "main: command line topic creation: register_topic<%s> failed, skipping: %s",
                     argv[optind], strerror(errno));
@@ -9454,9 +9449,6 @@ int main(int argc, char *argv[])
         sock_reuse(global_om_fd, 1);
         sock_nonblock(global_om_fd);
     }
-#endif
-
-#ifdef FEATURE_RAFT
 #endif
 
     struct sockaddr_in sin = {0};
@@ -9591,11 +9583,7 @@ shit_usage:
 #ifdef TESTS
 static int mqtt_register_session_test(struct session *session)
 {
-#ifdef FEATURE_RAFT
-    return register_session(session, true);
-#else
-    return register_session(session);
-#endif
+    return register_session(session RAFT_API_TRUE);
 }
 
 const struct mqtt_test_api mqtt_test_api = {

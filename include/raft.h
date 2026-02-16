@@ -31,7 +31,11 @@ typedef long timems_t;
 #endif
 
 #undef RAFT_API_SOURCE_SELF
+#undef RAFT_API_TRUE
+#undef RAFT_API_FALSE
 #define RAFT_API_SOURCE_SELF , bool source_self
+#define RAFT_API_TRUE , true
+#define RAFT_API_FALSE , false
 
 typedef enum {
     RAFT_HELLO = 0,

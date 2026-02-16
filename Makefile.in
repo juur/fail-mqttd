@@ -65,7 +65,7 @@ test_SRCS              := $(filter-out $(srcdir)/tests/test_raft%.c,$(test_SRCS)
 endif
 raft_TEST_CORE_SRCS    := $(filter-out $(prod_only_SRCS),$(raft_SRCS))
 raft_TEST_SUPPORT_SRCS := $(wildcard $(srcdir)/tests/raft_*.c)
-mqtt_TEST_CORE_SRCS    := main.c constants.c
+mqtt_TEST_CORE_SRCS    := main.c constants.c dump.c
 
 all_HEADERS       := $(wildcard $(srcdir)/include/*.h)
 
