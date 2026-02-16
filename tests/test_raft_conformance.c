@@ -735,6 +735,7 @@ struct model_node {
 	uint32_t id;
 	raft_state_t state;
 	uint32_t term;
+	uint32_t voted_for;
 	uint32_t commit_index;
 	uint32_t log_len;
 	struct model_entry log[8];
@@ -742,6 +743,15 @@ struct model_node {
 
 struct model_cluster {
 	struct model_node nodes[3];
+};
+
+struct model_message {
+	bool in_flight;
+	uint32_t source_id;
+	uint32_t dest_id;
+	uint32_t prev_index;
+	uint32_t prev_term;
+	uint32_t entry_index;
 };
 
 struct impl_client_state {
@@ -811,6 +821,27 @@ static bool model_log_matching(const struct model_node *nodes, size_t count)
 	return true;
 }
 
+static bool model_node_equal(const struct model_node *lhs, const struct model_node *rhs)
+{
+	if (lhs->id != rhs->id)
+		return false;
+	if (lhs->state != rhs->state)
+		return false;
+	if (lhs->term != rhs->term)
+		return false;
+	if (lhs->voted_for != rhs->voted_for)
+		return false;
+	if (lhs->commit_index != rhs->commit_index)
+		return false;
+	if (lhs->log_len != rhs->log_len)
+		return false;
+	for (uint32_t idx = 0; idx < lhs->log_len; idx++) {
+		if (lhs->log[idx].term != rhs->log[idx].term)
+			return false;
+	}
+	return true;
+}
+
 static bool model_leader_completeness(const struct model_node *committed_leader,
 		const struct model_node *future_leader, uint32_t commit_index)
 {
@@ -834,6 +865,7 @@ static void model_init_cluster(struct model_cluster *cluster)
 		cluster->nodes[idx].id = (uint32_t)(idx + 1);
 		cluster->nodes[idx].state = RAFT_STATE_FOLLOWER;
 		cluster->nodes[idx].term = 1;
+		cluster->nodes[idx].voted_for = NULL_ID;
 		cluster->nodes[idx].commit_index = 0;
 		cluster->nodes[idx].log_len = 0;
 		memset(cluster->nodes[idx].log, 0, sizeof(cluster->nodes[idx].log));
@@ -845,6 +877,7 @@ static void model_timeout(struct model_node *node)
 	if (node->state == RAFT_STATE_FOLLOWER || node->state == RAFT_STATE_CANDIDATE) {
 		node->state = RAFT_STATE_CANDIDATE;
 		node->term += 1;
+		node->voted_for = node->id;
 	}
 }
 
@@ -859,7 +892,13 @@ static void model_grant_votes(struct model_cluster *cluster, struct model_node *
 			continue;
 		if (voter->term > candidate->term)
 			continue;
-		voter->term = candidate->term;
+		if (voter->term < candidate->term) {
+			voter->term = candidate->term;
+			voter->voted_for = NULL_ID;
+		}
+		if (voter->voted_for != NULL_ID && voter->voted_for != candidate->id)
+			continue;
+		voter->voted_for = candidate->id;
 		votes++;
 	}
 
@@ -879,7 +918,13 @@ static void model_grant_votes_partial(struct model_cluster *cluster,
 			continue;
 		if (voter->term > candidate->term)
 			continue;
-		voter->term = candidate->term;
+		if (voter->term < candidate->term) {
+			voter->term = candidate->term;
+			voter->voted_for = NULL_ID;
+		}
+		if (voter->voted_for != NULL_ID && voter->voted_for != candidate->id)
+			continue;
+		voter->voted_for = candidate->id;
 		grants--;
 		votes++;
 	}
@@ -999,10 +1044,47 @@ static bool model_quorum_intersection(void)
 	return true;
 }
 
+static struct model_message model_make_append_message(const struct model_node *leader,
+		const struct model_node *follower, uint32_t prev_index,
+		uint32_t prev_term, uint32_t entry_index)
+{
+	struct model_message msg = {
+		.in_flight = true,
+		.source_id = leader->id,
+		.dest_id = follower->id,
+		.prev_index = prev_index,
+		.prev_term = prev_term,
+		.entry_index = entry_index,
+	};
+
+	return msg;
+}
+
+static void model_drop_message(struct model_message *msg)
+{
+	ck_assert(msg->in_flight);
+	msg->in_flight = false;
+}
+
 static void model_merge_to_leader(struct model_cluster *cluster, const struct model_node *leader)
 {
 	model_replicate_to_all(cluster, leader);
 	model_commit_all(cluster, leader->commit_index);
+}
+
+static uint32_t impl_term_at(const struct impl_node *node, uint32_t index)
+{
+	const struct raft_log *tmp;
+
+	if (index == 0)
+		return 0;
+
+	for (tmp = node->state.log_head; tmp; tmp = tmp->next) {
+		if (tmp->index == index)
+			return tmp->term;
+	}
+
+	return (uint32_t)-1;
 }
 
 static struct raft_host_entry *impl_find_peer(struct impl_node *node, uint32_t server_id)
@@ -1159,11 +1241,14 @@ static int impl_append_entries(struct impl_node *leader, struct impl_node *follo
 {
 	raft_status_t reply;
 	struct raft_host_entry *peer_entry;
+	uint32_t prev_index = entry_index == 0 ? 0 : entry_index - 1;
+	uint32_t prev_term = impl_term_at(leader, prev_index);
+
+	ck_assert_uint_ne(prev_term, (uint32_t)-1);
 
 	impl_load_node(follower);
 	if (send_append_entries_single(leader->state.current_term, leader->id,
-				entry_index == 0 ? 0 : entry_index - 1,
-				entry_index == 0 ? 0 : entry_term,
+				prev_index, prev_term,
 				leader_commit, entry_index, entry_term, &reply) == -1)
 		return -1;
 	impl_save_node(follower);
@@ -1453,8 +1538,8 @@ START_TEST(test_conformance_append_entries_rejects_prev_log_mismatch)
 	ck_assert_ptr_nonnull(entry);
 	entry->index = 1;
 	entry->term = 1;
-	raft_test_api.raft_append_log(entry, &raft_state.log_head,
-			&raft_state.log_tail, &raft_state.log_length);
+	ck_assert_int_eq(raft_test_api.raft_append_log(entry, &raft_state.log_head,
+				&raft_state.log_tail, &raft_state.log_length), 0);
 
 	ck_assert_int_eq(send_append_entries_heartbeat(2, 2, 1, 2, 0, &reply), 0);
 
@@ -1967,14 +2052,15 @@ START_TEST(test_model_split_brain_single_leader)
 
 	cand_a->term = 2;
 	cand_b->term = 2;
+	cand_a->voted_for = cand_a->id;
+	cand_b->voted_for = cand_b->id;
 
-	cand_a->state = RAFT_STATE_LEADER;
-	cand_b->state = RAFT_STATE_CANDIDATE;
+	model_grant_votes_partial(&cluster, cand_a, 1);
+	ck_assert_int_eq(cand_a->state, RAFT_STATE_LEADER);
 
+	model_grant_votes_partial(&cluster, cand_b, 1);
+	ck_assert_int_ne(cand_b->state, RAFT_STATE_LEADER);
 	ck_assert(model_election_safety(&cluster));
-
-	cand_b->state = RAFT_STATE_LEADER;
-	ck_assert(!model_election_safety(&cluster));
 }
 END_TEST
 
@@ -2146,8 +2232,10 @@ END_TEST
 START_TEST(test_model_drop_append_entries_no_effect)
 {
 	struct model_cluster cluster;
+	struct model_cluster before;
 	struct model_node *leader;
 	struct model_node *follower;
+	struct model_message message;
 
 	model_init_cluster(&cluster);
 	leader = &cluster.nodes[0];
@@ -2156,7 +2244,14 @@ START_TEST(test_model_drop_append_entries_no_effect)
 	leader->state = RAFT_STATE_LEADER;
 	leader->term = 2;
 	model_append_entry(leader, 2);
+	before = cluster;
 
+	message = model_make_append_message(leader, follower, 0, 0, 1);
+	model_drop_message(&message);
+
+	ck_assert(!message.in_flight);
+	for (size_t idx = 0; idx < 3; idx++)
+		ck_assert(model_node_equal(&cluster.nodes[idx], &before.nodes[idx]));
 	ck_assert_uint_eq(follower->log_len, 0);
 	ck_assert_uint_eq(leader->log_len, 1);
 	ck_assert(model_log_matching(cluster.nodes, 2));
@@ -2524,7 +2619,7 @@ START_TEST(test_conformance_request_vote_reply_ignored_if_not_candidate)
 
 	ck_assert_int_eq(raft_state.state, RAFT_STATE_FOLLOWER);
 	ck_assert(!peers[1].vote_responded);
-	ck_assert_uint_eq(peers[1].vote_granted, 0);
+	ck_assert_uint_eq(peers[1].vote_granted, NULL_ID);
 }
 END_TEST
 

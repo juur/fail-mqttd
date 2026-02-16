@@ -23,10 +23,6 @@ START_TEST(test_rpc_strings_present)
 	int rpc;
 
 	for (rpc = 0; rpc < RAFT_MAX_RPC; rpc++) {
-		if (rpc == RAFT_INSTALL_SNAPSHOT ||
-				rpc == RAFT_INSTALL_SNAPSHOT_REPLY) {
-			continue;
-		}
 		ck_assert_ptr_nonnull(raft_rpc_str[rpc]);
 	}
 }
@@ -66,6 +62,7 @@ START_TEST(test_sample_string_values)
 {
 	ck_assert_str_eq(raft_status_str[RAFT_OK], "OK");
 	ck_assert_str_eq(raft_rpc_str[RAFT_HELLO], "HELLO");
+	ck_assert_str_eq(raft_rpc_str[RAFT_INSTALL_SNAPSHOT], "INSTALL_SNAPSHOT");
 	ck_assert_str_eq(raft_mode_str[RAFT_STATE_LEADER], "LEADER");
 	ck_assert_str_eq(raft_conn_str[RAFT_PEER], "PEER");
 	ck_assert_str_eq(raft_log_str[RAFT_LOG_REGISTER_TOPIC], "REGISTER_TOPIC");

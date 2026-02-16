@@ -65,7 +65,7 @@ test_SRCS              := $(filter-out $(srcdir)/tests/test_raft%.c,$(test_SRCS)
 endif
 raft_TEST_CORE_SRCS    := $(filter-out $(prod_only_SRCS),$(raft_SRCS))
 raft_TEST_SUPPORT_SRCS := $(wildcard $(srcdir)/tests/raft_*.c)
-mqtt_TEST_CORE_SRCS    := main.c constants.c dump.c
+mqtt_TEST_CORE_SRCS    := main.c constants.c dump.c raft_impl.c
 
 all_HEADERS       := $(wildcard $(srcdir)/include/*.h)
 
@@ -146,10 +146,13 @@ $(objdir)/doc/$(PACKAGE).8: $(package_BIN) | $(objdir)/doc
 $(package_BIN): $(package_OBJS)
 	$(CC) $^ $(LDFLAGS) -o $@
 
+$(objdir)/test_raft: $(objdir)/tests/test_raft.o $(raft_TEST_CORE_OBJS) $(raft_TEST_SUPPORT_OBJS)
+	$(CC) $^ $(LDFLAGS) $(CHECK_LIBS) -o $@
+
 $(objdir)/test_raft%: $(objdir)/tests/test_raft%.o $(raft_TEST_CORE_OBJS) $(raft_TEST_SUPPORT_OBJS)
 	$(CC) $^ $(LDFLAGS) $(CHECK_LIBS) -o $@
 
-$(objdir)/test_mqtt%: $(objdir)/tests/test_mqtt%.o $(mqtt_TEST_CORE_OBJS)
+$(objdir)/test_mqtt%: $(objdir)/tests/test_mqtt%.o $(mqtt_TEST_CORE_OBJS) $(raft_TEST_CORE_OBJS)
 	$(CC) $^ $(LDFLAGS) $(CHECK_LIBS) -o $@
 
 .PHONY: install uninstall

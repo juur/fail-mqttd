@@ -2295,7 +2295,7 @@ START_TEST(test_recv_invalid_rpc)
 	ck_assert_int_eq(write(fds[1], header, sizeof(header)), (ssize_t)sizeof(header));
 	errno = 0;
 	ck_assert_int_eq(raft_test_api.raft_recv(&client), -1);
-	ck_assert_int_eq(errno, EINVAL);
+	ck_assert_int_eq(errno, EBADMSG);
 	ck_assert_int_eq(client.peer_fd, -1);
 
 	close(fds[0]);

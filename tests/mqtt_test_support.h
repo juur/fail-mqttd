@@ -17,12 +17,28 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "config.h"
 #include "mqtt_test_api.h"
 #include "test_io.h"
+
+#ifdef FEATURE_RAFT
+#include "raft.h"
+extern const struct raft_impl *raft_impl;
+extern const struct raft_impl mqtt_raft_impl;
+
+static inline void mqtt_test_init_raft_impl(void)
+{
+	/* mirror raft_loop() initialization in tests without starting raft thread */
+	raft_impl = &mqtt_raft_impl;
+}
+#endif
 
 static inline void mqtt_test_init_client(struct client *client, int fd,
 		struct session *session)
 {
+#ifdef FEATURE_RAFT
+	mqtt_test_init_raft_impl();
+#endif
 	memset(client, 0, sizeof(*client));
 	client->fd = fd;
 	client->session = session;

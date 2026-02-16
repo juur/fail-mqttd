@@ -1262,6 +1262,8 @@ static int raft_client_log_sendv(raft_log_t event, va_list ap)
     inserted = true;
     pthread_rwlock_unlock(&raft_client_state.log_pending_lock);
 
+    assert(raft_impl != NULL);
+
     if (event >= raft_impl->num_log_types) {
         errno = EINVAL;
         goto fail;

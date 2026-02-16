@@ -76,11 +76,7 @@ START_TEST(test_raft_loop_eintr)
 	ck_assert_int_eq(sigaction(SIGUSR1, &action, &old_action), 0);
 
 	ck_assert_int_eq(pthread_create(&tid, NULL, raft_loop_thread, (void *)&runtime_impl), 0);
-
-	test_sleep_ms(30);
 	ck_assert_int_eq(pthread_kill(tid, SIGUSR1), 0);
-
-	test_sleep_ms(30);
 	atomic_store(&running, false);
 	ck_assert_int_eq(pthread_kill(tid, SIGUSR1), 0);
 	ck_assert_int_eq(pthread_join(tid, NULL), 0);

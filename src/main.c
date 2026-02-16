@@ -249,7 +249,7 @@ static const struct {
 [[gnu::nonnull]] static bool is_null_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull, gnu::warn_unused_result]] static struct session *find_session_by_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull, gnu::warn_unused_result]] struct topic *find_topic_by_uuid(const uint8_t uuid[static UUID_SIZE]);
-[[gnu::nonnull]] static struct topic *find_topic(const uint8_t *name, bool active_only, bool need_lock);
+[[gnu::nonnull]] struct topic *find_topic(const uint8_t *name, bool active_only, bool need_lock);
 [[gnu::nonnull, gnu::warn_unused_result]] struct message *find_message_by_uuid(const uint8_t uuid[static UUID_SIZE]);
 [[gnu::nonnull]] static void handle_outbound(struct client *client);
 [[gnu::nonnull]] static void set_outbound(struct client *client, const uint8_t *buf, unsigned len);
@@ -3154,7 +3154,7 @@ static void link_topics(void)
         memcpy(topic->retained_msg_uuid, NULL_UUID, UUID_SIZE);
         topic->retained_msg_link = false;
 #ifdef FEATURE_RAFT
-        topic->state = TOPIC_PREACTIVE;
+        topic->state = opt_raft ? TOPIC_PREACTIVE : TOPIC_ACTIVE;
 #else
         topic->state = TOPIC_ACTIVE;
 #endif
@@ -3199,7 +3199,7 @@ static void link_topics(void)
         goto fail;
     }
 
-    if ((out = register_topic(tmp_str, tmp_uuid)) == NULL)
+    if ((out = register_topic(tmp_str, tmp_uuid RAFT_API_FALSE)) == NULL)
         goto fail;
 
     rc = read_uuid(tmp_uuid, &src, bytes_remaining);
@@ -3414,7 +3414,7 @@ static int register_session(struct session *session RAFT_API_SOURCE_SELF)
     dbg_printf("[%2d] register_session: session %d registered\n",
             session->id, session->id);
 #ifdef FEATURE_RAFT
-    if (source_self) {
+    if (source_self && opt_raft) {
         /* TODO raft_client_log_send(RAFT_LOG_REGISTER_SESSION, ...); */
         session->state = SESSION_ACTIVE;
     } else {
@@ -4621,7 +4621,7 @@ struct topic *register_topic(const uint8_t *name, const uint8_t uuid[UUID_SIZE] 
     dbg_printf(BYEL "     register_topic: name=%s" CRESET "\n", (char *)name);
 
 #ifdef FEATURE_RAFT
-    if (source_self) {
+    if (source_self && opt_raft) {
         uint32_t flags = 0;
         if (raft_client_log_send(RAFT_LOG_REGISTER_TOPIC, ret->name, &ret->uuid, flags,
                     ret->retained_message ? &ret->retained_message->uuid : NULL) == -1)
@@ -5862,7 +5862,7 @@ static int send_cp_connack(struct client *client, reason_code_t reason_code)
             (*tmp_connack_props)[num_connack_props].ident = MQTT_PROP_SERVER_KEEP_ALIVE;
         }
 #ifdef FEATURE_RAFT
-    } else if (reason_code == MQTT_USE_ANOTHER_SERVER) {
+    } else if (reason_code == MQTT_USE_ANOTHER_SERVER && opt_raft) {
 
         char tmpbuf[INET_ADDRSTRLEN + 1 + 5 + 1];
 
@@ -8622,7 +8622,7 @@ static void close_session(struct session *session RAFT_API_SOURCE_SELF)
     unsubscribe_session_from_all(session);
 
 #ifdef FEATURE_RAFT
-    if (source_self && session->state == SESSION_ACTIVE && session->expiry_interval) {
+    if (opt_raft && source_self && session->state == SESSION_ACTIVE && session->expiry_interval) {
         /* TODO raft_client_log_send(RAFT_LOG_UNREGISTER_SESSION, ...); */
         session->state = SESSION_DELETE;
     } else {
