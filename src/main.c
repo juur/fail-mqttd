@@ -2759,6 +2759,8 @@ static inline int read_bytes(uint8_t *out, const char **in, size_t *bytes_remain
     ret += sizeof((uint8_t)msg->qos);
     ret += sizeof((uint8_t)msg->retain);
     ret += sizeof((uint8_t)msg->type);
+    ret += sizeof((uint32_t)msg->registered_at);
+    ret += sizeof((uint32_t)msg->message_expiry_interval);
 
     /* the abscence of a sender is implied by NULL_UUID */
     ret += sizeof(msg->sender->uuid);
@@ -2971,15 +2973,23 @@ fail:
     if (rc == -1) goto fail;
     rc = read_u8(&tmp_u8, &src, bytes_remaining); out->type = (message_type_t)tmp_u8;
     if (rc == -1) goto fail;
+    rc = read_u32(&tmp_u32, &src, bytes_remaining); out->registered_at = tmp_u32;
+    if (rc == -1) goto fail;
+    rc = read_u32(&tmp_u32, &src, bytes_remaining); out->message_expiry_interval = tmp_u32;
+    if (rc == -1) goto fail;
 
     if (
             (out->payload_len > MAX_PACKET_LENGTH) ||
             (out->qos > 2) ||
-            (out->type >= MSG_TYPE_MAX)
+            (out->type >= MSG_TYPE_MAX) || 
+            (out->registered_at > time(NULL)) ||
+            (out->message_expiry_interval > (365*24*60*60))
        ) {
         errno = EINVAL;
         goto fail;
     }
+
+    out->message_expires_at = out->registered_at + out->message_expiry_interval;
 
     rc = read_uuid(tmp_uuid, &src, bytes_remaining);
     if (rc == -1) goto fail;
@@ -3080,6 +3090,8 @@ fail:
     write_u8(&dst, msg->qos);
     write_u8(&dst, msg->retain);
     write_u8(&dst, msg->type);
+    write_u32(&dst, msg->registered_at);
+    write_u32(&dst, msg->message_expiry_interval);
 
     write_uuid(&dst, msg->sender ? msg->sender->uuid : NULL_UUID);
 
