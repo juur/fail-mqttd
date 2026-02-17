@@ -190,7 +190,7 @@ mostlyclean:
 	-$(RM) -f $(objdir)/tests/*.gcda $(objdir)/tests/*.gcno
 
 clean: mostlyclean
-	-$(RM) $(objdir)/$(doc)/$(PACKAGE).8
+	-$(RM) $(objdir)/doc/$(PACKAGE).8
 	-$(RM) -rf $(objdir)/.d/*
 	-$(RMDIR) $(objdir)/.d
 

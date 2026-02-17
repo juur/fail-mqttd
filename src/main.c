@@ -3795,26 +3795,31 @@ next:
     return 0;
 }
 
-static int is_valid_utf8(const uint8_t *str)
+[[gnu::nonnull, gnu::warn_unused_result]]
+static int is_valid_utf8(const uint8_t *str, size_t len)
 {
     const uint8_t *ptr = str;
+    size_t bytes_remaining = len ? len : strlen((const void *)str);
     errno = EILSEQ;
 
     unsigned bytes;
 
-    while (*ptr)
+    while (*ptr && bytes_remaining)
     {
         if (*ptr < 0x80) {
             ptr++;
+            bytes_remaining--;
             continue;
         }
 
-        if ((*ptr & 0xc0) == 0x80)
+        if ((*ptr & 0xc0) == 0x80) {
             bytes = 1;
-        else if ((*ptr & 0xe0) == 0xc0)
+        } else if ((*ptr & 0xe0) == 0xc0) {
             bytes = 2;
-        else if ((*ptr & 0xf0) == 0xe0) {
+        } else if ((*ptr & 0xf0) == 0xe0) {
             /* surrogates U+D800..U+DFFF */
+            if (bytes_remaining < 2)
+                return -1;
             if (ptr[1] == '\0' || ptr[2] == '\0')
                 return -1;
             if (*ptr == 0xed && (ptr[1] & 0xe0) == 0xa0)
@@ -3824,6 +3829,10 @@ static int is_valid_utf8(const uint8_t *str)
             return -1;
 
         ptr++;
+        bytes_remaining--;
+
+        if (bytes_remaining < bytes)
+            return -1;
 
         while(bytes--)
         {
@@ -3832,6 +3841,7 @@ static int is_valid_utf8(const uint8_t *str)
             if ((*ptr & 0xc0) != 0x80)
                 return -1;
             ptr++;
+            bytes_remaining--;
         }
     }
 
@@ -3882,7 +3892,7 @@ static uint8_t *read_utf8(const uint8_t **const ptr, size_t *bytes_left)
         }
     }
 
-    if (is_valid_utf8(string) == -1)
+    if (is_valid_utf8(string, 0) == -1)
         goto fail;
 
     return string;
@@ -4147,8 +4157,6 @@ static int parse_properties(
         prop->ident = ident;
 
         type = property_to_type[prop->ident];
-
-        /* TODO perform "is this valid for this control type?" */
 
         /* for will_properties, there is no cp_type */
         if (cp_type != MQTT_CP_INVALID)
@@ -4982,6 +4990,7 @@ static struct message *register_message(const uint8_t *topic_name,
     msg->sender_status.session = sender;
     msg->state                 = MSG_NEW;
     msg->type                  = type;
+    msg->registered_at         = time(NULL);
 
     if (retain) {
         /* TODO retained_message locking ? */
@@ -5605,10 +5614,11 @@ static int send_cp_publish(struct packet *pkt)
     ssize_t length;//, wr_len;
     uint8_t *packet, *ptr;
     uint8_t proplen[4], remlen[4];
-    int proplen_len, remlen_len, prop_len;
+    int proplen_len, remlen_len, prop_len = 0;
     uint16_t tmp, topic_len;
     const struct message *msg;
     reason_code_t reason_code = MQTT_SUCCESS;
+    const time_t now = time(NULL);
 
     errno = 0;
 
@@ -5628,14 +5638,42 @@ static int send_cp_publish(struct packet *pkt)
     msg = pkt->message;
 
     /* Populate Properties */
-    const struct property props[] = {
-        { 0 },
-    };
-    const unsigned num_props = 0; /* sizeof(props) / sizeof(struct property) */
+    struct property (*props)[] = NULL;
+    unsigned num_props = 0; /* sizeof(props) / sizeof(struct property) */
 
-    /* Calculate Property[] Length */
-    if ((prop_len = get_properties_size(&props, num_props)) == -1)
-        goto fail;
+    if (pkt->message->format)
+        num_props++;
+
+    if (pkt->message->message_expiry_interval)
+        num_props++;
+
+    if (num_props) {
+        unsigned cur_prop = 0;
+
+        if ((props = calloc(num_props, sizeof(struct property))) == NULL)
+            goto fail;
+
+        if (pkt->message->format) {
+            (*props)[cur_prop].byte = pkt->message->format;
+            (*props)[cur_prop].ident = MQTT_PROP_PAYLOAD_FORMAT_INDICATOR;
+            cur_prop++;
+        }
+
+        /*  [MQTT-3.3.2-6] */
+        if (pkt->message->message_expiry_interval) {
+            /* This can underflow FIXME */
+            (*props)[cur_prop].byte4 = pkt->message->message_expiry_interval -
+                (now - pkt->message->registered_at);
+            (*props)[cur_prop].ident = MQTT_PROP_MESSAGE_EXPIRY_INTERVAL;
+            cur_prop++;
+        }
+
+        assert(cur_prop == num_props);
+
+        /* Calculate Property[] Length */
+        if ((prop_len = get_properties_size(props, num_props)) == -1)
+            goto fail;
+    }
 
     /* Calculate the length of Property Length */
     if ((proplen_len = encode_var_byte(prop_len, proplen)) == -1)
@@ -5687,7 +5725,7 @@ static int send_cp_publish(struct packet *pkt)
     memcpy(ptr, proplen, proplen_len);
     ptr += proplen_len;
 
-    if (build_properties(&props, num_props, &ptr) == -1)
+    if (build_properties(props, num_props, &ptr) == -1)
         goto fail;
 
     memcpy(ptr, msg->payload, msg->payload_len);
@@ -5710,14 +5748,20 @@ static int send_cp_publish(struct packet *pkt)
     handle_outbound(pkt->owner);
     pthread_rwlock_unlock(&pkt->owner->po_lock);
     dbg_printf("     send_cp_publish: <" NRED "PUBLISH" CRESET "> done\n");
+    if (props)
+        free_properties(props, num_props);
     return 0;
 
 skip_write:
     dbg_printf("      send_cp_publish: <" NRED "PUBLISH" CRESET "> done\n");
     free(packet);
+    if (props)
+        free_properties(props, num_props);
     return 0;
 
 fail:
+    if (props)
+        free_properties(props, num_props);
     if (packet)
         free(packet);
 
@@ -6724,6 +6768,7 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
     uint8_t *topic_name = NULL;
     uint16_t packet_identifier = 0;
     uint32_t subscription_identifier = 0;
+    uint32_t message_expiry_interval = 0;
     reason_code_t reason_code = MQTT_MALFORMED_PACKET;
     unsigned qos = 0;
     const struct property *prop = NULL;
@@ -6786,12 +6831,21 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         }
     }
 
-    uint8_t payload_format = 0; /* TODO extract from properties */
+    uint8_t payload_format = 0;
 
     if (parse_properties(&ptr, &bytes_left, &packet->properties,
                 &packet->property_count, MQTT_CP_PUBLISH) == -1)
         goto fail;
-    dbg_cprintf("payload_format=%u [%lub] ", payload_format, bytes_left);
+
+    if (packet->properties && packet->property_count && get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_PAYLOAD_FORMAT_INDICATOR, &prop) == 0)
+        payload_format = prop->byte;
+    dbg_cprintf("payload_format=%u ", payload_format);
+
+    if (payload_format >= PAYLOAD_FORMAT_MAX) {
+        reason_code = MQTT_PROTOCOL_ERROR;
+        goto fail;
+    }
 
     packet->payload_len = bytes_left;
     if ((packet->payload = malloc(bytes_left)) == NULL)
@@ -6801,12 +6855,32 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
 
     dbg_cprintf("\n");
 
+    if (payload_format == PAYLOAD_FORMAT_UTF8) {
+        if (((uint8_t *)packet->payload)[packet->payload_len - 1] != '\0') {
+            reason_code = MQTT_PAYLOAD_FORMAT_INVALID;
+            goto fail;
+        }
+        if (!is_valid_utf8((void *)packet->payload, packet->payload_len)) {
+            reason_code = MQTT_PAYLOAD_FORMAT_INVALID;
+            goto fail;
+        }
+    }
+
     if (packet->properties && packet->property_count && get_property_value(packet->properties, packet->property_count,
                 MQTT_PROP_SUBSCRIPTION_IDENTIFIER, &prop) == 0) {
         subscription_identifier = prop->byte4;
 
         if (subscription_identifier > MAX_SUB_IDENTIFIER ||
                 subscription_identifier == 0) {
+            reason_code = MQTT_PROTOCOL_ERROR;
+            goto fail;
+        }
+    }
+
+    if (packet->properties && packet->property_count && get_property_value(packet->properties, packet->property_count,
+                MQTT_PROP_MESSAGE_EXPIRY_INTERVAL, &prop) == 0) {
+        message_expiry_interval = prop->byte4;
+        if (message_expiry_interval > (365*24*60*60)) {
             reason_code = MQTT_PROTOCOL_ERROR;
             goto fail;
         }
@@ -6877,15 +6951,19 @@ static int handle_cp_publish(struct client *client, struct packet *packet,
         warn("handle_cp_publish: register_message");
         goto fail;
     }
+    const time_t now = time(NULL);
     msg->sender_status.packet_identifier = packet_identifier;
+
+    if (message_expiry_interval) {
+        msg->message_expiry_interval = message_expiry_interval;
+        msg->message_expires_at = now + message_expiry_interval;
+    }
 
     free(topic_name);
     topic_name = NULL;
 
     packet->payload = NULL;
     packet->payload_len = 0;
-
-    const time_t now = time(NULL);
 
     msg->sender_status.accepted_at = now;
     total_messages_sender_accepted_at++;
@@ -8355,6 +8433,15 @@ static void tick_msg(struct message *msg)
                 msg->id,
                 msg->qos,
                 msg->sender_status.completed_at);
+        return;
+    }
+
+    /* TODO is this going to work? */
+    if (msg->message_expires_at && msg->message_expires_at < now) {
+        msg->retain = false;
+        if (dequeue_message(msg) == -1)
+            warn("tick_msg: attempt to dequeue_message on expired message");
+        msg->state = MSG_DEAD;
         return;
     }
 

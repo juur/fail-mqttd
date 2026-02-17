@@ -217,6 +217,12 @@ typedef enum {
     MQTT_REASON_CODE_MAX
 } reason_code_t;
 
+enum {
+    PAYLOAD_FORMAT_BYTES = 0x00,
+    PAYLOAD_FORMAT_UTF8 = 0x01,
+    PAYLOAD_FORMAT_MAX
+};
+
 typedef enum {
     CS_NEW = 0,
     CS_ACTIVE,
@@ -381,6 +387,9 @@ struct message {
     message_type_t type;
     bool retain;
     uint8_t uuid[UUID_SIZE];
+    uint32_t message_expiry_interval;
+    time_t message_expires_at;
+    time_t registered_at;
 
     unsigned num_message_delivery_states;
     struct message_delivery_state **delivery_states;

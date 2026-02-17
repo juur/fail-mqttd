@@ -19,7 +19,7 @@ struct mqtt_test_api {
 	void *(*read_binary)(const uint8_t **ptr, size_t *bytes_left, uint16_t *length);
 	uint8_t *(*read_utf8)(const uint8_t **ptr, size_t *bytes_left);
 
-	int (*is_valid_utf8)(const uint8_t *str);
+	int (*is_valid_utf8)(const uint8_t *str, size_t len);
 	int (*is_valid_connection_id)(const uint8_t *str);
 	int (*is_valid_topic_name)(const uint8_t *name);
 	int (*is_valid_topic_filter)(const uint8_t *name);

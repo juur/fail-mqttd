@@ -14,7 +14,7 @@ START_TEST(test_utf8_valid_ascii)
 {
 	const uint8_t text[] = "hello";
 
-	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(text), 0);
+	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(text,0), 0);
 }
 END_TEST
 
@@ -22,7 +22,7 @@ START_TEST(test_utf8_invalid_continuation)
 {
 	const uint8_t text[] = {0x80, 0x00};
 
-	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(text), -1);
+	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(text,0), -1);
 }
 END_TEST
 

@@ -1199,8 +1199,8 @@ START_TEST(test_mqtt_1_5_4_1)
 	const uint8_t invalid[] = {0xC0, 0x00}; /* invalid continuation */
 	const uint8_t valid[] = "hello";
 
-	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(valid), 0);
-	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(invalid), -1);
+	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(valid, 0), 0);
+	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(invalid, 0), -1);
 }
 END_TEST
 
@@ -1209,7 +1209,7 @@ START_TEST(test_mqtt_1_5_4_surrogate)
 	/* UTF-8 must not include surrogate code points U+D800..U+DFFF. */
 	const uint8_t surrogate[] = {0xED, 0xA0, 0x80, 0x00}; /* U+D800 */
 
-	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(surrogate), -1);
+	ck_assert_int_eq(mqtt_test_api.is_valid_utf8(surrogate, 0), -1);
 }
 END_TEST
 
