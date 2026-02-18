@@ -309,4 +309,16 @@ static inline void mqtt_test_restore_log(struct mqtt_test_log_state *state)
 	*mqtt_test_options.logsyslog = state->logsyslog;
 }
 
+#define MQTT_TEST_STDERR_FIXTURE() \
+	static int mqtt_saved_stderr_fd = -1; \
+	static void mqtt_silence_stderr(void) \
+	{ \
+		(void)mqtt_test_silence_stderr(&mqtt_saved_stderr_fd); \
+	} \
+	static void mqtt_restore_stderr(void) \
+	{ \
+		mqtt_test_restore_stderr(mqtt_saved_stderr_fd); \
+		mqtt_saved_stderr_fd = -1; \
+	}
+
 #endif

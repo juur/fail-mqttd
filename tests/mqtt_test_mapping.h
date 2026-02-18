@@ -13,6 +13,7 @@
 	X("MQTT-1.5.5-1", test_mqtt_1_5_5_1) \
 	X("MQTT-1.5.7-1", test_mqtt_1_5_7_1) \
 	X("MQTT-2.1.3-1", test_mqtt_2_1_3_1) \
+	X("MQTT-2.2.1-2", test_mqtt_2_2_1_2_qos0_packet_id_treated_as_payload) \
 	X("MQTT-2.2.1-3", test_mqtt_publish_qos1_packet_id_zero) \
 	X("MQTT-2.2.1-4", test_mqtt_2_2_1_4_server_publish_packet_id_nonzero) \
 	X("MQTT-2.2.1-5", test_mqtt_2_2_1_5_puback) \
@@ -21,6 +22,7 @@
 	X("MQTT-3.1.0-1", test_mqtt_3_1_0_1) \
 	X("MQTT-3.1.0-2", test_mqtt_3_1_0_2) \
 	X("MQTT-3.1.2-1", test_mqtt_3_1_2_1_protocol_name) \
+	X("MQTT-3.1.2-10", test_mqtt_3_14_4_3_disconnect_success_discards_will) \
 	X("MQTT-3.1.2-3", test_mqtt_3_1_2_3) \
 	X("MQTT-3.1.2-4", test_mqtt_3_1_2_4_clean_start_discards_session) \
 	X("MQTT-3.1.2-5", test_mqtt_3_1_2_5_existing_session) \
@@ -37,6 +39,7 @@
 	X("MQTT-3.1.2-18", test_mqtt_3_1_2_18_password_flag_unset) \
 	X("MQTT-3.1.2-19", test_mqtt_3_1_2_19_password_flag_set_requires_password) \
 	X("MQTT-3.1.3-1", test_mqtt_3_1_3_1_connect_payload_order) \
+	X("MQTT-3.1.3-2", test_mqtt_3_2_2_3_existing_session_present) \
 	X("MQTT-3.1.3-3", test_mqtt_3_1_3_3_client_id_missing) \
 	X("MQTT-3.1.3-4", test_mqtt_3_1_3_4_client_id_utf8_invalid) \
 	X("MQTT-3.1.3-5", test_mqtt_3_1_3_5_client_id_allowed) \
@@ -44,6 +47,7 @@
 	X("MQTT-3.1.3-12", test_mqtt_3_1_3_12_username_utf8_invalid) \
 	X("MQTT-3.1.4-1", test_mqtt_3_1_4_1_connect_too_short) \
 	X("MQTT-3.1.4-2", test_mqtt_3_1_4_2_auth_required) \
+	X("MQTT-3.1.4-3", test_mqtt_3_1_4_3_session_taken_over_disconnects_existing_client) \
 	X("MQTT-3.1.4-4", test_mqtt_3_1_2_4_clean_start_discards_session) \
 	X("MQTT-3.1.4-5", test_mqtt_3_1_4_5_connack_success) \
 	X("MQTT-3.1.4-6", test_mqtt_3_1_4_6_reject_ignores_followup) \
@@ -57,6 +61,7 @@
 	X("MQTT-3.2.2-8", test_mqtt_3_2_2_8_connack_reason_code) \
 	X("MQTT-3.3.1-1", test_mqtt_3_3_1_1_dup_on_redelivery) \
 	X("MQTT-3.3.1-2", test_mqtt_publish_qos0_dup_rejected) \
+	X("MQTT-3.3.1-3", test_mqtt_3_3_1_3_outgoing_dup_independent_of_incoming) \
 	X("MQTT-3.3.1-4", test_mqtt_publish_qos_invalid) \
 	X("MQTT-3.3.2-1", test_mqtt_3_3_2_1_topic_name_required) \
 	X("MQTT-3.3.2-2", test_mqtt_3_3_2_2_topic_name_no_wildcards) \
@@ -65,10 +70,23 @@
 	X("MQTT-3.3.2-14", test_mqtt_3_3_2_14_response_topic_no_wildcards) \
 	X("MQTT-3.3.2-19", test_mqtt_3_3_2_19_content_type_utf8) \
 	X("MQTT-3.3.4-1", test_mqtt_3_3_4_1_publish_qos1_puback) \
+	X("MQTT-3.4.2-1", test_mqtt_3_4_2_1_2_3_puback_reason_and_no_props) \
+	X("MQTT-3.4.2-2", test_mqtt_3_4_2_1_2_3_puback_reason_and_no_props) \
+	X("MQTT-3.4.2-3", test_mqtt_3_4_2_1_2_3_puback_reason_and_no_props) \
+	X("MQTT-3.5.2-1", test_mqtt_3_5_2_1_2_3_pubrec_reason_and_no_props) \
+	X("MQTT-3.5.2-2", test_mqtt_3_5_2_1_2_3_pubrec_reason_and_no_props) \
+	X("MQTT-3.5.2-3", test_mqtt_3_5_2_1_2_3_pubrec_reason_and_no_props) \
 	X("MQTT-3.6.1-1", test_mqtt_3_6_1_1_pubrel_flags_invalid) \
+	X("MQTT-3.6.2-1", test_mqtt_3_6_2_1_2_3_and_4_3_3_4_server_sends_pubrel_on_pubrec) \
+	X("MQTT-3.6.2-2", test_mqtt_3_6_2_1_2_3_and_4_3_3_4_server_sends_pubrel_on_pubrec) \
+	X("MQTT-3.6.2-3", test_mqtt_3_6_2_1_2_3_and_4_3_3_4_server_sends_pubrel_on_pubrec) \
+	X("MQTT-3.7.2-1", test_mqtt_3_7_2_1_2_3_pubcomp_reason_and_no_props) \
+	X("MQTT-3.7.2-2", test_mqtt_3_7_2_1_2_3_pubcomp_reason_and_no_props) \
+	X("MQTT-3.7.2-3", test_mqtt_3_7_2_1_2_3_pubcomp_reason_and_no_props) \
 	X("MQTT-3.8.1-1", test_mqtt_3_8_1_1_subscribe_flags) \
 	X("MQTT-3.8.3-1", test_mqtt_3_8_3_1_subscribe_utf8_invalid) \
 	X("MQTT-3.8.3-2", test_mqtt_3_8_3_2) \
+	X("MQTT-3.8.3-3", test_mqtt_3_8_3_3_no_local_blocks_self_publish) \
 	X("MQTT-3.8.3-4", test_mqtt_subscribe_shared_no_local_rejected) \
 	X("MQTT-3.8.3-5", test_mqtt_subscribe_reserved_bits_rejected) \
 	X("MQTT-3.8.4-1", test_mqtt_3_8_4_1_suback_sent) \
@@ -78,6 +96,8 @@
 	X("MQTT-3.8.4-6", test_mqtt_3_8_4_6_suback_reason_codes) \
 	X("MQTT-3.8.4-7", test_mqtt_3_8_4_6_suback_reason_codes) \
 	X("MQTT-3.8.4-8", test_mqtt_3_8_4_8_subscribe_qos_minimum) \
+	X("MQTT-3.9.2-1", test_mqtt_3_9_2_1_suback_has_no_optional_properties) \
+	X("MQTT-3.9.2-2", test_mqtt_3_9_2_1_suback_has_no_optional_properties) \
 	X("MQTT-3.9.3-1", test_mqtt_3_9_3_1_suback_reason_code_order) \
 	X("MQTT-3.9.3-2", test_mqtt_3_8_4_6_suback_reason_codes) \
 	X("MQTT-3.10.1-1", test_mqtt_2_1_3_1_unsubscribe_flags) \
@@ -89,13 +109,31 @@
 	X("MQTT-3.10.4-4", test_mqtt_3_10_4_4_unsuback_sent) \
 	X("MQTT-3.10.4-5", test_mqtt_3_10_4_5_unsuback_packet_id) \
 	X("MQTT-3.10.4-6", test_mqtt_3_10_4_6_unsuback_single_response) \
+	X("MQTT-3.11.2-1", test_mqtt_3_11_2_1_unsuback_has_no_optional_properties) \
+	X("MQTT-3.11.2-2", test_mqtt_3_11_2_1_unsuback_has_no_optional_properties) \
 	X("MQTT-3.11.3-1", test_mqtt_3_11_3_1_unsuback_reason_code_order) \
 	X("MQTT-3.11.3-2", test_mqtt_3_11_3_1_unsuback_reason_code_order) \
 	X("MQTT-3.12.4-1", test_mqtt_3_12_4_1_pingresp_sent) \
+	X("MQTT-3.14.0-1", test_mqtt_3_14_0_1_no_disconnect_before_connack) \
 	X("MQTT-3.14.1-1", test_mqtt_3_14_1_1_disconnect_flags_invalid) \
+	X("MQTT-3.14.2-1", test_mqtt_3_14_2_1_2_server_disconnect_reason_and_no_props) \
+	X("MQTT-3.14.2-2", test_mqtt_3_14_2_1_2_server_disconnect_reason_and_no_props) \
+	X("MQTT-3.14.2-3", test_mqtt_3_14_2_1_2_server_disconnect_reason_and_no_props) \
+	X("MQTT-3.14.2-4", test_mqtt_3_14_2_1_2_server_disconnect_reason_and_no_props) \
 	X("MQTT-3.14.4-1", test_mqtt_3_14_4_1_disconnect_no_more_packets) \
 	X("MQTT-3.14.4-2", test_mqtt_3_14_4_2_disconnect_closes) \
+	X("MQTT-3.14.4-3", test_mqtt_3_14_4_3_disconnect_success_discards_will) \
 	X("MQTT-3.15.1-1", test_mqtt_3_15_1_1_auth_flags_invalid) \
+	X("MQTT-4.3.1-1", test_mqtt_4_3_1_1_outgoing_qos0_dup_clear) \
+	X("MQTT-4.3.2-1", test_mqtt_4_3_2_1_2_outgoing_qos1_packet_id_and_dup_clear) \
+	X("MQTT-4.3.2-2", test_mqtt_4_3_2_1_2_outgoing_qos1_packet_id_and_dup_clear) \
+	X("MQTT-4.3.2-4", test_mqtt_2_2_1_5_puback) \
+	X("MQTT-4.3.3-4", test_mqtt_3_6_2_1_2_3_and_4_3_3_4_server_sends_pubrel_on_pubrec) \
+	X("MQTT-4.3.3-8", test_mqtt_3_5_2_1_2_3_pubrec_reason_and_no_props) \
+	X("MQTT-4.3.3-11", test_mqtt_3_7_2_1_2_3_pubcomp_reason_and_no_props) \
+	X("MQTT-4.7.0-1", test_mqtt_4_7_0_1_wildcards_allowed_in_filters_not_names) \
+	X("MQTT-4.7.1-1", test_mqtt_4_7_1_1_multi_level_wildcard_must_be_last_level) \
+	X("MQTT-4.7.1-2", test_mqtt_4_7_1_2_single_level_wildcard_must_be_entire_level) \
 	X("MQTT-4.7.3-1", test_mqtt_4_7_3_1_topic_name)
 
 #define MQTT_POLICY_MAP(X) \

@@ -11,18 +11,7 @@
 
 #include "mqtt_test_support.h"
 
-static int saved_stderr_fd = -1;
-
-static void mqtt_silence_stderr(void)
-{
-	(void)mqtt_test_silence_stderr(&saved_stderr_fd);
-}
-
-static void mqtt_restore_stderr(void)
-{
-	mqtt_test_restore_stderr(saved_stderr_fd);
-	saved_stderr_fd = -1;
-}
+MQTT_TEST_STDERR_FIXTURE()
 
 static void encode_var(uint32_t value, uint8_t out[static 4], int *out_len)
 {

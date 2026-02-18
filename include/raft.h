@@ -186,7 +186,7 @@ struct raft_host_entry {
     uint8_t rd_packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
 
     /* write buffering */
-    _Atomic const uint8_t *wr_packet_buffer;
+    const uint8_t *wr_packet_buffer;
     off_t wr_offset;
     ssize_t wr_need;
     ssize_t wr_packet_length;
@@ -197,7 +197,7 @@ struct raft_host_entry {
     unsigned wr_queue;
 
     /* snapshot sending */
-    _Atomic const uint8_t *ss_data;
+    const uint8_t *ss_data;
     off_t ss_offset;
     ssize_t ss_need;
     uint32_t ss_length;

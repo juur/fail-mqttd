@@ -27,6 +27,7 @@
 #include "raft.h"
 #include "raft_test_api.h"
 #include "raft_test_io.h"
+#include "raft_test_support.h"
 
 extern struct raft_state raft_state;
 extern const struct raft_impl *raft_impl;
@@ -109,50 +110,27 @@ static void init_state_filenames(void);
 
 static void init_entry_locks(struct raft_host_entry *entry)
 {
-	ck_assert_int_eq(pthread_rwlock_init(&entry->wr_lock, NULL), 0);
-	ck_assert_int_eq(pthread_rwlock_init(&entry->ss_lock, NULL), 0);
+	raft_test_init_entry_locks(entry);
 }
 
 static void destroy_entry_locks(struct raft_host_entry *entry)
 {
-	pthread_rwlock_destroy(&entry->wr_lock);
-	pthread_rwlock_destroy(&entry->ss_lock);
+	raft_test_destroy_entry_locks(entry);
 }
 
 static void init_client_state(void)
 {
-	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
-
-	memset(client_state, 0, sizeof(*client_state));
-	ck_assert_int_eq(pthread_rwlock_init(&client_state->lock, NULL), 0);
-	ck_assert_int_eq(pthread_rwlock_init(&client_state->log_pending_lock, NULL), 0);
-	client_state->current_leader_id = NULL_ID;
+	raft_test_init_client_state();
 }
 
 static void destroy_client_state(void)
 {
-	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
-
-	pthread_rwlock_destroy(&client_state->log_pending_lock);
-	pthread_rwlock_destroy(&client_state->lock);
+	raft_test_destroy_client_state();
 }
 
 static void reset_raft_state(void)
 {
-	struct raft_log *tmp;
-
-	for (tmp = raft_state.log_head; tmp;) {
-		struct raft_log *next = tmp->next;
-		raft_test_api.raft_free_log(tmp);
-		tmp = next;
-	}
-
-	memset(&raft_state, 0, sizeof(raft_state));
-	atomic_store(&raft_state.log_length, 0);
-	raft_state.voted_for = NULL_ID;
-	raft_state.state = RAFT_STATE_FOLLOWER;
-	raft_state.current_term = 1;
-	raft_state.self_id = 1;
+	raft_test_reset_state_full(&raft_state, 1);
 	init_state_filenames();
 }
 
@@ -252,66 +230,23 @@ static void teardown(void)
 
 static int enter_temp_dir(char *path, size_t path_len, int *saved_cwd_fd)
 {
-	const char *tmpdir = getenv("TMPDIR");
-
-	if (!tmpdir)
-		tmpdir = "/tmp";
-
-	if (snprintf(path, path_len, "%s/raft-tla-XXXXXX", tmpdir) >= (int)path_len)
-		return -1;
-
-	if (mkdtemp(path) == NULL)
-		return -1;
-
-	*saved_cwd_fd = open(".", O_RDONLY);
-	if (*saved_cwd_fd == -1)
-		return -1;
-
-	if (chdir(path) == -1)
-		return -1;
-
-	return 0;
+	return raft_test_enter_temp_dir(path, path_len, saved_cwd_fd,
+			"raft-tla-XXXXXX");
 }
 
 static void init_state_filenames(void)
 {
-	snprintf(raft_state.fn_prefix, sizeof(raft_state.fn_prefix),
-			"save_state_%u_", raft_state.self_id);
-	snprintf(raft_state.fn_vars, sizeof(raft_state.fn_vars),
-			"%svars.bin", raft_state.fn_prefix);
-	snprintf(raft_state.fn_log, sizeof(raft_state.fn_log),
-			"%slog.bin", raft_state.fn_prefix);
-	snprintf(raft_state.fn_vars_new, sizeof(raft_state.fn_vars_new),
-			"%s.new", raft_state.fn_vars);
+	raft_test_init_state_filenames(&raft_state);
 }
 
 static void leave_temp_dir(const char *path, int saved_cwd_fd)
 {
-	if (path) {
-		unlink(raft_state.fn_vars);
-		unlink(raft_state.fn_vars_new);
-		unlink(raft_state.fn_log);
-	}
-
-	if (saved_cwd_fd != -1) {
-		if (fchdir(saved_cwd_fd) == -1)
-			(void)0;
-		close(saved_cwd_fd);
-	}
-
-	if (path)
-		rmdir(path);
+	raft_test_leave_temp_dir(&raft_state, path, saved_cwd_fd);
 }
 
 static struct raft_log *make_log(uint32_t index, uint32_t term)
 {
-	struct raft_log *entry;
-
-	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
-	ck_assert_ptr_nonnull(entry);
-	entry->index = index;
-	entry->term = term;
-	return entry;
+	return raft_test_make_log(index, term);
 }
 
 static void assert_election_safety(void)
@@ -3075,7 +3010,7 @@ START_TEST(test_conformance_restart_clears_volatile_state)
 	peers[0].wr_packet_length = 4;
 	peers[0].wr_offset = 1;
 	atomic_store_explicit(&peers[0].wr_packet_buffer,
-			(_Atomic const uint8_t *)active->buf, memory_order_seq_cst);
+			(const uint8_t *)active->buf, memory_order_seq_cst);
 
 	peers[0].ss_need = 12;
 	peers[0].ss_offset = 5;
@@ -3085,7 +3020,7 @@ START_TEST(test_conformance_restart_clears_volatile_state)
 	peers[0].ss_last_index = 9;
 	peers[0].ss_last_term = 3;
 	atomic_store_explicit(&peers[0].ss_data,
-			(_Atomic const uint8_t *)malloc(10), memory_order_seq_cst);
+			(const uint8_t *)malloc(10), memory_order_seq_cst);
 
 	simulate_restart();
 

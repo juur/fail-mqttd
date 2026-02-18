@@ -14,18 +14,7 @@
 
 #include "mqtt_test_support.h"
 
-static int saved_stderr_fd = -1;
-
-static void mqtt_silence_stderr(void)
-{
-	(void)mqtt_test_silence_stderr(&saved_stderr_fd);
-}
-
-static void mqtt_restore_stderr(void)
-{
-	mqtt_test_restore_stderr(saved_stderr_fd);
-	saved_stderr_fd = -1;
-}
+MQTT_TEST_STDERR_FIXTURE()
 
 static size_t build_publish_packet(uint8_t *out, size_t out_len, uint8_t flags,
 		const uint8_t *topic, const struct property *props,

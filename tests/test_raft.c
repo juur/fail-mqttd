@@ -25,6 +25,7 @@
 #include "raft.h"
 #include "raft_test_api.h"
 #include "raft_test_io.h"
+#include "raft_test_support.h"
 
 extern struct raft_state raft_state;
 extern const struct raft_impl *raft_impl;
@@ -34,27 +35,23 @@ extern in_port_t opt_port;
 static int free_log_called;
 static int commit_called;
 
-static int test_free_log(struct raft_log *entry, raft_log_t event)
+static int test_free_log(struct raft_log * /*entry*/, raft_log_t /*event*/)
 {
-	(void)entry;
-	(void)event;
 	free_log_called++;
 	return 0;
 }
 
-static int test_apply(struct raft_log *entry, raft_log_t event)
+static int test_apply(struct raft_log * /*entry*/, raft_log_t /*event*/)
 {
-	(void)entry;
-	(void)event;
 	commit_called++;
 	return 0;
 }
 
-static int test_save_log(const struct raft_log *entry, uint8_t **buf, raft_log_t event)
+static int test_save_log(const struct raft_log *entry, uint8_t **buf,
+		raft_log_t /*event*/)
 {
 	uint32_t value;
 
-	(void)event;
 	if (!buf) {
 		errno = EINVAL;
 		return -1;
@@ -69,20 +66,19 @@ static int test_save_log(const struct raft_log *entry, uint8_t **buf, raft_log_t
 	return (int)sizeof(value);
 }
 
-static int test_save_log_empty(const struct raft_log *entry, uint8_t **buf, raft_log_t event)
+static int test_save_log_empty(const struct raft_log * /*entry*/, uint8_t **buf,
+		raft_log_t /*event*/)
 {
-	(void)entry;
-	(void)event;
 	if (buf)
 		*buf = NULL;
 	return 0;
 }
 
-static int test_read_log(struct raft_log *entry, const uint8_t *buf, int len, raft_log_t event)
+static int test_read_log(struct raft_log *entry, const uint8_t *buf, int len,
+		raft_log_t /*event*/)
 {
 	uint32_t value;
 
-	(void)event;
 	if (!entry || !buf || len != (int)sizeof(value)) {
 		errno = EINVAL;
 		return -1;
@@ -93,11 +89,9 @@ static int test_read_log(struct raft_log *entry, const uint8_t *buf, int len, ra
 	return 0;
 }
 
-static int test_size_send_empty(struct raft_log *entry, struct send_state *state,
-		raft_log_t event)
+static int test_size_send_empty(struct raft_log * /*entry*/, struct send_state *state,
+		raft_log_t /*event*/)
 {
-	(void)entry;
-	(void)event;
 	if (!state) {
 		errno = EINVAL;
 		return -1;
@@ -106,62 +100,43 @@ static int test_size_send_empty(struct raft_log *entry, struct send_state *state
 	return 0;
 }
 
-static int test_fill_send_empty(struct send_state *state, const struct raft_log *entry,
-		raft_log_t event)
+static int test_fill_send_empty(struct send_state * /*state*/,
+		const struct raft_log * /*entry*/, raft_log_t /*event*/)
 {
-	(void)state;
-	(void)entry;
-	(void)event;
 	return 0;
 }
 
-static int test_fill_send_fail(struct send_state *state, const struct raft_log *entry,
-		raft_log_t event)
+static int test_fill_send_fail(struct send_state * /*state*/,
+		const struct raft_log * /*entry*/, raft_log_t /*event*/)
 {
-	(void)state;
-	(void)entry;
-	(void)event;
 	errno = EIO;
 	return -1;
 }
 
-static int test_fill_send_overflow(struct send_state *state, const struct raft_log *entry,
-		raft_log_t event)
+static int test_fill_send_overflow(struct send_state * /*state*/,
+		const struct raft_log * /*entry*/, raft_log_t /*event*/)
 {
-	(void)state;
-	(void)entry;
-	(void)event;
 	return (int)USHRT_MAX + 1;
 }
 
-static raft_status_t test_process_packet_fail(size_t *bytes_remaining,
-		const uint8_t **ptr, raft_rpc_t rpc, raft_log_t type,
-		struct raft_log *log_entry)
+static raft_status_t test_process_packet_fail(size_t * /*bytes_remaining*/,
+		const uint8_t ** /*ptr*/, raft_rpc_t /*rpc*/, raft_log_t /*type*/,
+		struct raft_log * /*log_entry*/)
 {
-	(void)bytes_remaining;
-	(void)ptr;
-	(void)rpc;
-	(void)type;
-	(void)log_entry;
 	errno = EIO;
 	return -1;
 }
 
-static int test_size_send_fail_overflow(struct raft_log *entry, struct send_state *state,
-		raft_log_t event)
+static int test_size_send_fail_overflow(struct raft_log * /*entry*/,
+		struct send_state * /*state*/, raft_log_t /*event*/)
 {
-	(void)entry;
-	(void)state;
-	(void)event;
 	errno = EOVERFLOW;
 	return -1;
 }
 
-static int test_size_send_too_large(struct raft_log *entry, struct send_state *state,
-		raft_log_t event)
+static int test_size_send_too_large(struct raft_log * /*entry*/,
+		struct send_state *state, raft_log_t /*event*/)
 {
-	(void)entry;
-	(void)event;
 	if (!state) {
 		errno = EINVAL;
 		return -1;
@@ -170,11 +145,9 @@ static int test_size_send_too_large(struct raft_log *entry, struct send_state *s
 	return 0;
 }
 
-static int test_save_log_fail(const struct raft_log *entry, uint8_t **buf, raft_log_t event)
+static int test_save_log_fail(const struct raft_log * /*entry*/, uint8_t ** /*buf*/,
+		raft_log_t /*event*/)
 {
-	(void)entry;
-	(void)buf;
-	(void)event;
 	errno = EIO;
 	return -1;
 }
@@ -297,47 +270,27 @@ static void reset_peers(void)
 
 static void reset_raft_state(void)
 {
-	struct raft_log *tmp;
-
-	for (tmp = raft_state.log_head; tmp;) {
-		struct raft_log *next = tmp->next;
-		raft_test_api.raft_free_log(tmp);
-		tmp = next;
-	}
-
-	memset(&raft_state, 0, sizeof(raft_state));
-	atomic_store(&raft_state.log_length, 0);
-	raft_state.voted_for = NULL_ID;
+	raft_test_reset_state_basic(&raft_state);
 }
 
 static void init_client_state(void)
 {
-	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
-
-	memset(client_state, 0, sizeof(*client_state));
-	ck_assert_int_eq(pthread_rwlock_init(&client_state->lock, NULL), 0);
-	ck_assert_int_eq(pthread_rwlock_init(&client_state->log_pending_lock, NULL), 0);
-	client_state->current_leader_id = NULL_ID;
+	raft_test_init_client_state();
 }
 
 static void destroy_client_state(void)
 {
-	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
-
-	pthread_rwlock_destroy(&client_state->log_pending_lock);
-	pthread_rwlock_destroy(&client_state->lock);
+	raft_test_destroy_client_state();
 }
 
 static void init_entry_locks(struct raft_host_entry *entry)
 {
-	ck_assert_int_eq(pthread_rwlock_init(&entry->wr_lock, NULL), 0);
-	ck_assert_int_eq(pthread_rwlock_init(&entry->ss_lock, NULL), 0);
+	raft_test_init_entry_locks(entry);
 }
 
 static void destroy_entry_locks(struct raft_host_entry *entry)
 {
-	pthread_rwlock_destroy(&entry->wr_lock);
-	pthread_rwlock_destroy(&entry->ss_lock);
+	raft_test_destroy_entry_locks(entry);
 }
 
 static struct raft_host_entry *alloc_peers(unsigned count)
@@ -397,13 +350,7 @@ static void restore_stderr(int saved_fd)
 
 static struct raft_log *make_log(uint32_t index, uint32_t term)
 {
-	struct raft_log *entry;
-
-	entry = raft_test_api.raft_alloc_log(RAFT_PEER, RAFT_LOG_REGISTER_TOPIC);
-	ck_assert_ptr_nonnull(entry);
-	entry->index = index;
-	entry->term = term;
-	return entry;
+	return raft_test_make_log(index, term);
 }
 
 static int call_client_log_sendv(raft_log_t event, ...)
@@ -419,55 +366,18 @@ static int call_client_log_sendv(raft_log_t event, ...)
 
 static int enter_temp_dir(char *path, size_t path_len, int *saved_cwd_fd)
 {
-	const char *tmpdir = getenv("TMPDIR");
-
-	if (!tmpdir)
-		tmpdir = "/tmp";
-
-	if (snprintf(path, path_len, "%s/raft-test-XXXXXX", tmpdir) >= (int)path_len)
-		return -1;
-
-	if (mkdtemp(path) == NULL)
-		return -1;
-
-	*saved_cwd_fd = open(".", O_RDONLY);
-	if (*saved_cwd_fd == -1)
-		return -1;
-
-	if (chdir(path) == -1)
-		return -1;
-
-	return 0;
+	return raft_test_enter_temp_dir(path, path_len, saved_cwd_fd,
+			"raft-test-XXXXXX");
 }
 
 static void init_state_filenames(void)
 {
-	snprintf(raft_state.fn_prefix, sizeof(raft_state.fn_prefix),
-			"save_state_%u_", raft_state.self_id);
-	snprintf(raft_state.fn_vars, sizeof(raft_state.fn_vars),
-			"%svars.bin", raft_state.fn_prefix);
-	snprintf(raft_state.fn_log, sizeof(raft_state.fn_log),
-			"%slog.bin", raft_state.fn_prefix);
-	snprintf(raft_state.fn_vars_new, sizeof(raft_state.fn_vars_new),
-			"%s.new", raft_state.fn_vars);
+	raft_test_init_state_filenames(&raft_state);
 }
 
 static void leave_temp_dir(const char *path, int saved_cwd_fd)
 {
-	if (path) {
-		unlink(raft_state.fn_vars);
-		unlink(raft_state.fn_vars_new);
-		unlink(raft_state.fn_log);
-	}
-
-	if (saved_cwd_fd != -1) {
-		if (fchdir(saved_cwd_fd) == -1)
-			(void)0;
-		close(saved_cwd_fd);
-	}
-
-	if (path)
-		rmdir(path);
+	raft_test_leave_temp_dir(&raft_state, path, saved_cwd_fd);
 }
 
 enum {
@@ -1113,21 +1023,18 @@ START_TEST(test_reset_write_state_frees_buffer)
 	entry.wr_need = 9;
 	entry.wr_packet_length = 55;
 	{
-		buf = (const uint8_t *)malloc(32);
+		buf = malloc(32);
 		ck_assert_ptr_nonnull(buf);
-		atomic_store_explicit(&entry.wr_packet_buffer,
-				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
+		entry.wr_packet_buffer = buf;
 	}
-	ck_assert_ptr_nonnull(atomic_load_explicit(&entry.wr_packet_buffer,
-				memory_order_seq_cst));
+	ck_assert_ptr_nonnull(entry.wr_packet_buffer);
 
 	ck_assert_int_eq(raft_test_api.raft_reset_write_state(&entry, true), 0);
 
 	ck_assert_int_eq(entry.wr_offset, 0);
 	ck_assert_int_eq(entry.wr_need, 0);
 	ck_assert_int_eq(entry.wr_packet_length, 0);
-	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
-				memory_order_seq_cst), NULL);
+	ck_assert_ptr_eq(entry.wr_packet_buffer, NULL);
 	free((void *)buf);
 	buf = NULL;
 	destroy_entry_locks(&entry);
@@ -1150,16 +1057,14 @@ START_TEST(test_clear_active_write_resets_fields)
 
 	entry.wr_need = 3;
 	entry.wr_packet_length = 8;
-	atomic_store_explicit(&entry.wr_packet_buffer,
-			(_Atomic const uint8_t *)active->buf, memory_order_seq_cst);
+	entry.wr_packet_buffer = active->buf;
 	entry.wr_offset = 2;
 	entry.wr_active = active;
 
 	ck_assert_int_eq(raft_test_api.raft_clear_active_write(&entry), 0);
 	ck_assert_int_eq(entry.wr_need, 0);
 	ck_assert_int_eq(entry.wr_packet_length, 0);
-	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
-				memory_order_seq_cst), NULL);
+	ck_assert_ptr_eq(entry.wr_packet_buffer, NULL);
 	ck_assert_int_eq(entry.wr_offset, 0);
 	ck_assert_ptr_eq(entry.wr_active, NULL);
 
@@ -1253,16 +1158,13 @@ START_TEST(test_reset_ss_state_frees_buffer)
 	{
 		const uint8_t *buf = (const uint8_t *)malloc(8);
 		ck_assert_ptr_nonnull(buf);
-		atomic_store_explicit(&entry.ss_data,
-				(_Atomic const uint8_t *)buf, memory_order_seq_cst);
+		entry.ss_data = (const uint8_t *)buf;
 	}
-	ck_assert_ptr_nonnull(atomic_load_explicit(&entry.ss_data,
-				memory_order_seq_cst));
+	ck_assert_ptr_nonnull(entry.ss_data);
 
 	ck_assert_int_eq(raft_test_api.raft_reset_ss_state(&entry, true), 0);
 
-	ck_assert_ptr_eq(atomic_load_explicit(&entry.ss_data,
-				memory_order_seq_cst), NULL);
+	ck_assert_ptr_eq(entry.ss_data, NULL);
 	ck_assert_int_eq(entry.ss_last_index, 0);
 	ck_assert_int_eq(entry.ss_last_term, 0);
 	ck_assert_int_eq(entry.ss_need, 0);
@@ -1291,8 +1193,7 @@ START_TEST(test_add_write_and_try_write_success)
 	ck_assert_int_eq(raft_test_api.raft_add_write(&entry, (uint8_t *)strdup((char *)payload),
 				sizeof(payload) - 1), 0);
 	ck_assert_int_eq(raft_test_api.raft_try_write(&entry), 0);
-	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
-				memory_order_seq_cst), NULL);
+	ck_assert_ptr_eq(entry.wr_packet_buffer, NULL);
 
 	rc = read(fds[0], read_buf, sizeof(read_buf));
 	ck_assert_int_eq(rc, (ssize_t)(sizeof(payload) - 1));
@@ -1560,8 +1461,7 @@ START_TEST(test_reset_write_state_clears_queue)
 	entry.wr_queue = 2;
 	entry.wr_need = 4;
 	entry.wr_packet_length = 4;
-	atomic_store_explicit(&entry.wr_packet_buffer,
-			(_Atomic const uint8_t *)active->buf, memory_order_seq_cst);
+	entry.wr_packet_buffer = (const uint8_t *)active->buf;
 
 	ck_assert_int_eq(raft_test_api.raft_reset_write_state(&entry, true), 0);
 	ck_assert_ptr_eq(entry.wr_head, NULL);
@@ -1570,8 +1470,7 @@ START_TEST(test_reset_write_state_clears_queue)
 	ck_assert_int_eq(entry.wr_queue, 0);
 	ck_assert_int_eq(entry.wr_need, 0);
 	ck_assert_int_eq(entry.wr_packet_length, 0);
-	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
-				memory_order_seq_cst), NULL);
+	ck_assert_ptr_eq(entry.wr_packet_buffer, NULL);
 
 	destroy_entry_locks(&entry);
 }
@@ -1599,12 +1498,10 @@ START_TEST(test_remove_and_free_unknown_host)
 
 	wr_buf = (const uint8_t *)malloc(8);
 	ck_assert_ptr_nonnull(wr_buf);
-	atomic_store_explicit(&second->wr_packet_buffer,
-			(_Atomic const uint8_t *)wr_buf, memory_order_seq_cst);
+	second->wr_packet_buffer = (const uint8_t *)wr_buf;
 	ss_buf = (const uint8_t *)malloc(8);
 	ck_assert_ptr_nonnull(ss_buf);
-	atomic_store_explicit(&second->ss_data,
-			(_Atomic const uint8_t *)ss_buf, memory_order_seq_cst);
+	second->ss_data = (const uint8_t *)ss_buf;
 	rd_buf = malloc(8);
 	ck_assert_ptr_nonnull(rd_buf);
 	second->rd_packet_buffer = rd_buf;
@@ -3908,23 +3805,19 @@ START_TEST(test_close_resets_state)
 	{
 		wr_buf = (const uint8_t *)malloc(16);
 		ck_assert_ptr_nonnull(wr_buf);
-		atomic_store_explicit(&entry.wr_packet_buffer,
-				(_Atomic const uint8_t *)wr_buf, memory_order_seq_cst);
+		entry.wr_packet_buffer = (const uint8_t *)wr_buf;
 	}
 	{
 		ss_buf = (const uint8_t *)malloc(8);
 		ck_assert_ptr_nonnull(ss_buf);
-		atomic_store_explicit(&entry.ss_data,
-				(_Atomic const uint8_t *)ss_buf, memory_order_seq_cst);
+		entry.ss_data = (const uint8_t *)ss_buf;
 	}
 	entry.ss_last_index = 4;
 	entry.ss_last_term = 2;
 
 	ck_assert_ptr_nonnull(entry.rd_packet_buffer);
-	ck_assert_ptr_nonnull(atomic_load_explicit(&entry.wr_packet_buffer,
-				memory_order_seq_cst));
-	ck_assert_ptr_nonnull(atomic_load_explicit(&entry.ss_data,
-				memory_order_seq_cst));
+	ck_assert_ptr_nonnull(entry.wr_packet_buffer);
+	ck_assert_ptr_nonnull(entry.ss_data);
 
 	raft_state.self_id = 1;
 	raft_state.log_tail = make_log(10, 1);
@@ -3939,10 +3832,8 @@ START_TEST(test_close_resets_state)
 	ck_assert_int_eq(entry.wr_offset, 0);
 	ck_assert_int_eq(entry.wr_need, 0);
 	ck_assert_int_eq(entry.wr_packet_length, 0);
-	ck_assert_ptr_eq(atomic_load_explicit(&entry.wr_packet_buffer,
-				memory_order_seq_cst), NULL);
-	ck_assert_ptr_eq(atomic_load_explicit(&entry.ss_data,
-				memory_order_seq_cst), NULL);
+	ck_assert_ptr_eq(entry.wr_packet_buffer, NULL);
+	ck_assert_ptr_eq(entry.ss_data, NULL);
 	ck_assert_int_eq(entry.ss_last_index, 0);
 	ck_assert_int_eq(entry.ss_last_term, 0);
 

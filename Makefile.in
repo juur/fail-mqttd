@@ -100,7 +100,7 @@ CPPFLAGS += -I$(srcdir)/include
 
 all: $(objdir)/.d $(package_BINS) man
 
-check: $(objdir)/tests $(objdir)/.d/tests $(test_BINS)
+check: $(objdir)/.d/tests $(test_BINS)
 	@set -e; for t in $(test_BINS); do \
 		echo "RUN $$t"; \
 		$$t; \
@@ -133,9 +133,6 @@ coverage-json-run:
 $(objdir)/doc:
 	@mkdir -p $(objdir)/doc 2>/dev/null
 
-$(objdir)/tests:
-	@mkdir -p $(objdir)/tests 2>/dev/null
-
 $(objdir)/.d:
 	@mkdir -p $(objdir)/.d 2>/dev/null
 
@@ -152,13 +149,13 @@ $(objdir)/doc/$(PACKAGE).8: $(package_BIN) | $(objdir)/doc
 $(package_BIN): $(package_OBJS)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(objdir)/test_raft: $(objdir)/tests/test_raft.o $(raft_TEST_CORE_OBJS) $(raft_TEST_SUPPORT_OBJS)
+$(objdir)/test_raft: $(objdir)/tests/test_raft.o $(raft_TEST_CORE_OBJS) $(raft_TEST_SUPPORT_OBJS) | $(objdir)/.d/tests
 	$(CC) $^ $(LDFLAGS) $(CHECK_LIBS) -o $@
 
-$(objdir)/test_raft%: $(objdir)/tests/test_raft%.o $(raft_TEST_CORE_OBJS) $(raft_TEST_SUPPORT_OBJS)
+$(objdir)/test_raft%: $(objdir)/tests/test_raft%.o $(raft_TEST_CORE_OBJS) $(raft_TEST_SUPPORT_OBJS) | $(objdir)/.d/tests
 	$(CC) $^ $(LDFLAGS) $(CHECK_LIBS) -o $@
 
-$(objdir)/test_mqtt%: $(objdir)/tests/test_mqtt%.o $(mqtt_TEST_CORE_OBJS) $(raft_TEST_CORE_OBJS)
+$(objdir)/test_mqtt%: $(objdir)/tests/test_mqtt%.o $(mqtt_TEST_CORE_OBJS) $(raft_TEST_CORE_OBJS) | $(objdir)/.d/tests
 	$(CC) $^ $(LDFLAGS) $(CHECK_LIBS) -o $@
 
 .PHONY: install uninstall
@@ -214,7 +211,7 @@ else
 	$(CC) -c $(CFLAGS) $(CPPFLAGS) $< -o $@
 endif
 
-$(objdir)/tests/%.o: $(srcdir)/tests/%.c | $(objdir)/tests
+$(objdir)/tests/%.o: $(srcdir)/tests/%.c | $(objdir)/.d/tests
 ifeq ($(DEPS),1)
 	$(CC) -c $(CFLAGS) $(CPPFLAGS) $(CHECK_CFLAGS) -DTESTS -MF $(objdir)/.d/tests/$*.d $< -o $@
 else

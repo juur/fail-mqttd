@@ -2612,33 +2612,33 @@ fail:
  * persistence functions
  */
 
-static inline void write_u32(char **out, uint32_t val)
+static inline void write_u32(char **restrict out, uint32_t val)
 {
     val = htonl(val);
     memcpy(*out, &val, sizeof(val));
     *out += sizeof(val);
 }
 
-static inline void write_u16(char **out, uint16_t val)
+static inline void write_u16(char **restrict out, uint16_t val)
 {
     val = htons(val);
     memcpy(*out, &val, sizeof(val));
     *out += sizeof(val);
 }
 
-static inline void write_u8(char **out, uint8_t val)
+static inline void write_u8(char **restrict out, uint8_t val)
 {
     memcpy(*out, &val, sizeof(val));
     *out += sizeof(val);
 }
 
-static inline void write_bytes(char **out, const void *src, size_t len)
+static inline void write_bytes(char **restrict out, const void *restrict src, size_t len)
 {
     memcpy(*out, src, len);
     *out += len;
 }
 
-static inline void write_uuid(char **out, const uint8_t *src)
+static inline void write_uuid(char **restrict out, const uint8_t *restrict src)
 {
     memcpy(*out, src, UUID_SIZE);
     *out += UUID_SIZE;
@@ -2981,7 +2981,7 @@ fail:
     if (
             (out->payload_len > MAX_PACKET_LENGTH) ||
             (out->qos > 2) ||
-            (out->type >= MSG_TYPE_MAX) || 
+            (out->type >= MSG_TYPE_MAX) ||
             (out->registered_at > time(NULL)) ||
             (out->message_expiry_interval > (365*24*60*60))
        ) {
@@ -3079,7 +3079,7 @@ fail:
 /**
  * buffer must be sized using size_message() first
  */
-[[maybe_unused]] static int serialise_message(const struct message *msg, void *buffer)
+[[maybe_unused]] static int serialise_message(const struct message *restrict msg, void *restrict buffer)
 {
     char *dst = buffer;
 
@@ -3239,7 +3239,7 @@ fail:
 /**
  * buffer must be sized using size_message() first
  */
-[[maybe_unused]] static int serialise_topic(const struct topic *topic, void *buffer)
+[[maybe_unused]] static int serialise_topic(const struct topic *restrict topic, void *restrict buffer)
 {
     char *dst = buffer;
 
@@ -3260,12 +3260,6 @@ fail:
 [[gnu::nonnull]]
 static int save_message(const struct message *msg)
 {
-    /*
-    struct message_save *save = NULL;
-
-    assert(msg->uuid);
-    */
-
     void *save = NULL;
     errno = EINVAL;
 
@@ -3279,7 +3273,6 @@ static int save_message(const struct message *msg)
     dbg_printf("     save_message: saving message id=%d uuid=%s\n",
             msg->id, uuid_to_string(msg->uuid));
 
-    //size_t size = sizeof(struct message_save) + msg->payload_len;
     const int size = size_message(msg);
 
     if (size == -1)
@@ -3291,27 +3284,12 @@ static int save_message(const struct message *msg)
     if (serialise_message(msg, save) == -1)
         goto fail;
 
-    /*
-    save->id = msg->id;
-    save->format = msg->format;
-    save->payload_len = msg->payload_len;
-    save->qos = msg->qos;
-    save->retain = msg->retain;
-    save->type = msg->type;
-
-    memcpy(save->uuid, msg->uuid, UUID_SIZE);
-    if (msg->topic)
-        memcpy(save->topic_uuid, msg->topic->uuid, UUID_SIZE);
-    if (msg->payload)
-        memcpy(&save->payload, msg->payload, msg->payload_len);
-        */
-
-    datum key = {
+    const datum key = {
         .dptr = (char *)msg->uuid,
         .dsize = sizeof(msg->uuid),
     };
 
-    datum content = {
+    const datum content = {
         .dptr = (void *)save,
         .dsize = size
     };
@@ -3356,9 +3334,6 @@ int save_topic(const struct topic *topic)
             topic->retained_message ? uuid_to_string(topic->retained_message->uuid) : ""
             );
 
-    //struct topic_save save;
-    //memset(&save, 0, sizeof(save));
-
     const int size = size_topic(topic);
 
     if (size == -1)
@@ -3370,22 +3345,12 @@ int save_topic(const struct topic *topic)
     if (serialise_topic(topic, save) == -1)
         goto fail;
 
-    /*
-    save.id = topic->id;
-    memcpy(save.uuid, topic->uuid, UUID_SIZE);
-    strncpy(save.name, (char *)topic->name, sizeof(save.name) - 1);
-    if (topic->retained_message) {
-        memcpy(save.retained_message_uuid, topic->retained_message->uuid, UUID_SIZE);
-        dbg_printf("     save_topic: set retained_message_uuid to %s\n",
-                uuid_to_string(save.retained_message_uuid));
-    }*/
-
-    datum key = {
+    const datum key = {
         .dptr = (char *)topic->uuid,
         .dsize = sizeof(topic->uuid),
     };
 
-    datum content = {
+    const datum content = {
         .dptr = (void *)save,
         .dsize = size,
     };
@@ -3999,7 +3964,7 @@ static ssize_t get_properties_size(const struct property (*props)[],
 }
 
 [[gnu::nonnull(2)]]
-static void do_one_string(const uint8_t *str, uint8_t **ptr)
+static void do_one_string(const uint8_t *str, uint8_t **restrict ptr)
 {
     unsigned len;
     uint16_t enclen;
@@ -4021,7 +3986,7 @@ static void do_one_string(const uint8_t *str, uint8_t **ptr)
 
 [[gnu::nonnull]]
 static int build_properties(const struct property (*props)[],
-        unsigned num_props, uint8_t **out)
+        unsigned num_props, uint8_t **restrict out)
 {
     uint8_t *ptr = *out;
     uint16_t tmp2byte;
