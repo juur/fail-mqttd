@@ -68,7 +68,6 @@ static inline void write_str(struct send_state *out, const void *src, size_t len
 {
     memcpy(out->ptr, src, len);
     out->ptr += len;
-    //*(out->ptr++) = '\0';
 }
 
 static inline void write_uuid(struct send_state *out, const uint8_t *src)
@@ -312,7 +311,7 @@ static int register_topic_size_send(struct raft_log *lg, struct send_state *out,
     out->arg_uuid = arg_event->register_topic.uuid;
     out->arg_flags = arg_event->register_topic.flags;
 
-    out->arg_req_len += strlen((const void *)out->arg_str); // + 1;
+    out->arg_req_len += strlen((const void *)out->arg_str);
 
     if (out->arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
         out->arg_msg_uuid = arg_event->register_topic.msg_uuid;
@@ -348,15 +347,14 @@ static int register_topic_fill_send(struct send_state *out, const struct raft_lo
 
     write_u32(out, htons(out->arg_flags));
     write_u16(out, htons(strlen((void *)out->arg_str)));
-    write_str(out, out->arg_str, strlen((void *)out->arg_str));
     write_uuid(out, out->arg_uuid);
+    write_str(out, out->arg_str, strlen((void *)out->arg_str));
     if (retained_uuid)
         write_uuid(out, out->arg_msg_uuid);
 
     entry_length += sizeof(uint32_t);
     entry_length += sizeof(uint16_t);
     entry_length += tmp->register_topic.length;
-    //entry_length++; // NUL terminator
     entry_length += UUID_SIZE;
     if (tmp->register_topic.retained)
         entry_length += UUID_SIZE;
@@ -438,12 +436,12 @@ static raft_status_t register_topic_process_packet(size_t *bytes_remaining, cons
 
     read_u32(&out->register_topic.flags, ptr, bytes_remaining);
     read_u16(&out->register_topic.length, ptr, bytes_remaining);
+    read_uuid(out->register_topic.uuid, ptr, bytes_remaining);
 
     if (read_str(&out->register_topic.name, ptr, out->register_topic.length,
             bytes_remaining) == -1)
         goto fail;
 
-    read_uuid(out->register_topic.uuid, ptr, bytes_remaining);
     out->register_topic.retained = (out->register_topic.flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
 
     if (out->register_topic.retained)
