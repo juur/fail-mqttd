@@ -70,7 +70,7 @@ enum { RAFT_LOG_UNREGISTER_SESSION_SIZE = 16 };
  * u8[16] uuid
  * u32    last_connected (time_t)
  * u16    client_id_length
- * 1..n   u8[client_id_length] (0 terminated uint8_t string)
+ * 1..n   u8[client_id_length] (unterminated uint8_t string)
  */
 
 #define RAFT_LOG_REGISTER_SESSION_REQ_RESP_INFO (1<<0)
@@ -82,7 +82,7 @@ enum { RAFT_LOG_REGISTER_SESSION_SIZE = (2 + 4 + 16 + 4 + 2) };
  *
  * u32    flags (1 = retained)
  * u16    string_length
- * 1..n   u8[n] (0 terminated uint8_t string)
+ * 1..n   u8[n] (unterminated uint8_t string)
  * u8[16] uuid
  * u8[16] uuid retained message (OPTIONAL)
  *

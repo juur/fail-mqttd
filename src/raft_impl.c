@@ -68,7 +68,7 @@ static inline void write_str(struct send_state *out, const void *src, size_t len
 {
     memcpy(out->ptr, src, len);
     out->ptr += len;
-    *(out->ptr++) = '\0';
+    //*(out->ptr++) = '\0';
 }
 
 static inline void write_uuid(struct send_state *out, const uint8_t *src)
@@ -312,7 +312,7 @@ static int register_topic_size_send(struct raft_log *lg, struct send_state *out,
     out->arg_uuid = arg_event->register_topic.uuid;
     out->arg_flags = arg_event->register_topic.flags;
 
-    out->arg_req_len += strlen((const void *)out->arg_str) + 1;
+    out->arg_req_len += strlen((const void *)out->arg_str); // + 1;
 
     if (out->arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED) {
         out->arg_msg_uuid = arg_event->register_topic.msg_uuid;
@@ -356,7 +356,7 @@ static int register_topic_fill_send(struct send_state *out, const struct raft_lo
     entry_length += sizeof(uint32_t);
     entry_length += sizeof(uint16_t);
     entry_length += tmp->register_topic.length;
-    entry_length++;
+    //entry_length++; // NUL terminator
     entry_length += UUID_SIZE;
     if (tmp->register_topic.retained)
         entry_length += UUID_SIZE;
