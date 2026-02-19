@@ -1467,7 +1467,7 @@ static void raft_remove_and_free_unknown_host(struct raft_host_entry *entry)
 static int raft_new_conn(int new_fd, struct raft_host_entry *unknown_host,
         [[maybe_unused]] const struct sockaddr_in *sin, socklen_t /*sin_len*/)
 {
-    const uint8_t *ptr = NULL;
+    const char *ptr = NULL;
     raft_conn_t type;
     ssize_t rc;
     struct raft_host_entry *tmp_host = NULL;
@@ -1690,7 +1690,7 @@ static const struct {
  * @return -1 on error, @c errno is set
  */
 [[gnu::nonnull,gnu::warn_unused_result]]
-static int raft_add_write(struct raft_host_entry *client, uint8_t *buffer, ssize_t size)
+static int raft_add_write(struct raft_host_entry *client, void *buffer, ssize_t size)
 {
     struct io_buf *io_buf;
 
@@ -1782,7 +1782,7 @@ done:
 int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, ...)
 {
     ssize_t sendsz;
-    uint8_t *packet_buffer = NULL, *ptr;
+    char *packet_buffer = NULL, *ptr;
     void *tmp_packet_buffer = NULL;
     struct raft_packet packet;
 
@@ -2084,7 +2084,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                     goto fail;
                     */
 
-            ptr = send_state.ptr;
+            ptr = (void *)send_state.ptr;
 
             break;
 
@@ -2147,7 +2147,7 @@ int raft_send(raft_conn_t mode, struct raft_host_entry *client, raft_rpc_t rpc, 
                 const struct raft_log *tmp = arg_entries;
                 uint32_t index, term;
                 uint16_t entry_length;
-                uint8_t *entry_length_ptr;
+                char *entry_length_ptr;
 
                 for (unsigned idx = 0; tmp && idx < arg_num_entries; idx++)
                 {
@@ -2895,7 +2895,7 @@ static int raft_process_packet(struct raft_host_entry *client, raft_rpc_t rpc)
 {
     const uint32_t log_index = get_last_index();
     const uint32_t log_term = raft_state.log_tail ? raft_state.log_tail->term : 0;
-    const uint8_t *ptr = client->rd_packet_buffer;
+    const char *ptr = client->rd_packet_buffer;
     size_t bytes_remaining = client->rd_packet_length;
     struct raft_log *log_entry = NULL, *log_entry_head = NULL;
     struct raft_log *prev_log_entry = NULL;
@@ -3227,7 +3227,7 @@ send_client_request_reply:
                     if (ent->process_packet) {
                         size_t tmp_bytes_remaining = entry_length;
                         if (ent->process_packet(&tmp_bytes_remaining,
-                                    &ptr, rpc, (raft_log_t)type, log_entry) == -1)
+                                    (const char **)&ptr, rpc, (raft_log_t)type, log_entry) == -1)
                             goto fail;
                         assert(tmp_bytes_remaining == 0);
                     } else
@@ -3461,7 +3461,7 @@ fail:
 static int raft_recv(struct raft_host_entry *client)
 {
     ssize_t rc;
-    uint8_t *ptr = NULL;
+    char *ptr = NULL;
     const int *fd = &client->peer_fd;
 
     if (*fd == -1) {

@@ -120,7 +120,7 @@ static int test_fill_send_overflow(struct send_state * /*state*/,
 }
 
 static raft_status_t test_process_packet_fail(size_t * /*bytes_remaining*/,
-		const uint8_t ** /*ptr*/, raft_rpc_t /*rpc*/, raft_log_t /*type*/,
+		const char ** /*ptr*/, raft_rpc_t /*rpc*/, raft_log_t /*type*/,
 		struct raft_log * /*log_entry*/)
 {
 	errno = EIO;
@@ -1015,7 +1015,7 @@ END_TEST
 START_TEST(test_reset_write_state_frees_buffer)
 {
 	struct raft_host_entry entry;
-	const uint8_t *buf = NULL;
+	const char *buf = NULL;
 
 	memset(&entry, 0, sizeof(entry));
 	init_entry_locks(&entry);
@@ -1057,7 +1057,7 @@ START_TEST(test_clear_active_write_resets_fields)
 
 	entry.wr_need = 3;
 	entry.wr_packet_length = 8;
-	entry.wr_packet_buffer = active->buf;
+		entry.wr_packet_buffer = (const char *)active->buf;
 	entry.wr_offset = 2;
 	entry.wr_active = active;
 
@@ -1461,7 +1461,7 @@ START_TEST(test_reset_write_state_clears_queue)
 	entry.wr_queue = 2;
 	entry.wr_need = 4;
 	entry.wr_packet_length = 4;
-	entry.wr_packet_buffer = (const uint8_t *)active->buf;
+	entry.wr_packet_buffer = (const char *)active->buf;
 
 	ck_assert_int_eq(raft_test_api.raft_reset_write_state(&entry, true), 0);
 	ck_assert_ptr_eq(entry.wr_head, NULL);
@@ -1481,9 +1481,9 @@ START_TEST(test_remove_and_free_unknown_host)
 	struct raft_client_state *client_state = raft_test_api.client_state_ptr();
 	struct raft_host_entry *first;
 	struct raft_host_entry *second;
-	const uint8_t *wr_buf = NULL;
+	const char *wr_buf = NULL;
 	const uint8_t *ss_buf = NULL;
-	uint8_t *rd_buf = NULL;
+	char *rd_buf = NULL;
 
 	first = calloc(1, sizeof(*first));
 	second = calloc(1, sizeof(*second));
@@ -1496,9 +1496,9 @@ START_TEST(test_remove_and_free_unknown_host)
 	first->unknown_next = second;
 	client_state->unknown_clients = first;
 
-	wr_buf = (const uint8_t *)malloc(8);
+	wr_buf = (const char *)malloc(8);
 	ck_assert_ptr_nonnull(wr_buf);
-	second->wr_packet_buffer = (const uint8_t *)wr_buf;
+	second->wr_packet_buffer = wr_buf;
 	ss_buf = (const uint8_t *)malloc(8);
 	ck_assert_ptr_nonnull(ss_buf);
 	second->ss_data = (const uint8_t *)ss_buf;
@@ -1842,7 +1842,7 @@ START_TEST(test_process_packet_client_request_reply_invalid_status)
 	buf[1] = RAFT_LOG_REGISTER_TOPIC;
 	memset(buf + 2, 0, RAFT_CLIENT_REQUEST_REPLY_SIZE - 2);
 
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = RAFT_CLIENT_REQUEST_REPLY_SIZE;
 	errno = 0;
 	ck_assert_int_eq(raft_test_api.raft_process_packet(&client, RAFT_CLIENT_REQUEST_REPLY), -1);
@@ -1867,7 +1867,7 @@ START_TEST(test_process_packet_client_request_invalid_type)
 	memcpy(ptr, &len, sizeof(len));
 
 	memset(&client, 0, sizeof(client));
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	raft_state.state = RAFT_STATE_LEADER;
@@ -1897,7 +1897,7 @@ START_TEST(test_process_packet_client_request_no_handler)
 	memset(&client, 0, sizeof(client));
 	init_entry_locks(&client);
 	client.peer_fd = fds[1];
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	raft_state.state = RAFT_STATE_LEADER;
@@ -1929,7 +1929,7 @@ START_TEST(test_process_packet_client_request_not_leader_reply)
 	memset(&client, 0, sizeof(client));
 	init_entry_locks(&client);
 	client.peer_fd = fds[1];
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	raft_state.state = RAFT_STATE_FOLLOWER;
@@ -1982,7 +1982,7 @@ START_TEST(test_process_packet_append_entries_short_payload)
 	memcpy(ptr, &num_entries, sizeof(num_entries));
 
 	memset(&client, 0, sizeof(client));
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	ck_assert_int_eq(raft_test_api.raft_process_packet(&client, RAFT_APPEND_ENTRIES), -1);
@@ -2009,7 +2009,7 @@ START_TEST(test_process_packet_append_entries_num_entries_overflow)
 	memcpy(ptr, &num_entries, sizeof(num_entries));
 
 	memset(&client, 0, sizeof(client));
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	errno = 0;
@@ -2047,7 +2047,7 @@ START_TEST(test_process_packet_append_entries_handler_error)
 	memcpy(ptr, &entry_len, sizeof(entry_len));
 
 	memset(&client, 0, sizeof(client));
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	raft_impl = &fail_impl;
@@ -2075,7 +2075,7 @@ START_TEST(test_process_packet_client_request_handler_error)
 	memcpy(ptr, &len, sizeof(len));
 
 	memset(&client, 0, sizeof(client));
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	raft_state.state = RAFT_STATE_LEADER;
@@ -2119,7 +2119,7 @@ START_TEST(test_process_packet_request_vote_updates_term)
 	memcpy(buf + 8, &last_log_index, sizeof(last_log_index));
 	memcpy(buf + 12, &last_log_term, sizeof(last_log_term));
 
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	raft_state.state = RAFT_STATE_LEADER;
@@ -3337,7 +3337,7 @@ START_TEST(test_client_log_send_follower_path)
 	memset(&client, 0, sizeof(client));
 	fill_client_request_reply_payload(payload, RAFT_OK, RAFT_LOG_REGISTER_TOPIC,
 			raft_state.self_id, 1);
-	client.rd_packet_buffer = payload;
+	client.rd_packet_buffer = (char *)payload;
 	client.rd_packet_length = sizeof(payload);
 
 	ck_assert_int_eq(raft_test_api.raft_process_packet(&client, RAFT_CLIENT_REQUEST_REPLY), 0);
@@ -3386,7 +3386,7 @@ START_TEST(test_client_log_sendv_success)
 	memset(&client, 0, sizeof(client));
 	fill_client_request_reply_payload(payload, RAFT_OK, RAFT_LOG_REGISTER_TOPIC,
 			raft_state.self_id, 1);
-	client.rd_packet_buffer = payload;
+	client.rd_packet_buffer = (char *)payload;
 	client.rd_packet_length = sizeof(payload);
 
 	ck_assert_int_eq(raft_test_api.raft_process_packet(&client, RAFT_CLIENT_REQUEST_REPLY), 0);
@@ -3787,7 +3787,7 @@ END_TEST
 START_TEST(test_close_resets_state)
 {
 	struct raft_host_entry entry;
-	const uint8_t *wr_buf = NULL;
+	const char *wr_buf = NULL;
 	const uint8_t *ss_buf = NULL;
 
 	memset(&entry, 0, sizeof(entry));
@@ -3803,9 +3803,9 @@ START_TEST(test_close_resets_state)
 	entry.wr_need = 6;
 	entry.wr_packet_length = 20;
 	{
-		wr_buf = (const uint8_t *)malloc(16);
+		wr_buf = (const char *)malloc(16);
 		ck_assert_ptr_nonnull(wr_buf);
-		entry.wr_packet_buffer = (const uint8_t *)wr_buf;
+		entry.wr_packet_buffer = wr_buf;
 	}
 	{
 		ss_buf = (const uint8_t *)malloc(8);
@@ -4364,7 +4364,7 @@ START_TEST(test_process_packet_append_entries_invalid_log_type)
 	memcpy(ptr, &entry_len, sizeof(entry_len));
 
 	memset(&client, 0, sizeof(client));
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	errno = 0;
@@ -4389,7 +4389,7 @@ START_TEST(test_process_packet_client_request_overlong)
 	memcpy(ptr, &len, sizeof(len));
 
 	memset(&client, 0, sizeof(client));
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	ck_assert_int_eq(raft_test_api.raft_process_packet(&client, RAFT_CLIENT_REQUEST), -1);

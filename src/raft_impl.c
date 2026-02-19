@@ -2,8 +2,6 @@
 # define _XOPEN_SOURCE 800
 #endif
 
-#include "config.h"
-
 #include <stdlib.h>
 #include <pthread.h>
 #include <errno.h>
@@ -13,9 +11,11 @@
 #include <stdio.h>
 #include <assert.h>
 
+#include "config.h"
 #include "mqtt.h"
 #include "raft.h"
 #include "debug.h"
+#include "io_helpers.h"
 
 #ifdef FEATURE_RAFT_IMPL_DEBUG
 static int64_t timems(void)
@@ -52,6 +52,7 @@ static const struct raft_impl_limits raft_log_settings[RAFT_MAX_LOG] ={
 
 /* helper functions */
 
+/*
 static inline void write_u32(struct send_state *out, const uint32_t val)
 {
     memcpy(out->ptr, &val, sizeof(val));
@@ -110,8 +111,9 @@ static int read_uuid(uint8_t dest[static UUID_SIZE], const uint8_t **ptr, size_t
 
     return 0;
 }
+*/
 
-static int read_str(uint8_t **string, const uint8_t **ptr, size_t length, size_t *bytes_remaining)
+static int read_str(uint8_t **string, const char **ptr, size_t *bytes_remaining, size_t length)
 {
     if (*bytes_remaining < length) {
         errno = EMSGSIZE;
@@ -326,7 +328,7 @@ static int register_topic_size_send(struct raft_log *lg, struct send_state *out,
 
 static int unregister_topic_fill_send(struct send_state *out, const struct raft_log * /* lg */, raft_log_t /*event*/)
 {
-    write_uuid(out, out->arg_uuid);
+    write_uuid(&out->ptr, out->arg_uuid);
 
     return UUID_SIZE;
 }
@@ -345,12 +347,14 @@ static int register_topic_fill_send(struct send_state *out, const struct raft_lo
     const bool retained_uuid = (out->arg_flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);
     uint16_t entry_length = 0;
 
-    write_u32(out, htons(out->arg_flags));
-    write_u16(out, htons(strlen((void *)out->arg_str)));
-    write_uuid(out, out->arg_uuid);
-    write_str(out, out->arg_str, strlen((void *)out->arg_str));
+    const int len = strlen((void *)out->arg_str);
+
+    write_u32(&out->ptr, out->arg_flags);
+    write_u16(&out->ptr, len);
+    write_uuid(&out->ptr, out->arg_uuid);
+    write_bytes(&out->ptr, out->arg_str, len);
     if (retained_uuid)
-        write_uuid(out, out->arg_msg_uuid);
+        write_uuid(&out->ptr, out->arg_msg_uuid);
 
     entry_length += sizeof(uint32_t);
     entry_length += sizeof(uint16_t);
@@ -364,7 +368,7 @@ static int register_topic_fill_send(struct send_state *out, const struct raft_lo
     return entry_length;
 }
 
-static raft_status_t unregister_topic_process_packet(size_t *bytes_remaining, const uint8_t **ptr,
+static raft_status_t unregister_topic_process_packet(size_t *bytes_remaining, const char **ptr,
         [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *lg)
 {
     union raft_log_options *out = &lg->opt;
@@ -387,7 +391,7 @@ fail:
     return -1;
 }
 
-static raft_status_t register_session_process_packet(size_t *bytes_remaining, const uint8_t **ptr,
+static raft_status_t register_session_process_packet(size_t *bytes_remaining, const char **ptr,
         [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *lg)
 {
     if (lg == NULL) {
@@ -410,8 +414,8 @@ static raft_status_t register_session_process_packet(size_t *bytes_remaining, co
         goto fail;
     }
 
-    if (read_str(&out->register_session.client_id, ptr,
-                out->register_session.client_id_length, bytes_remaining) == -1)
+    if (read_str(&out->register_session.client_id, ptr, bytes_remaining,
+                out->register_session.client_id_length) == -1)
         goto fail;
 
     if (rc == -1)
@@ -423,7 +427,7 @@ fail:
     return -1;
 }
 
-static raft_status_t register_topic_process_packet(size_t *bytes_remaining, const uint8_t **ptr,
+static raft_status_t register_topic_process_packet(size_t *bytes_remaining, const char **ptr,
         [[maybe_unused]] raft_rpc_t rpc, raft_log_t /* type */, struct raft_log *lg)
 {
     union raft_log_options *out = &lg->opt;
@@ -438,8 +442,8 @@ static raft_status_t register_topic_process_packet(size_t *bytes_remaining, cons
     read_u16(&out->register_topic.length, ptr, bytes_remaining);
     read_uuid(out->register_topic.uuid, ptr, bytes_remaining);
 
-    if (read_str(&out->register_topic.name, ptr, out->register_topic.length,
-            bytes_remaining) == -1)
+    if (read_str(&out->register_topic.name, ptr, bytes_remaining,
+                out->register_topic.length) == -1)
         goto fail;
 
     out->register_topic.retained = (out->register_topic.flags & RAFT_LOG_REGISTER_TOPIC_HAS_RETAINED);

@@ -61,7 +61,7 @@ static int test_save_log(const struct raft_log *entry, uint8_t **buf, raft_log_t
 }
 
 static raft_status_t test_process_packet(size_t *bytes_remaining,
-		const uint8_t **ptr, raft_rpc_t rpc, raft_log_t log_type,
+		const char **ptr, raft_rpc_t rpc, raft_log_t log_type,
 		struct raft_log *out)
 {
 	(void)rpc;
@@ -343,7 +343,7 @@ static int send_request_vote(uint32_t term, uint32_t candidate_id,
 	memcpy(buf + 8, &last_log_index, sizeof(last_log_index));
 	memcpy(buf + 12, &last_log_term, sizeof(last_log_term));
 
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	if (raft_test_api.raft_process_packet(&client, RAFT_REQUEST_VOTE) == -1)
@@ -417,7 +417,7 @@ static int send_client_request(uint32_t client_id, uint32_t sequence_num,
 	buf[9] = 0;
 	memcpy(buf + 10, &payload_len, sizeof(payload_len));
 
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	if (raft_test_api.raft_process_packet(&client, RAFT_CLIENT_REQUEST) == -1)
@@ -493,7 +493,7 @@ static int send_append_entries_heartbeat(uint32_t term, uint32_t leader_id,
 	memcpy(buf + 16, &leader_commit, sizeof(leader_commit));
 	memset(buf + 20, 0, sizeof(uint32_t));
 
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	if (raft_test_api.raft_process_packet(&client, RAFT_APPEND_ENTRIES) == -1)
@@ -575,7 +575,7 @@ static int send_append_entries_single(uint32_t term, uint32_t leader_id,
 	ptr += sizeof(entry_term);
 	memset(ptr, 0, sizeof(uint16_t));
 
-	client.rd_packet_buffer = buf;
+	client.rd_packet_buffer = (char *)buf;
 	client.rd_packet_length = sizeof(buf);
 
 	if (raft_test_api.raft_process_packet(&client, RAFT_APPEND_ENTRIES) == -1)
@@ -641,7 +641,7 @@ static int process_append_entries_reply(struct raft_host_entry *client,
 	memcpy(buf + 1, &term_n, sizeof(term_n));
 	memcpy(buf + 5, &match_n, sizeof(match_n));
 
-	client->rd_packet_buffer = buf;
+	client->rd_packet_buffer = (char *)buf;
 	client->rd_packet_length = sizeof(buf);
 	return raft_test_api.raft_process_packet(client, RAFT_APPEND_ENTRIES_REPLY);
 }
@@ -657,7 +657,7 @@ static int process_request_vote_reply(struct raft_host_entry *client,
 	memcpy(buf + 1, &term_n, sizeof(term_n));
 	memcpy(buf + 5, &voted_n, sizeof(voted_n));
 
-	client->rd_packet_buffer = buf;
+	client->rd_packet_buffer = (char *)buf;
 	client->rd_packet_length = sizeof(buf);
 	return raft_test_api.raft_process_packet(client, RAFT_REQUEST_VOTE_REPLY);
 }
@@ -3010,7 +3010,7 @@ START_TEST(test_conformance_restart_clears_volatile_state)
 	peers[0].wr_packet_length = 4;
 	peers[0].wr_offset = 1;
 	atomic_store_explicit(&peers[0].wr_packet_buffer,
-			(const uint8_t *)active->buf, memory_order_seq_cst);
+			(const char *)active->buf, memory_order_seq_cst);
 
 	peers[0].ss_need = 12;
 	peers[0].ss_offset = 5;

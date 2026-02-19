@@ -47,7 +47,7 @@ struct raft_test_api {
     void (*raft_remove_and_free_unknown_host)(struct raft_host_entry *entry);
     int (*raft_new_conn)(int new_fd, struct raft_host_entry *unknown_host,
             const struct sockaddr_in *sin, socklen_t sin_len);
-    int (*raft_add_write)(struct raft_host_entry *client, uint8_t *buffer, ssize_t size);
+    int (*raft_add_write)(struct raft_host_entry *client, void *buffer, ssize_t size);
     int (*raft_try_write)(struct raft_host_entry *client);
     int (*raft_append_iobuf)(struct io_buf *entry, struct io_buf **head,
             struct io_buf **tail, unsigned *iobuf_len);

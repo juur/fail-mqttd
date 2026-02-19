@@ -182,11 +182,11 @@ struct raft_host_entry {
     ssize_t rd_need;
     ssize_t rd_packet_length;
     struct raft_host_entry *unknown_next;
-    uint8_t *rd_packet_buffer;
-    uint8_t rd_packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
+    char *rd_packet_buffer;
+    char rd_packet[RAFT_HDR_SIZE + RAFT_HELLO_SIZE];
 
     /* write buffering */
-    const uint8_t *wr_packet_buffer;
+    const char *wr_packet_buffer;
     off_t wr_offset;
     ssize_t wr_need;
     ssize_t wr_packet_length;
@@ -273,7 +273,7 @@ struct io_buf {
 };
 
 struct send_state {
-    uint8_t *ptr;
+    char *ptr;
     uint16_t arg_req_len;
 
     uint8_t *arg_str;
@@ -289,7 +289,7 @@ struct raft_impl_entry {
     int (*client_append)(struct raft_log *, raft_log_t, va_list);
     int (*size_send)(struct raft_log *, struct send_state *, raft_log_t);
     int (*fill_send)(struct send_state *, const struct raft_log *, raft_log_t);
-    raft_status_t (*process_packet)(size_t *, const uint8_t **, raft_rpc_t rpc, raft_log_t, struct raft_log *);
+    raft_status_t (*process_packet)(size_t *, const char **, raft_rpc_t rpc, raft_log_t, struct raft_log *);
     int (*save_log)(const struct raft_log *, uint8_t **, raft_log_t);
     int (*read_log)(struct raft_log *, const uint8_t *, int, raft_log_t);
 };
