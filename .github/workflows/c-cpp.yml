@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: prep
       run: sudo apt-get install -y libgdbm-dev libgdbm-compat-dev check
     - name: configure
@@ -22,7 +22,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: prep
       run: sudo apt-get install -y libgdbm-dev libgdbm-compat-dev check
     - name: configure
